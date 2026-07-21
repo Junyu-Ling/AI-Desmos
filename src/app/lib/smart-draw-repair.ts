@@ -166,6 +166,32 @@ For "contours" (skip or [] if mode is fill-only):
 - Max 20 contours. Prioritize accuracy over quantity.
 - closed=true for loops; false for open strokes.`;
 
+const SMART_DRAW_BATCH_AI_PROMPT = `You analyze {N} animation frames (indices 0..{N-1}) for Smart Drawing on Desmos.
+Return ONLY valid JSON (no markdown). Mode: {MODE}.
+
+{
+  "frames": [
+    {
+      "index": 0,
+      "contrastBoost": number (1.0-2.5),
+      "sharpenAmount": number (0-1.5),
+      "edgeThresholdFactor": number (0.4-1.6),
+      "strengthThresholdRatio": number (0.1-0.5),
+      "maxContours": integer (25-90),
+      "fourierK": integer (40-160),
+      "targetPointCount": integer (250-800),
+      "preserveFineDetails": boolean,
+      "invertColors": boolean,
+      "blurPasses": integer (0-2),
+      "contours": [{ "closed": boolean, "points": [[x,y], ...] }]
+    }
+  ]
+}
+
+Each frame image is labeled "Frame index K" before the image. Match results to that index.
+For "contours" (skip or [] if mode is fill-only): normalized coords 0-1000, 12-60 points, max 20 contours per frame.
+Prioritize accuracy; analyze EACH frame independently.`;
+
 type RawAIResponse = Partial<SmartDrawTuningParams> & {
   contours?: Array<{
     closed?: boolean;
@@ -213,6 +239,213 @@ function parseAIResponse(
   } catch {
     return null;
   }
+}
+
+type BatchRawFrame = RawAIResponse & { index?: number };
+
+function parseBatchAIResponse(
+  text: string,
+  frames: Array<{ frameIndex: number; width: number; height: number }>,
+): Map<number, { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] }> {
+  const result = new Map<number, { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] }>();
+  const trimmed = text.trim();
+  const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return result;
+
+  try {
+    const raw = JSON.parse(jsonMatch[0]) as { frames?: BatchRawFrame[] };
+    const items = Array.isArray(raw.frames) ? raw.frames : [];
+
+    for (const item of items) {
+      const idx = Number(item.index);
+      const meta = frames.find(f => f.frameIndex === idx) ?? frames[items.indexOf(item)];
+      if (!meta) continue;
+
+      const { contours: rawContours, index: _idx, ...tuningPartial } = item;
+      const parsed = parseAIResponse(
+        JSON.stringify({ ...tuningPartial, contours: rawContours }),
+        meta.width,
+        meta.height,
+      );
+      if (parsed) {
+        result.set(meta.frameIndex, parsed);
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  return result;
+}
+
+async function callOpenAiVisionBatch(
+  endpoint: string,
+  model: string,
+  batch: Array<{ dataUrl: string; frameIndex: number; width: number; height: number }>,
+  mode: SmartDrawMode,
+  headersOverride?: Record<string, string>,
+): Promise<Map<number, { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] }> | null> {
+  const n = batch.length;
+  const content: Array<{ type: string; text?: string; image_url?: { url: string; detail: string } }> = [
+    {
+      type: 'text',
+      text: SMART_DRAW_BATCH_AI_PROMPT
+        .replace('{N}', String(n))
+        .replace('{N-1}', String(n - 1))
+        .replace('{MODE}', mode),
+    },
+  ];
+
+  for (const frame of batch) {
+    content.push({ type: 'text', text: `Frame index ${frame.frameIndex}:` });
+    content.push({ type: 'image_url', image_url: { url: frame.dataUrl, detail: 'low' } });
+  }
+
+  const headers = headersOverride ?? { 'Content-Type': 'application/json' };
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model,
+      temperature: 0.1,
+      max_tokens: Math.min(16384, 2048 + n * 1200),
+      messages: [{ role: 'user', content }],
+    }),
+  });
+
+  if (!response.ok) return null;
+  const json = await response.json();
+  const text = json?.choices?.[0]?.message?.content;
+  if (typeof text !== 'string') return null;
+
+  const parsed = parseBatchAIResponse(text, batch.map(f => ({
+    frameIndex: f.frameIndex,
+    width: f.width,
+    height: f.height,
+  })));
+  return parsed.size > 0 ? parsed : null;
+}
+
+async function callClaudeVisionBatch(
+  apiKey: string,
+  model: string,
+  batch: Array<{ dataUrl: string; frameIndex: number }>,
+  mode: SmartDrawMode,
+  frameMeta: Array<{ frameIndex: number; width: number; height: number }>,
+): Promise<Map<number, { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] }> | null> {
+  const n = batch.length;
+  const content: Array<{ type: string; text?: string; source?: { type: string; media_type: string; data: string } }> = [
+    {
+      type: 'text',
+      text: SMART_DRAW_BATCH_AI_PROMPT
+        .replace('{N}', String(n))
+        .replace('{N-1}', String(n - 1))
+        .replace('{MODE}', mode),
+    },
+  ];
+
+  for (const frame of batch) {
+    const base64 = frame.dataUrl.replace(/^data:image\/\w+;base64,/, '');
+    const mediaType = frame.dataUrl.startsWith('data:image/png') ? 'image/png' : 'image/jpeg';
+    content.push({ type: 'text', text: `Frame index ${frame.frameIndex}:` });
+    content.push({
+      type: 'image',
+      source: { type: 'base64', media_type: mediaType, data: base64 },
+    });
+  }
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: Math.min(16384, 2048 + n * 1200),
+      messages: [{ role: 'user', content }],
+    }),
+  });
+
+  if (!response.ok) return null;
+  const json = await response.json();
+  const block = json?.content?.find((b: { type: string }) => b.type === 'text');
+  if (!block?.text) return null;
+
+  const parsed = parseBatchAIResponse(block.text, frameMeta);
+  return parsed.size > 0 ? parsed : null;
+}
+
+export type SmartDrawBatchFrameInput = {
+  frameIndex: number;
+  dataUrl: string;
+  width: number;
+  height: number;
+};
+
+/** 批量 AI：一次请求分析多帧，降低成本；失败时回退逐帧 */
+export async function analyzeSmartDrawBatchWithAI(
+  frames: SmartDrawBatchFrameInput[],
+  mode: SmartDrawMode,
+  apiKey?: string,
+): Promise<Map<number, { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] }>> {
+  const result = new Map<number, { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] }>();
+  if (frames.length === 0 || mode === 'fill') return result;
+
+  const cfg = getApiConfig();
+  const key = getEffectiveApiKey(apiKey);
+  const provider = getProviderById(cfg.provider);
+  if (!provider) return result;
+  if (!PROXY_PROVIDERS.has(provider.id) && !key) return result;
+
+  try {
+    const compressed = await Promise.all(
+      frames.map(f => compressImageDataUrl(f.dataUrl, 640, 0.82)),
+    );
+    const batch = frames.map((f, i) => ({
+      ...f,
+      dataUrl: compressed[i],
+    }));
+
+    let batchResult: Map<number, { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] }> | null = null;
+
+    if (provider.format === 'anthropic') {
+      if (key) {
+        batchResult = await callClaudeVisionBatch(
+          key,
+          resolveVisionModel(provider.id, cfg.model),
+          batch,
+          mode,
+          frames.map(f => ({ frameIndex: f.frameIndex, width: f.width, height: f.height })),
+        );
+      }
+    } else {
+      const { url, headers } = buildProviderRequest(provider.id, provider.endpoint, key);
+      const model = resolveVisionModel(provider.id, cfg.model);
+      batchResult = await callOpenAiVisionBatch(url, model, batch, mode, headers);
+    }
+
+    if (batchResult && batchResult.size > 0) {
+      batchResult.forEach((v, k) => result.set(k, v));
+      return result;
+    }
+  } catch {
+    // fall through to per-frame
+  }
+
+  for (const frame of frames) {
+    try {
+      const single = await analyzeSmartDrawWithAI(
+        frame.dataUrl, mode, frame.width, frame.height, apiKey,
+      );
+      if (single) result.set(frame.frameIndex, single);
+    } catch {
+      // skip frame
+    }
+  }
+
+  return result;
 }
 
 async function callOpenAiVision(

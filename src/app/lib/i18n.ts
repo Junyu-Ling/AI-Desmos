@@ -100,7 +100,7 @@ export const translations = {
     smart_draw_mode_fill: '仅涂色',
     smart_draw_mode_fill_desc: '只用色块还原颜色，不勾线',
     smart_draw_mode_both: '轮廓 + 涂色',
-    smart_draw_mode_both_desc: '先勾线再填色，AI 精确追踪轮廓后还原度最高',
+    smart_draw_mode_both_desc: '先勾线再填色；GIF 支持标准/电影级质量与时间轴 s 播放',
 
     // ── 快速示例（帮助面板） ──────────────────────────────────────────────────
     example_sine: '画一个正弦函数',
@@ -183,6 +183,18 @@ export const translations = {
     canvas_cleared: '画板已清空。',              // 清空画板后在聊天中显示的消息
     drawing_complete: '绘画已完成。',            // 图片拟合成功后的消息
     drawing_processing: '正在分析图片…',
+    gif_drawing_processing: '正在解码 GIF 并分析时间轴…',
+    gif_drawing_frame: '正在处理第 {current}/{total} 关键帧…',
+    gif_drawing_ai: 'AI 批量识别第 {current}/{total} 帧（8 帧/批，请耐心等待）…',
+    gif_drawing_worker: 'Worker 并行处理第 {current}/{total} 帧…',
+    gif_drawing_inject: '正在写入画板 {current}/{total}…',
+    gif_drawing_complete: 'GIF 高保真动画已完成。滑块 s（秒）可连续拖动；点击 s 旁 ▶ 按时间播放。',
+    gif_process_fail: 'GIF 处理失败：文件过大或帧数过多，请尝试更短/更小的 GIF。',
+    gif_quality_title: 'GIF 动画质量',
+    gif_quality_standard: '标准',
+    gif_quality_standard_desc: '约 8fps · 最多 400 帧 · 高采样',
+    gif_quality_cinema: '电影级',
+    gif_quality_cinema_desc: '约 24fps · 最多 600 帧 · 原帧尽量全保留',
     drawing_local_repair: '正在修复图片对比度与边缘…',
     drawing_ai_repair: 'AI 正在分析图像并精确追踪轮廓…',
     drawing_progress_outline: '正在勾勒轮廓 {current}/{total}…',
@@ -195,7 +207,7 @@ export const translations = {
     // ── 聊天界面基础文字 ──────────────────────────────────────────────────────
     thinking: '正在思考...',                    // AI 加载时的提示
     input_placeholder: '输入消息...',            // 输入框占位文字
-    upload_hint: '上传图片（支持 PNG/JPG，也可直接 Ctrl+V 粘贴）', // 回形针按钮 tooltip
+    upload_hint: '上传图片或 GIF（支持 PNG/JPG/GIF，也可 Ctrl+V 粘贴）', // 回形针按钮 tooltip
     image_uploaded: '图片已上传',                // 消息列表中图片缩略图的文字
     welcome: '你好！我是 AI Desmos。',           // 聊天的第一条欢迎消息
 
@@ -491,7 +503,7 @@ export const translations = {
     smart_draw_mode_fill: 'Fill only',
     smart_draw_mode_fill_desc: 'Color blocks only, no outlines',
     smart_draw_mode_both: 'Outline + fill',
-    smart_draw_mode_both_desc: 'Outlines first, then fill — AI contour tracing for highest fidelity',
+    smart_draw_mode_both_desc: 'Outlines + fill; GIF supports Standard/Cinema quality with time slider s',
 
     // ── 快速示例 ──────────────────────────────────────────────────────────────
     example_sine: 'Draw a sine wave',
@@ -568,6 +580,18 @@ export const translations = {
     canvas_cleared: 'Canvas cleared.',
     drawing_complete: 'Drawing complete.',
     drawing_processing: 'Analyzing image…',
+    gif_drawing_processing: 'Decoding GIF and building timeline…',
+    gif_drawing_frame: 'Processing keyframe {current}/{total}…',
+    gif_drawing_ai: 'AI batch analyzing frame {current}/{total} (8 frames/batch)…',
+    gif_drawing_worker: 'Worker parallel processing {current}/{total}…',
+    gif_drawing_inject: 'Writing to canvas {current}/{total}…',
+    gif_drawing_complete: 'High-fidelity GIF ready. Drag time slider s, or press ▶ on s to play.',
+    gif_process_fail: 'GIF processing failed. Try a shorter or smaller GIF.',
+    gif_quality_title: 'GIF animation quality',
+    gif_quality_standard: 'Standard',
+    gif_quality_standard_desc: '~8fps · up to 400 frames · high sampling',
+    gif_quality_cinema: 'Cinema',
+    gif_quality_cinema_desc: '~24fps · up to 600 frames · keep all source frames when possible',
     drawing_local_repair: 'Enhancing contrast and edges…',
     drawing_ai_repair: 'AI is analyzing the image and tracing precise contours…',
     drawing_progress_outline: 'Drawing outlines {current}/{total}…',
@@ -580,7 +604,7 @@ export const translations = {
     // ── 聊天界面基础文字 ──────────────────────────────────────────────────────
     thinking: 'Thinking...',
     input_placeholder: 'Type a message...',
-    upload_hint: 'Upload image (PNG/JPG) or paste screenshot (Ctrl+V)',
+    upload_hint: 'Upload image or GIF (PNG/JPG/GIF) or paste with Ctrl+V',
     image_uploaded: 'Image uploaded',
     welcome: 'Hello! I am AI Desmos.',
 

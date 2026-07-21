@@ -957,8 +957,7 @@ const detectBorderBackgroundKey = (
  */
 const MAX_FILL_POLYGONS = 3600;
 
-const computeOptimalFillGrid = (width: number, height: number): number => {
-  const maxCells = MAX_FILL_POLYGONS;
+const computeOptimalFillGrid = (width: number, height: number, maxCells = MAX_FILL_POLYGONS): number => {
   let lo = 96;
   let hi = Math.min(720, Math.max(width, height));
   let best = 128;
@@ -985,8 +984,9 @@ const extractPerCellFillPolygons = (
   offsetX: number,
   offsetY: number,
   desmosScale: number,
+  maxFillPolygons = MAX_FILL_POLYGONS,
 ): FillPolygon[] => {
-  const gridMax = computeOptimalFillGrid(width, height);
+  const gridMax = computeOptimalFillGrid(width, height, maxFillPolygons);
   const seg = buildColorSegmentation(ctx, width, height, gridMax);
   const { gw, gh, src, borderBg } = seg;
   const cellW = width / gw;
@@ -1227,8 +1227,9 @@ const extractColorFillPolygons = (
   offsetX: number,
   offsetY: number,
   desmosScale: number,
+  maxFillPolygons = MAX_FILL_POLYGONS,
 ): FillPolygon[] => extractPerCellFillPolygons(
-  ctx, width, height, offsetX, offsetY, desmosScale,
+  ctx, width, height, offsetX, offsetY, desmosScale, maxFillPolygons,
 );
 
 const extractColorFillPolygonsAtGrid = (
@@ -1257,14 +1258,65 @@ const extractColorFillPolygonsAtGrid = (
   return polys;
 };
 
-const buildFillPolygonExpressions = (polys: FillPolygon[]): any[] => {
+const formatDesmosTime = (sec: number): string => {
+  const rounded = Math.round(sec * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, '');
+};
+
+const buildFrameVisibilityRestriction = (
+  frameSlot: number,
+  sliderVar: string,
+  smooth: boolean,
+  frameCount?: number,
+  timeRange?: { start: number; end: number },
+  timeBased?: boolean,
+): string => {
+  if (timeBased && timeRange) {
+    const start = formatDesmosTime(timeRange.start);
+    const end = formatDesmosTime(timeRange.end);
+    return `\\left\\{${start}\\le ${sliderVar}<${end}\\right\\}`;
+  }
+  if (!smooth) {
+    return `\\left\\{${sliderVar}=${frameSlot}\\right\\}`;
+  }
+  const total = frameCount ?? frameSlot;
+  if (frameSlot < total) {
+    return `\\left\\{${frameSlot}\\le ${sliderVar}<${frameSlot + 1}\\right\\}`;
+  }
+  return `\\left\\{${frameSlot}\\le ${sliderVar}\\le ${frameSlot + 0.999}\\right\\}`;
+};
+
+const buildFillPolygonExpressions = (
+  polys: FillPolygon[],
+  options: Pick<ImageFourierOptions,
+    'frameSlot' | 'frameSliderVar' | 'idPrefix' | 'gifFrameCount' | 'gifSmoothSlider'
+    | 'gifTimeBasedSlider' | 'gifTimeStart' | 'gifTimeEnd'
+  > = {},
+): any[] => {
   const expressions: any[] = [];
+  const prefix = options.idPrefix ?? '';
+  const restrict = (latex: string) => {
+    if (options.frameSlot != null && options.frameSliderVar) {
+      return `${latex}${buildFrameVisibilityRestriction(
+        options.frameSlot,
+        options.frameSliderVar,
+        options.gifSmoothSlider ?? false,
+        options.gifFrameCount,
+        options.gifTimeStart != null && options.gifTimeEnd != null
+          ? { start: options.gifTimeStart, end: options.gifTimeEnd }
+          : undefined,
+        options.gifTimeBasedSlider,
+      )}`;
+    }
+    return latex;
+  };
+
   polys.forEach((poly, i) => {
     const latex = buildPolygonLatex(poly.points);
     if (!latex) return;
     expressions.push({
-      id: `fill_poly_${i}`,
-      latex,
+      id: `${prefix}fill_poly_${i}`,
+      latex: restrict(latex),
       color: poly.color,
       fill: true,
       fillOpacity: 1,
@@ -1284,13 +1336,19 @@ const createFillContext = (
   fallbackCtx?: CanvasRenderingContext2D,
 ): CanvasRenderingContext2D => {
   if (fillImageData) {
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const fillCtx = canvas.getContext('2d');
-    if (!fillCtx) throw new Error('Fill canvas unavailable');
-    fillCtx.putImageData(fillImageData, 0, 0);
-    return fillCtx;
+    let ctx: CanvasRenderingContext2D | null = null;
+    if (typeof document !== 'undefined') {
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      ctx = canvas.getContext('2d');
+    } else if (typeof OffscreenCanvas !== 'undefined') {
+      const canvas = new OffscreenCanvas(width, height);
+      ctx = canvas.getContext('2d') as CanvasRenderingContext2D | null;
+    }
+    if (!ctx) throw new Error('Fill canvas unavailable');
+    ctx.putImageData(fillImageData, 0, 0);
+    return ctx;
   }
   if (!fallbackCtx) throw new Error('Fill context unavailable');
   return fallbackCtx;
@@ -1309,6 +1367,23 @@ export type ImageFourierOptions = {
   enableAiRepair?: boolean;
   apiKey?: string;
   onRepairProgress?: (phase: SmartDrawRepairPhase) => void;
+  /** GIF 多帧：每帧独立变量命名空间（如 3 → F_{301}） */
+  varNamespace?: number;
+  /** GIF 多帧：当前帧序号（1-based），用于 \\left\\{f=k\\right\\} 限制 */
+  frameSlot?: number;
+  frameSliderVar?: string;
+  /** 表达式 id 前缀（GIF 帧隔离） */
+  idPrefix?: string;
+  /** GIF 连续滑块：用 k≤f<k+1 区间代替 f=k 整数跳变 */
+  gifSmoothSlider?: boolean;
+  /** GIF 总帧数（配合 gifSmoothSlider） */
+  gifFrameCount?: number;
+  /** GIF 时间轴滑块：用 t_start≤t<t_end 限制可见性 */
+  gifTimeBasedSlider?: boolean;
+  gifTimeStart?: number;
+  gifTimeEnd?: number;
+  /** 填色 polygon 数量上限（GIF 多帧时降低） */
+  maxFillPolygons?: number;
 };
 
 /**
@@ -1342,19 +1417,46 @@ const generateFourierExpressions = (
   const desmosScale = 20 / Math.max(width, height);
   const offsetX = width / 2;
   const offsetY = height / 2;
+  const idPrefix = options.idPrefix ?? (options.frameSlot ? `gif_f${options.frameSlot}_` : '');
+  const frameSliderVar = options.frameSliderVar ?? 'f';
+  const restrictPlot = (latex: string) => (
+    options.frameSlot != null
+      ? `${latex}${buildFrameVisibilityRestriction(
+        options.frameSlot,
+        frameSliderVar,
+        options.gifSmoothSlider ?? false,
+        options.gifFrameCount,
+        options.gifTimeStart != null && options.gifTimeEnd != null
+          ? { start: options.gifTimeStart, end: options.gifTimeEnd }
+          : undefined,
+        options.gifTimeBasedSlider,
+      )}`
+      : latex
+  );
 
   let fillPolys: FillPolygon[] = [];
   let fillExpressions: any[] = [];
 
   if (includeFill) {
     const fillCtx = createFillContext(width, height, options.fillImageData, ctx);
-    fillPolys = extractColorFillPolygons(fillCtx, width, height, offsetX, offsetY, desmosScale);
+    fillPolys = extractColorFillPolygons(
+      fillCtx, width, height, offsetX, offsetY, desmosScale, options.maxFillPolygons,
+    );
     fillPolys.sort((a, b) => {
       const avgY = (poly: FillPolygon) =>
         poly.points.reduce((sum, p) => sum + p.y, 0) / poly.points.length;
       return avgY(b) - avgY(a);
     });
-    fillExpressions = buildFillPolygonExpressions(fillPolys);
+    fillExpressions = buildFillPolygonExpressions(fillPolys, {
+      frameSlot: options.frameSlot,
+      frameSliderVar,
+      idPrefix,
+      gifSmoothSlider: options.gifSmoothSlider,
+      gifFrameCount: options.gifFrameCount,
+      gifTimeBasedSlider: options.gifTimeBasedSlider,
+      gifTimeStart: options.gifTimeStart,
+      gifTimeEnd: options.gifTimeEnd,
+    });
   }
 
   if (!includeOutline) {
@@ -1549,55 +1651,39 @@ const generateFourierExpressions = (
     const L_real = coeffs.map(c => c.re.toFixed(5));   // 实部（保留5位小数，平衡精度和体积）
     const L_imag = coeffs.map(c => c.im.toFixed(5));   // 虚部
 
-    // 为每条轮廓生成唯一的 Desmos 变量名（使用下标索引）
-    const index    = idx;             // 轮廓序号
-    const id_freq  = `F_{${index}}`; // 频率列表变量名（如 F_{0}）
-    const id_re    = `R_{${index}}`; // 实部列表变量名（如 R_{0}）
-    const id_im    = `I_{${index}}`; // 虚部列表变量名（如 I_{0}）
-    const func_X   = `X_{${index}}`; // X 坐标函数名（如 X_{0}）
-    const func_Y   = `Y_{${index}}`; // Y 坐标函数名（如 Y_{0}）
+    const index    = idx;
+    const nameKey  = options.varNamespace !== undefined ? options.varNamespace * 100 + index : index;
+    const id_freq  = `F_{${nameKey}}`;
+    const id_re    = `R_{${nameKey}}`;
+    const id_im    = `I_{${nameKey}}`;
+    const func_X   = `X_{${nameKey}}`;
+    const func_Y   = `Y_{${nameKey}}`;
 
     const plotColor = SMART_DRAW_OUTLINE_COLOR;
 
-    // ── 推入 Desmos 表达式 ─────────────────────────────────────────────────
     contourExpressions.push(
-      // 频率列表（隐藏，用户看不到）
-      { id: `dft_freq_${index}`, latex: `${id_freq} = [${L_freq.join(',')}]`, hidden: true },
-
-      // 傅里叶系数实部列表（隐藏）
-      { id: `dft_real_${index}`, latex: `${id_re} = [${L_real.join(',')}]`, hidden: true },
-
-      // 傅里叶系数虚部列表（隐藏）
-      { id: `dft_imag_${index}`, latex: `${id_im} = [${L_imag.join(',')}]`, hidden: true },
-
-      // X(t) 函数：X 坐标 = 所有旋转圆的 x 分量之和
-      // total() 是 Desmos 的求和函数（对列表所有元素求和）
-      // 公式：X(t) = Σ(R[k]×cos(F[k]×t) - I[k]×sin(F[k]×t))
+      { id: `${idPrefix}dft_freq_${index}`, latex: `${id_freq} = [${L_freq.join(',')}]`, hidden: true },
+      { id: `${idPrefix}dft_real_${index}`, latex: `${id_re} = [${L_real.join(',')}]`, hidden: true },
+      { id: `${idPrefix}dft_imag_${index}`, latex: `${id_im} = [${L_imag.join(',')}]`, hidden: true },
       {
-        id: `dft_x_${index}`,
+        id: `${idPrefix}dft_x_${index}`,
         latex: `${func_X}(t) = \\operatorname{total}(${id_re}\\cos(${id_freq}t) - ${id_im}\\sin(${id_freq}t))`,
-        hidden: true
+        hidden: true,
       },
-
-      // Y(t) 函数：Y 坐标 = 所有旋转圆的 y 分量之和
-      // 公式：Y(t) = Σ(R[k]×sin(F[k]×t) + I[k]×cos(F[k]×t))
       {
-        id: `dft_y_${index}`,
+        id: `${idPrefix}dft_y_${index}`,
         latex: `${func_Y}(t) = \\operatorname{total}(${id_re}\\sin(${id_freq}t) + ${id_im}\\cos(${id_freq}t))`,
-        hidden: true
+        hidden: true,
       },
-
-      // 参数曲线（可见！这就是用户看到的绘制结果）
-      // (X(t), Y(t)) 是 Desmos 参数方程的标准格式
       {
-        id: `dft_plot_${index}`,
-        latex: `(${func_X}(t), ${func_Y}(t))`,
+        id: `${idPrefix}dft_plot_${index}`,
+        latex: restrictPlot(`(${func_X}(t), ${func_Y}(t))`),
         color: plotColor,
         lineWidth: fillPolys.length > 0 ? 2 : 2.5,
         lineOpacity: 1,
         hidden: false,
-        parametricDomain: { min: "0", max: "2\\pi" }
-      }
+        parametricDomain: { min: "0", max: "2\\pi" },
+      },
     );
   });
 
@@ -1619,6 +1705,9 @@ const generateFourierExpressions = (
         : `绘画已完成（${finalContours.length} 条黑色轮廓${outlineNote}，仅勾线）。`,
   };
 };
+
+/** 供 GIF 等多帧管线直接调用 */
+export const generateFourierExpressionsFromContext = generateFourierExpressions;
 
 // ─── 公共导出函数 ─────────────────────────────────────────────────────────────
 
@@ -1669,14 +1758,14 @@ const prepareFourierExpression = (expr: any): any => {
 };
 
 const isFillExpression = (expr: any): boolean =>
-  String(expr.id || '').startsWith('fill_poly_');
+  /(?:^|_)fill_poly_\d+$/.test(String(expr.id || ''));
 
 const getContourGroupKey = (expr: any): string | null => {
   const id = String(expr.id || '');
-  const dft = id.match(/^dft_(?:plot|freq|real|imag|x|y)_(\d+)$/);
-  if (dft) return `dft_${dft[1]}`;
-  const hd = id.match(/^hd_(?:plot|freq|real|imag|x|y)_(\d+)$/);
-  if (hd) return `hd_${hd[1]}`;
+  const dft = id.match(/^(.*)dft_(?:plot|freq|real|imag|x|y)_(\d+)$/);
+  if (dft) return `${dft[1]}dft_${dft[2]}`;
+  const hd = id.match(/^(.*)hd_(?:plot|freq|real|imag|x|y)_(\d+)$/);
+  if (hd) return `${hd[1]}hd_${hd[2]}`;
   return null;
 };
 
@@ -1818,6 +1907,41 @@ export function applyFourierExpressionsToCalculator(
   for (let i = 0; i < prepared.length; i += DESMOS_EXPR_BATCH) {
     pushExprBatch(calculator, prepared.slice(i, i + DESMOS_EXPR_BATCH));
   }
+}
+
+/** GIF 动画：分批写入，避免 Desmos / 主线程卡死 */
+export async function applyGifExpressionsToCalculator(
+  calculator: any,
+  expressions: any[],
+  options: {
+    signal?: AbortSignal;
+    onProgress?: (done: number, total: number) => void;
+  } = {},
+): Promise<void> {
+  if (!calculator || expressions.length === 0) return;
+
+  const GIF_BATCH = 36;
+  const BATCH_PAUSE_MS = 12;
+
+  calculator.setBlank();
+  const prepared = expressions.map(prepareFourierExpression);
+  const total = prepared.length;
+
+  for (let i = 0; i < prepared.length; i += GIF_BATCH) {
+    if (options.signal?.aborted) return;
+    pushExprBatch(calculator, prepared.slice(i, i + GIF_BATCH));
+    options.onProgress?.(Math.min(i + GIF_BATCH, total), total);
+    if (i + GIF_BATCH < prepared.length) {
+      await sleep(BATCH_PAUSE_MS, options.signal);
+    }
+  }
+
+  const contourGroups = groupContourExpressions(
+    prepared.filter(expr => !isFillExpression(expr)
+      && expr.id !== 'gif_frame_slider'
+      && expr.id !== 'gif_time_slider'),
+  );
+  bringOutlinePlotsToFront(calculator, contourGroups);
 }
 
 /**

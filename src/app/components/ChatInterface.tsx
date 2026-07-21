@@ -45,7 +45,7 @@ import React, { useState, useRef, useEffect } from 'react';
 // Pencil=铅笔  GraduationCap=学士帽（解题）  ChevronRight=右箭头  Lock=锁
 // Zap=闪电（试用）  ExternalLink=外部链接  ShieldCheck=盾牌+对勾（安全）
 // MousePointer2=鼠标指针（长手模式）  CloudOff=断网图标  RefreshCcw=刷新
-import { X, Send, Paperclip, Bot, User, Loader2, Trash2, Layers, HelpCircle, BookOpen, MessageSquareX, ScanEye, Share, Settings, Key, Globe, Pen, ImageIcon, Sigma, Eye, Upload, Lightbulb, Wrench, Pencil, GraduationCap, ChevronRight, Lock, Zap, ExternalLink, ShieldCheck, MousePointer2, CloudOff, RefreshCcw, Square, Check } from 'lucide-react';
+import { X, Send, Paperclip, Bot, User, Loader2, Trash2, Layers, HelpCircle, BookOpen, MessageSquareX, ScanEye, Share, Settings, Key, Globe, Pen, ImageIcon, Sigma, Eye, Upload, Lightbulb, Wrench, Pencil, GraduationCap, ChevronRight, Lock, Zap, ExternalLink, ShieldCheck, MousePointer2, CloudOff, RefreshCcw, Square, Check, Film } from 'lucide-react';
 
 // 工具函数：Desmos 流式注入
 import { processDesmosStreamChunk, createDesmosInjectState } from '../lib/utils';
@@ -63,6 +63,7 @@ import {
 
 // 图像处理：图片/Emoji → 傅里叶变换 → Desmos 表达式
 import { processImageToFourier, processEmojiToFourier, applyFourierExpressionsProgressively, type ProgressiveDrawPhase, type SmartDrawMode } from '../lib/image-processing';
+import { processGifToDesmosAnimation, applyGifExpressionsToCalculator, type GifQualityTier } from '../lib/gif-animation';
 
 // LaTeX 数学公式渲染库
 // 把 $f(x)=x^2$ 这样的字符串渲染成美观的数学公式
@@ -590,6 +591,13 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
   /** drawModeRef — 用户选定的绘图模式，供文件选择器回调使用 */
   const drawModeRef = useRef<SmartDrawMode>('both');
 
+  /** GIF 质量档位（标准 / 电影级） */
+  const gifQualityRef = useRef<GifQualityTier>('standard');
+  const [gifQualityTier, setGifQualityTier] = useState<GifQualityTier>('standard');
+  const [drawModeSheetIsGif, setDrawModeSheetIsGif] = useState(false);
+  const [showGifQualitySheet, setShowGifQualitySheet] = useState(false);
+  const pendingGifFileRef = useRef<{ file: File; mode: SmartDrawMode } | null>(null);
+
   /** solveFileRef — 解题模式的隐藏文件选择器的引用 */
   const solveFileRef = useRef<HTMLInputElement>(null);
 
@@ -984,8 +992,13 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     ));
   };
 
-  const openDrawModeSheet = (subtitle: string | null) => {
+  const openDrawModeSheet = (subtitle: string | null, isGif = false) => {
     setDrawModeSheetSubtitle(subtitle);
+    setDrawModeSheetIsGif(isGif);
+    if (isGif) {
+      setGifQualityTier('standard');
+      gifQualityRef.current = 'standard';
+    }
     setShowDrawModeSheet(true);
   };
 
@@ -1202,17 +1215,142 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
   };
 
   /**
-   * processFile — 处理上传的图片文件（绘图模式）
-   *
-   * 流程：
-   * 1. 创建图片预览 URL，在聊天消息中显示缩略图
-   * 2. 调用 processImageToFourier 进行傅里叶变换
-   * 3. 把生成的 Desmos 表达式注入画板
-   * 4. 更新聊天消息状态
-   *
-   * @param file - 用户上传的图片文件（File 对象）
+   * processFile — 处理上传的图片/GIF 文件（绘图模式）
    */
-  const processFile = async (file: File, mode: SmartDrawMode = 'both') => {
+  const isGifFile = (file: File) =>
+    file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif');
+
+  const processGifFile = async (
+    file: File,
+    mode: SmartDrawMode = 'both',
+    quality: GifQualityTier = 'standard',
+  ) => {
+    const imageUrl = URL.createObjectURL(file);
+
+    const userMsg: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: `[${t('upload_image')}: ${file.name}]`,
+      hasImage: true,
+      imageUrl,
+    };
+    setMessages(prev => [...prev, userMsg]);
+    setIsLoading(true);
+    const task = beginTask();
+    const progressMsgId = (Date.now() + 1).toString();
+
+    try {
+      setMessages(prev => [...prev, {
+        id: progressMsgId,
+        role: 'assistant',
+        content: t('gif_drawing_processing'),
+        translationKey: 'gif_drawing_processing',
+        drawingProgressPhase: 'processing',
+      }]);
+
+      const result = await processGifToDesmosAnimation(file, {
+        mode,
+        quality,
+        apiKey: customApiKey,
+        enableAiRepair: true,
+        signal: task.signal,
+        onProgress: (current, total, phase) => {
+          const key = phase === 'decode'
+            ? 'gif_drawing_processing'
+            : phase === 'inject'
+              ? 'gif_drawing_inject'
+              : phase === 'ai'
+                ? 'gif_drawing_ai'
+                : phase === 'worker'
+                  ? 'gif_drawing_worker'
+                  : 'gif_drawing_frame';
+          setMessages(prev => prev.map(m =>
+            m.id === progressMsgId
+              ? {
+                  ...m,
+                  content: t(key, {
+                    current: String(current),
+                    total: String(total),
+                  }),
+                  translationKey: key,
+                  translationParams: {
+                    current: String(current),
+                    total: String(total),
+                  },
+                  drawingProgressPhase: 'processing',
+                  drawingProgressCurrent: current,
+                  drawingProgressTotal: total,
+                }
+              : m,
+          ));
+        },
+      });
+
+      if (task.signal.aborted) return;
+
+      if (calculatorRef.current) {
+        await applyGifExpressionsToCalculator(
+          calculatorRef.current,
+          result.expressions,
+          {
+            signal: task.signal,
+            onProgress: (done, total) => {
+              setMessages(prev => prev.map(m =>
+                m.id === progressMsgId
+                  ? {
+                      ...m,
+                      content: t('gif_drawing_inject', {
+                        current: String(done),
+                        total: String(total),
+                      }),
+                      translationKey: 'gif_drawing_inject',
+                      translationParams: {
+                        current: String(done),
+                        total: String(total),
+                      },
+                      drawingProgressCurrent: done,
+                      drawingProgressTotal: total,
+                    }
+                  : m,
+              ));
+            },
+          },
+        );
+      }
+
+      setMessages(prev => prev.map(m =>
+        m.id === progressMsgId ? {
+          ...m,
+          content: 'GIF complete',
+          translationKey: 'gif_drawing_complete',
+          drawingProgressPhase: undefined,
+          drawingProgressCurrent: undefined,
+          drawingProgressTotal: undefined,
+        } : m,
+      ));
+    } catch (error) {
+      if (isAbortError(error)) return;
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        role: 'system',
+        content: 'GIF processing failed',
+        translationKey: 'gif_process_fail',
+      }]);
+    } finally {
+      endTask();
+      setIsLoading(false);
+    }
+  };
+
+  const processFile = async (
+    file: File,
+    mode: SmartDrawMode = 'both',
+    quality: GifQualityTier = gifQualityRef.current,
+  ) => {
+    if (isGifFile(file)) {
+      await processGifFile(file, mode, quality);
+      return;
+    }
     // URL.createObjectURL 为文件创建一个临时本地 URL（blob:// 开头）
     // 可以直接用在 <img src={...}> 中显示图片，无需上传服务器
     const imageUrl = URL.createObjectURL(file);
@@ -1303,8 +1441,12 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
       setPendingFile(file);
       setShowSolveOptions(true);
     } else {
-      // 绘图模式：使用用户在模式面板中选择的选项
-      await processFile(file, drawModeRef.current);
+      if (isGifFile(file)) {
+        pendingGifFileRef.current = { file, mode: drawModeRef.current };
+        setShowGifQualitySheet(true);
+      } else {
+        await processFile(file, drawModeRef.current);
+      }
     }
 
     e.target.value = ''; // 清空文件输入，允许再次选择同一文件
@@ -1420,7 +1562,23 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
   /** 打开智能绘图模式选择（粘贴图片路径） */
   const openDrawModeSheetForPaste = (file: File) => {
     pendingDrawFileRef.current = file;
-    openDrawModeSheet(file.name);
+    openDrawModeSheet(file.name, isGifFile(file));
+  };
+
+  const startGifWithQuality = async (quality: GifQualityTier) => {
+    gifQualityRef.current = quality;
+    setGifQualityTier(quality);
+    setShowGifQualitySheet(false);
+
+    const pending = pendingGifFileRef.current;
+    if (pending) {
+      pendingGifFileRef.current = null;
+      await processGifFile(pending.file, pending.mode, quality);
+    }
+  };
+
+  const handleGifQualitySelect = (quality: GifQualityTier) => {
+    void startGifWithQuality(quality);
   };
 
   /** 用户选定绘图模式后：Emoji / 文件 / 打开文件选择器 */
@@ -1455,7 +1613,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     const pendingFile = pendingDrawFileRef.current;
     if (pendingFile) {
       pendingDrawFileRef.current = null;
-      await processFile(pendingFile, mode);
+      await processFile(pendingFile, mode, gifQualityRef.current);
       return;
     }
 
@@ -1894,6 +2052,108 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
                             <button
                                 key={opt.mode}
                                 onClick={() => handleDrawModeSelect(opt.mode)}
+                                className={`w-full flex items-center gap-3 px-4 py-3 rounded-2xl transition-colors text-left ${opt.cls}`}
+                            >
+                                <span className="shrink-0">{opt.icon}</span>
+                                <div className="min-w-0 flex-1">
+                                    <p className="text-sm text-gray-800" style={{fontWeight:600}}>{opt.label}</p>
+                                    <p className="text-xs text-gray-500 mt-0.5">{opt.desc}</p>
+                                </div>
+                                <ChevronRight size={15} className="text-gray-300 shrink-0" />
+                            </button>
+                        ))}
+                    </div>
+                    {drawModeSheetIsGif && (
+                      <div className="mt-4 pt-4 border-t border-gray-100">
+                        <p className="text-xs text-gray-500 mb-2" style={{ fontWeight: 600 }}>
+                          {t('gif_quality_title')}
+                        </p>
+                        <div className="grid grid-cols-2 gap-2">
+                          {([
+                            {
+                              tier: 'standard' as const,
+                              label: t('gif_quality_standard'),
+                              desc: t('gif_quality_standard_desc'),
+                              icon: <Zap size={15} className="text-amber-600" />,
+                              cls: gifQualityTier === 'standard'
+                                ? 'ring-2 ring-amber-400 bg-amber-50'
+                                : 'bg-gray-50 hover:bg-gray-100',
+                            },
+                            {
+                              tier: 'cinema' as const,
+                              label: t('gif_quality_cinema'),
+                              desc: t('gif_quality_cinema_desc'),
+                              icon: <Film size={15} className="text-violet-600" />,
+                              cls: gifQualityTier === 'cinema'
+                                ? 'ring-2 ring-violet-400 bg-violet-50'
+                                : 'bg-gray-50 hover:bg-gray-100',
+                            },
+                          ]).map(opt => (
+                            <button
+                              key={opt.tier}
+                              type="button"
+                              onClick={() => {
+                                setGifQualityTier(opt.tier);
+                                gifQualityRef.current = opt.tier;
+                              }}
+                              className={`rounded-2xl p-3 text-left transition-all border border-transparent ${opt.cls}`}
+                            >
+                              <div className="flex items-center gap-1.5 mb-1">
+                                {opt.icon}
+                                <span className="text-sm text-gray-800" style={{ fontWeight: 600 }}>
+                                  {opt.label}
+                                </span>
+                              </div>
+                              <p className="text-[10px] text-gray-500 leading-snug">{opt.desc}</p>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                </div>
+            </div>
+        )}
+
+        {/* GIF Quality Sheet (file picker path) */}
+        {showGifQualitySheet && (
+            <div className="absolute inset-0 z-50 bg-black/30 flex items-end justify-center animate-in fade-in duration-150">
+                <div className="w-full bg-white rounded-t-3xl p-5 pb-8 shadow-2xl animate-in slide-in-from-bottom-4 duration-200">
+                    <div className="flex items-center justify-between mb-4">
+                        <div>
+                            <h3 className="text-gray-900" style={{fontWeight:700, fontSize:'1rem'}}>{t('gif_quality_title')}</h3>
+                            {pendingGifFileRef.current && (
+                              <p className="text-xs text-gray-400 mt-0.5 truncate max-w-[240px]">
+                                {pendingGifFileRef.current.file.name}
+                              </p>
+                            )}
+                        </div>
+                        <button
+                            onClick={() => { setShowGifQualitySheet(false); pendingGifFileRef.current = null; }}
+                            className="p-2 hover:bg-gray-100 rounded-full transition-colors"
+                        >
+                            <X size={20} />
+                        </button>
+                    </div>
+                    <div className="space-y-2">
+                        {([
+                            {
+                              tier: 'standard' as const,
+                              label: t('gif_quality_standard'),
+                              desc: t('gif_quality_standard_desc'),
+                              cls: 'bg-amber-50 hover:bg-amber-100 border border-amber-100',
+                              icon: <Zap size={16} className="text-amber-600" />,
+                            },
+                            {
+                              tier: 'cinema' as const,
+                              label: t('gif_quality_cinema'),
+                              desc: t('gif_quality_cinema_desc'),
+                              cls: 'bg-violet-50 hover:bg-violet-100 border border-violet-100',
+                              icon: <Film size={16} className="text-violet-600" />,
+                            },
+                        ]).map(opt => (
+                            <button
+                                key={opt.tier}
+                                onClick={() => handleGifQualitySelect(opt.tier)}
                                 className={`w-full flex items-center gap-3 px-4 py-3 rounded-2xl transition-colors text-left ${opt.cls}`}
                             >
                                 <span className="shrink-0">{opt.icon}</span>
