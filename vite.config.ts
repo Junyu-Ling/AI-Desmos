@@ -17,7 +17,7 @@
  */
 
 // defineConfig：Vite 提供的辅助函数，让配置对象有 TypeScript 类型提示
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 
 // path：Node.js 内置模块，提供跨平台的文件路径操作工具
 import path from 'path'
@@ -92,8 +92,23 @@ function figmaAssetResolver() {
 }
 
 // 导出 Vite 配置对象（Vite 会自动读取这个默认导出）
-export default defineConfig({
-  // plugins：使用的 Vite 插件列表，按顺序执行
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), '');
+  const serverDeepSeekKey = env.DEEPSEEK_API_KEY || env.VITE_DEEPSEEK_API_KEY || '';
+  const serverGeminiKey = env.GEMINI_API_KEY || env.VITE_GEMINI_API_KEY || '';
+
+  const injectBearer = (
+    proxyReq: import('http').ClientRequest,
+    req: import('http').IncomingMessage,
+    fallbackKey: string,
+  ) => {
+    const auth = req.headers['authorization'];
+    const bearerMatch = typeof auth === 'string' && auth.match(/^Bearer\s+(.+)$/i);
+    const key = (bearerMatch?.[1]?.trim()) || fallbackKey;
+    if (key) proxyReq.setHeader('Authorization', `Bearer ${key}`);
+  };
+
+  return {
   plugins: [
     stripPackageVersion(), // 自定义：解析 package@version 导入
     figmaAssetResolver(), // 自定义：解析 figma:asset/ 资源路径
@@ -113,4 +128,30 @@ export default defineConfig({
       '@': path.resolve(__dirname, './src/app'), // @ 指向 src/app 目录
     },
   },
-})
+
+  server: {
+    proxy: {
+      '/api/deepseek': {
+        target: 'https://api.deepseek.com',
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/api\/deepseek/, ''),
+        configure: (proxy) => {
+          proxy.on('proxyReq', (proxyReq, req) => {
+            injectBearer(proxyReq, req, serverDeepSeekKey);
+          });
+        },
+      },
+      '/api/gemini': {
+        target: 'https://generativelanguage.googleapis.com',
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/api\/gemini/, ''),
+        configure: (proxy) => {
+          proxy.on('proxyReq', (proxyReq, req) => {
+            injectBearer(proxyReq, req, serverGeminiKey);
+          });
+        },
+      },
+    },
+  },
+};
+});

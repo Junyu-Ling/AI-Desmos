@@ -1,34 +1,36 @@
 /**
  * Smart Drawing 图像修复与 AI 视觉分析
- * 在傅里叶拟合前增强对比度、锐化边缘，并由视觉模型优化拟合参数。
+ * - 本地：对比度拉伸、锐化、反色
+ * - AI：优化拟合参数 + 精确追踪主轮廓（补充 Sobel 边缘检测）
  */
 
 import { getProviderById } from './api-providers';
-import { getApiConfig } from './deepseek';
+import { getApiConfig, getEffectiveApiKey, resolveVisionModel } from './deepseek';
+import { buildProviderRequest, compressImageDataUrl } from './gemini-api';
 
 export type SmartDrawMode = 'outline' | 'fill' | 'both';
 
 export type SmartDrawTuningParams = {
-  /** 对比度拉伸强度 1.0–2.5 */
   contrastBoost: number;
-  /** 锐化强度 0–1.5 */
   sharpenAmount: number;
-  /** 边缘检测阈值倍率 0.5–1.5（越小保留越多弱边缘） */
   edgeThresholdFactor: number;
-  /** 轮廓强度过滤比例 0.12–0.45（越小保留越多弱轮廓） */
   strengthThresholdRatio: number;
-  /** 最多保留轮廓数 */
   maxContours: number;
-  /** 傅里叶频率项数 */
   fourierK: number;
-  /** 每条轮廓降采样目标点数 */
   targetPointCount: number;
-  /** 保留细线/小轮廓，降低几何过滤强度 */
   preserveFineDetails: boolean;
-  /** 深色背景图反色为白底黑线 */
   invertColors: boolean;
-  /** 预处理模糊次数 0–2 */
   blurPasses: number;
+};
+
+export type SmartDrawAIContour = {
+  closed: boolean;
+  points: { x: number; y: number }[];
+};
+
+export type SmartDrawPrepareResult = {
+  tuning: SmartDrawTuningParams;
+  aiContours: SmartDrawAIContour[];
 };
 
 export const DEFAULT_SMART_DRAW_TUNING: SmartDrawTuningParams = {
@@ -85,9 +87,7 @@ export function analyzeImageHeuristically(
   const { data } = ctx.getImageData(0, 0, width, height);
   let sum = 0;
   let dark = 0;
-  let bright = 0;
   let edgeSpread = 0;
-  const samples = Math.min(data.length / 4, width * height);
   const step = Math.max(4, Math.floor((width * height) / 8000));
 
   for (let i = 0; i < width * height; i += step) {
@@ -95,7 +95,6 @@ export function analyzeImageHeuristically(
     const lum = 0.299 * data[off] + 0.587 * data[off + 1] + 0.114 * data[off + 2];
     sum += lum;
     if (lum < 60) dark += 1;
-    if (lum > 200) bright += 1;
     if (i + step * 4 < data.length) {
       const lum2 = 0.299 * data[off + step * 4] + 0.587 * data[off + step * 4 + 1]
         + 0.114 * data[off + step * 4 + 2];
@@ -106,7 +105,6 @@ export function analyzeImageHeuristically(
   const count = Math.ceil((width * height) / step);
   const avgLum = sum / count;
   const darkRatio = dark / count;
-  const brightRatio = bright / count;
   const avgEdge = edgeSpread / count;
 
   const lowContrast = avgEdge < 18;
@@ -137,36 +135,81 @@ export function analyzeImageHeuristically(
   return mergeSmartDrawTuning(tuning);
 }
 
-const VISION_MODELS: Record<string, string> = {
-  openai: 'gpt-4o-mini',
-  google: 'gemini-2.0-flash',
-  claude: 'claude-3-5-sonnet-20241022',
-  openrouter: 'openai/gpt-4o-mini',
-  xai: 'grok-2-vision-latest',
-};
+const PROXY_PROVIDERS = new Set(['deepseek', 'google']);
 
-const VISION_PROMPT = `You analyze images for conversion into parametric curves (edge detection + Fourier series).
-Return ONLY valid JSON (no markdown) with these fields:
+const SMART_DRAW_AI_PROMPT = `You analyze images for Smart Drawing: edge detection + Fourier parametric curves on Desmos.
+Return ONLY valid JSON (no markdown). Mode: {MODE}.
+
 {
   "contrastBoost": number (1.0-2.5),
   "sharpenAmount": number (0-1.5),
-  "edgeThresholdFactor": number (0.4-1.6, lower keeps more weak edges),
-  "strengthThresholdRatio": number (0.1-0.5, lower keeps more contours),
+  "edgeThresholdFactor": number (0.4-1.6, lower = keep weak edges),
+  "strengthThresholdRatio": number (0.1-0.5, lower = keep more contours),
   "maxContours": integer (25-90),
-  "fourierK": integer (40-160, higher = more detail),
+  "fourierK": integer (40-160, higher = sharper curves),
   "targetPointCount": integer (250-800),
   "preserveFineDetails": boolean,
   "invertColors": boolean (true if dark background / light lines),
-  "blurPasses": integer (0-2)
+  "blurPasses": integer (0-2),
+  "contours": [
+    {
+      "closed": boolean,
+      "points": [[x,y], ...] 
+    }
+  ]
 }
-Goal: preserve fine lines, hair, small features; reduce noise blobs. Mode: {MODE}.`;
 
-function parseVisionJson(text: string): Partial<SmartDrawTuningParams> | null {
+For "contours" (skip or [] if mode is fill-only):
+- Trace MAIN visible outlines only (outer shape, key internal lines, hair/fine features if important).
+- Use normalized coords 0-1000: x=0 left, x=1000 right, y=0 top, y=1000 bottom.
+- 12-60 points per contour, evenly spaced along the path.
+- Max 20 contours. Prioritize accuracy over quantity.
+- closed=true for loops; false for open strokes.`;
+
+type RawAIResponse = Partial<SmartDrawTuningParams> & {
+  contours?: Array<{
+    closed?: boolean;
+    points?: unknown;
+  }>;
+};
+
+function parseAIResponse(
+  text: string,
+  width: number,
+  height: number,
+): { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] } | null {
   const trimmed = text.trim();
   const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
   if (!jsonMatch) return null;
+
   try {
-    return JSON.parse(jsonMatch[0]) as Partial<SmartDrawTuningParams>;
+    const raw = JSON.parse(jsonMatch[0]) as RawAIResponse;
+    const { contours: rawContours, ...tuningPartial } = raw;
+    const contours: SmartDrawAIContour[] = [];
+
+    if (Array.isArray(rawContours)) {
+      for (const item of rawContours.slice(0, 25)) {
+        if (!Array.isArray(item.points) || item.points.length < 6) continue;
+
+        const points: { x: number; y: number }[] = [];
+        for (const pt of item.points) {
+          if (!Array.isArray(pt) || pt.length < 2) continue;
+          const nx = Number(pt[0]);
+          const ny = Number(pt[1]);
+          if (!Number.isFinite(nx) || !Number.isFinite(ny)) continue;
+          points.push({
+            x: clamp((nx / 1000) * width, 0, width - 1),
+            y: clamp((ny / 1000) * height, 0, height - 1),
+          });
+        }
+
+        if (points.length >= 6) {
+          contours.push({ closed: Boolean(item.closed), points });
+        }
+      }
+    }
+
+    return { tuning: tuningPartial, contours };
   } catch {
     return null;
   }
@@ -174,25 +217,25 @@ function parseVisionJson(text: string): Partial<SmartDrawTuningParams> | null {
 
 async function callOpenAiVision(
   endpoint: string,
-  apiKey: string,
   model: string,
   dataUrl: string,
   mode: SmartDrawMode,
-): Promise<Partial<SmartDrawTuningParams> | null> {
+  width: number,
+  height: number,
+  headersOverride?: Record<string, string>,
+): Promise<{ tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] } | null> {
+  const headers = headersOverride ?? { 'Content-Type': 'application/json' };
   const response = await fetch(endpoint, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
+    headers,
     body: JSON.stringify({
       model,
       temperature: 0.1,
-      max_tokens: 512,
+      max_tokens: 4096,
       messages: [{
         role: 'user',
         content: [
-          { type: 'text', text: VISION_PROMPT.replace('{MODE}', mode) },
+          { type: 'text', text: SMART_DRAW_AI_PROMPT.replace('{MODE}', mode) },
           { type: 'image_url', image_url: { url: dataUrl, detail: 'low' } },
         ],
       }],
@@ -203,7 +246,8 @@ async function callOpenAiVision(
   const json = await response.json();
   const content = json?.choices?.[0]?.message?.content;
   if (typeof content !== 'string') return null;
-  return parseVisionJson(content);
+
+  return parseAIResponse(content, width, height);
 }
 
 async function callClaudeVision(
@@ -211,7 +255,9 @@ async function callClaudeVision(
   model: string,
   dataUrl: string,
   mode: SmartDrawMode,
-): Promise<Partial<SmartDrawTuningParams> | null> {
+  width: number,
+  height: number,
+): Promise<{ tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] } | null> {
   const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, '');
   const mediaType = dataUrl.startsWith('data:image/png') ? 'image/png' : 'image/jpeg';
 
@@ -224,7 +270,7 @@ async function callClaudeVision(
     },
     body: JSON.stringify({
       model,
-      max_tokens: 512,
+      max_tokens: 4096,
       messages: [{
         role: 'user',
         content: [
@@ -232,7 +278,7 @@ async function callClaudeVision(
             type: 'image',
             source: { type: 'base64', media_type: mediaType, data: base64 },
           },
-          { type: 'text', text: VISION_PROMPT.replace('{MODE}', mode) },
+          { type: 'text', text: SMART_DRAW_AI_PROMPT.replace('{MODE}', mode) },
         ],
       }],
     }),
@@ -242,33 +288,60 @@ async function callClaudeVision(
   const json = await response.json();
   const block = json?.content?.find((b: { type: string }) => b.type === 'text');
   if (!block?.text) return null;
-  return parseVisionJson(block.text);
+  return parseAIResponse(block.text, width, height);
 }
 
-/** 调用视觉模型分析图片，失败时返回 null */
+/** 调用视觉模型：优化参数 + 追踪主轮廓；失败时返回 null */
+export async function analyzeSmartDrawWithAI(
+  dataUrl: string,
+  mode: SmartDrawMode,
+  width: number,
+  height: number,
+  apiKey?: string,
+): Promise<{ tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] } | null> {
+  if (mode === 'fill') return null;
+
+  const cfg = getApiConfig();
+  const key = getEffectiveApiKey(apiKey);
+  const provider = getProviderById(cfg.provider);
+  if (!provider) return null;
+
+  if (!PROXY_PROVIDERS.has(provider.id) && !key) return null;
+
+  try {
+    const compressed = await compressImageDataUrl(dataUrl, 768, 0.85);
+
+    if (provider.format === 'anthropic') {
+      if (!key) return null;
+      return await callClaudeVision(
+        key,
+        resolveVisionModel(provider.id, cfg.model),
+        compressed,
+        mode,
+        width,
+        height,
+      );
+    }
+
+    const { url, headers } = buildProviderRequest(provider.id, provider.endpoint, key);
+    const model = resolveVisionModel(provider.id, cfg.model);
+
+    const result = await callOpenAiVision(url, model, compressed, mode, width, height, headers);
+    if (!result) return null;
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+/** @deprecated 使用 analyzeSmartDrawWithAI */
 export async function analyzeImageWithAI(
   dataUrl: string,
   mode: SmartDrawMode,
   apiKey?: string,
 ): Promise<Partial<SmartDrawTuningParams> | null> {
-  const cfg = getApiConfig();
-  const key = (apiKey || cfg.key || '').trim();
-  if (!key) return null;
-
-  const provider = getProviderById(cfg.provider);
-  if (!provider) return null;
-
-  const visionModel = VISION_MODELS[provider.id];
-  if (!visionModel && provider.format !== 'anthropic') return null;
-
-  try {
-    if (provider.format === 'anthropic') {
-      return await callClaudeVision(key, visionModel || provider.defaultModel, dataUrl, mode);
-    }
-    return await callOpenAiVision(provider.endpoint, key, visionModel || provider.defaultModel, dataUrl, mode);
-  } catch {
-    return null;
-  }
+  const result = await analyzeSmartDrawWithAI(dataUrl, mode, 1024, 1024, apiKey);
+  return result?.tuning ?? null;
 }
 
 /** 在 Canvas 上应用对比度拉伸、锐化、可选反色 */
@@ -381,18 +454,28 @@ export async function prepareSmartDrawImage(
     enableAiRepair?: boolean;
     onProgress?: (phase: SmartDrawRepairPhase) => void;
   } = {},
-): Promise<SmartDrawTuningParams> {
+): Promise<SmartDrawPrepareResult> {
   let tuning = analyzeImageHeuristically(ctx, width, height, mode);
+  let aiContours: SmartDrawAIContour[] = [];
 
   if (options.enableAiRepair !== false) {
     options.onProgress?.('ai_analyze');
-    const aiPartial = await analyzeImageWithAI(dataUrl, mode, options.apiKey);
-    if (aiPartial) {
-      tuning = mergeSmartDrawTuning({ ...tuning, ...aiPartial });
+    const aiResult = await analyzeSmartDrawWithAI(dataUrl, mode, width, height, options.apiKey);
+    if (aiResult) {
+      tuning = mergeSmartDrawTuning({ ...tuning, ...aiResult.tuning });
+      aiContours = aiResult.contours;
+      if (aiContours.length > 0) {
+        tuning = mergeSmartDrawTuning({
+          ...tuning,
+          preserveFineDetails: true,
+          fourierK: Math.max(tuning.fourierK, 115),
+          targetPointCount: Math.max(tuning.targetPointCount, 500),
+        });
+      }
     }
   }
 
   options.onProgress?.('local_repair');
   applyLocalImageRepair(ctx, width, height, tuning);
-  return tuning;
+  return { tuning, aiContours };
 }

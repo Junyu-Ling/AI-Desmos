@@ -1139,6 +1139,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
          error.message.includes('401')
       )) {
          errorKey = 'err_key';
+      } else if (error.message && (
+         error.message.includes('NetworkError') ||
+         error.message.includes('Failed to fetch')
+      )) {
+         errorKey = 'err_network';
       }
 
       setMessages(prev => [...prev, { 
@@ -1392,6 +1397,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
         errorContent = t('err_balance');
       } else if (msg.includes('Unauthorized')) {
         errorContent = t('err_key');
+      } else if (msg.includes('NetworkError') || msg.includes('Failed to fetch')) {
+        errorContent = t('err_network');
       }
       setMessages(prev => prev.map(m =>
         m.id === aiMsgId ? { ...m, content: errorContent } : m

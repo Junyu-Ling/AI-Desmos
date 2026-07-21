@@ -100,7 +100,7 @@ export const translations = {
     smart_draw_mode_fill: '仅涂色',
     smart_draw_mode_fill_desc: '只用色块还原颜色，不勾线',
     smart_draw_mode_both: '轮廓 + 涂色',
-    smart_draw_mode_both_desc: '先勾线再填色，AI 修复细节后还原度最高',
+    smart_draw_mode_both_desc: '先勾线再填色，AI 精确追踪轮廓后还原度最高',
 
     // ── 快速示例（帮助面板） ──────────────────────────────────────────────────
     example_sine: '画一个正弦函数',
@@ -137,11 +137,11 @@ export const translations = {
 
     // ── 拍照解题 ──────────────────────────────────────────────────────────────
     solve_problem: '拍照解题',
-    solve_problem_desc: '上传数学题照片，OCR 识别文字后 AI 按你选择的风格解答。',
+    solve_problem_desc: '上传数学题照片，AI 直接阅读图片并按你选择的风格解答（无需 OCR）。',
     solve_problem_how: '点击回形针 →「解决问题」→ 上传题目图片 → 选择仅提示 / 显示答案 / 提示+完整解答。',
     solve_problem_example1: '上传证明题，选「仅提示」获取思路',
     solve_problem_example2: '上传计算题，选「显示答案」查看完整步骤',
-    solve_problem_principle: '本地 OCR 提取题目文字，再调用 AI 生成解答；需配置支持视觉识别的 API Key。',
+    solve_problem_principle: 'Gemini 视觉模型直接读图解题，再按需注入 Desmos 公式；默认使用内置 Gemini Key。',
 
     // ── 手绘转公式 ────────────────────────────────────────────────────────────
     hand_draw: '手绘转公式',
@@ -184,7 +184,7 @@ export const translations = {
     drawing_complete: '绘画已完成。',            // 图片拟合成功后的消息
     drawing_processing: '正在分析图片…',
     drawing_local_repair: '正在修复图片对比度与边缘…',
-    drawing_ai_repair: 'AI 正在分析并优化细节参数…',
+    drawing_ai_repair: 'AI 正在分析图像并精确追踪轮廓…',
     drawing_progress_outline: '正在勾勒轮廓 {current}/{total}…',
     drawing_progress_fill: '正在填色 {current}/{total}…',
     drawing_cancelled: '绘画已终止。',
@@ -206,7 +206,8 @@ export const translations = {
     // ── 错误消息（分类型） ────────────────────────────────────────────────────
     err_balance: '⚠️ API 余额不足：请检查您的 DeepSeek 账户余额。',  // 余额不足错误
     err_key: '⚠️ API Key 无效：请检查您的 Key 配置是否正确。',       // Key 无效错误
-    err_system: '系统错误：连接断开或超时。',                         // 其他网络/系统错误
+    err_system: '系统错误：连接断开或超时。',
+    err_network: '⚠️ 无法连接 AI 服务：请确认网络正常，或稍后重试（Gemini 配额用尽也会表现为连接失败）。',
 
     // ── 画板上下文注入（发给 AI 的系统消息） ────────────────────────────────
     analyze_prompt: '请根据下方「实时画板快照」分析当前画布上的全部可见内容，解释其几何意义与相互关系。不要引用聊天记录里曾出现但快照中已不存在的公式。',
@@ -348,7 +349,7 @@ export const translations = {
 
     // ── OCR 识别流程 ──────────────────────────────────────────────────────────
     ocr_recognizing: '📷 OCR 识别中，请稍候...', // 正在进行 OCR 识别
-    ocr_analyzing: '🧠 识别完成，正在分析题目...', // OCR 完成，AI 开始分析
+    ocr_analyzing: '🧠 正在阅读题目图片并分析…',
     ocr_fail: '❌ OCR 识别失败：请确保图片清晰、包含可读文字。',
     ocr_empty: '❌ OCR 未识别到文字，请换一张更清晰的图片。',
 
@@ -490,7 +491,7 @@ export const translations = {
     smart_draw_mode_fill: 'Fill only',
     smart_draw_mode_fill_desc: 'Color blocks only, no outlines',
     smart_draw_mode_both: 'Outline + fill',
-    smart_draw_mode_both_desc: 'Outlines first, then fill — AI detail repair for highest fidelity',
+    smart_draw_mode_both_desc: 'Outlines first, then fill — AI contour tracing for highest fidelity',
 
     // ── 快速示例 ──────────────────────────────────────────────────────────────
     example_sine: 'Draw a sine wave',
@@ -525,11 +526,11 @@ export const translations = {
     image_fitting_tip4: 'High contrast and clear outline sketches work best',
 
     solve_problem: 'Photo Problem Solving',
-    solve_problem_desc: 'Upload a math problem photo — OCR reads the text, then AI solves in your chosen style.',
+    solve_problem_desc: 'Upload a math problem photo — AI reads the image directly and solves in your chosen style (no OCR).',
     solve_problem_how: 'Paperclip → Solve Problem → upload photo → choose hints only / full answer / hints + solution.',
     solve_problem_example1: 'Upload a proof — pick "Hints Only" for approach',
     solve_problem_example2: 'Upload a calculation — pick "Show Answer" for full steps',
-    solve_problem_principle: 'Local OCR extracts text, then AI generates a solution; requires a vision-capable API Key.',
+    solve_problem_principle: 'Gemini vision reads the image directly, then injects Desmos formulas as needed; built-in Gemini key by default.',
 
     hand_draw: 'Hand Draw to Formula',
     hand_draw_desc: 'Sketch freehand on the Desmos canvas and convert strokes to math curves.',
@@ -568,7 +569,7 @@ export const translations = {
     drawing_complete: 'Drawing complete.',
     drawing_processing: 'Analyzing image…',
     drawing_local_repair: 'Enhancing contrast and edges…',
-    drawing_ai_repair: 'AI is analyzing and tuning detail parameters…',
+    drawing_ai_repair: 'AI is analyzing the image and tracing precise contours…',
     drawing_progress_outline: 'Drawing outlines {current}/{total}…',
     drawing_progress_fill: 'Filling blocks {current}/{total}…',
     drawing_cancelled: 'Drawing stopped.',
@@ -591,6 +592,7 @@ export const translations = {
     err_balance: '⚠️ Insufficient Balance: Check your DeepSeek account.',
     err_key: '⚠️ Invalid API Key: Check your configuration.',
     err_system: 'System Error: Connection lost or timeout.',
+    err_network: '⚠️ Cannot reach AI service: check your network or retry later (Gemini quota limits may also cause this).',
 
     // ── 画板上下文注入 ────────────────────────────────────────────────────────
     analyze_prompt: 'Analyze ONLY the live canvas snapshot below. Explain the geometric meaning and relationships of what is currently visible. Do NOT refer to formulas from chat history that are not in the snapshot.',
@@ -724,7 +726,7 @@ export const translations = {
 
     // ── OCR 识别流程 ──────────────────────────────────────────────────────────
     ocr_recognizing: '📷 OCR recognizing, please wait...',
-    ocr_analyzing: '🧠 Recognition done, analyzing the problem...',
+    ocr_analyzing: '🧠 Reading the problem image and analyzing…',
     ocr_fail: '❌ OCR failed: Make sure the image is clear and contains readable text.',
     ocr_empty: '❌ OCR found no text. Please try a clearer image.',
 

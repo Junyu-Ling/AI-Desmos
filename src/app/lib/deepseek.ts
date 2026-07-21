@@ -38,6 +38,7 @@ import {
   getProviderById,
 } from './api-providers';
 import { CHAT_LATEX_SYNTAX_EN, CHAT_LATEX_SYNTAX_ZH } from './chat-latex';
+import { buildProviderRequest, compressImageDataUrl } from './gemini-api';
 
 export type ApiProvider = ApiProviderId;
 export { DEFAULT_MODELS, CLAUDE_MODELS, API_ENDPOINTS };
@@ -54,12 +55,9 @@ export interface ChatMessage {
 
 // ─── 常量配置 ────────────────────────────────────────────────────────────────
 
-/**
- * DEEPSEEK_API_KEY — 内置的默认 DeepSeek API Key
- * 试用模式（未配置自定义 Key 的用户）和邀请码解锁用户使用这个 Key。
- * 正式部署时应注意：内置 Key 会消耗开发者账户的余额。
- */
-const DEEPSEEK_API_KEY = 'sk-b227b4e99a6c47b58eb1e2548aef18bc';
+/** 内置默认 DeepSeek Key（未配置时由 /api/deepseek 服务端代理注入） */
+const DEEPSEEK_API_KEY =
+  (typeof import.meta !== 'undefined' && import.meta.env?.VITE_DEEPSEEK_API_KEY) || '';
 
 function resolveProviderConfig(providerId: string) {
   return getProviderById(providerId) || getProviderById('deepseek')!;
@@ -75,14 +73,51 @@ function readStoredApiKey(): string {
 }
 
 export const getApiConfig = (): { provider: ApiProviderId; key: string; model: string } => {
-  const key = readStoredApiKey();
+  const storedKey = readStoredApiKey();
   const savedProvider = localStorage.getItem('desmos_api_provider');
-  const detected = key ? detectProviderFromKey(key) : null;
-  const provider = (detected?.id || savedProvider || 'deepseek') as ApiProviderId;
+  const detected = storedKey ? detectProviderFromKey(storedKey) : null;
+  let provider = (detected?.id || savedProvider || 'deepseek') as ApiProviderId;
+  if (!storedKey && provider === 'google') provider = 'deepseek';
   const providerConfig = resolveProviderConfig(provider);
-  const model = localStorage.getItem('desmos_api_model') || providerConfig.defaultModel;
-  return { provider, key, model };
+  let model = localStorage.getItem('desmos_api_model') || providerConfig.defaultModel;
+  if (!storedKey && model.includes('gemini')) model = providerConfig.defaultModel;
+  return { provider, key: storedKey, model };
 };
+
+/** 优先用户 Key，否则内置/服务端代理 Key */
+export const getEffectiveApiKey = (override?: string): string =>
+  (override || readStoredApiKey() || DEEPSEEK_API_KEY).trim();
+
+/** 部分旧模型对该 Key 免费配额为 0，自动切到可用别名 */
+const LEGACY_GEMINI_MODELS = new Set([
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-001',
+  'gemini-2.0-flash-lite',
+  'gemini-2.0-flash-lite-001',
+]);
+
+export const resolveGeminiModel = (model: string): string => {
+  if (LEGACY_GEMINI_MODELS.has(model)) return 'gemini-flash-latest';
+  if (model.includes('gemini')) return model;
+  return 'gemini-flash-latest';
+};
+
+export const resolveProviderModel = (providerId: string, model: string): string => {
+  if (providerId === 'google') {
+    return resolveGeminiModel(model.includes('gemini') ? model : model);
+  }
+  return model;
+};
+
+const VISION_MODELS: Record<string, string> = {
+  deepseek: 'deepseek-v4-flash',
+  google: 'gemini-flash-latest',
+  openai: 'gpt-4o-mini',
+  claude: 'claude-3-5-sonnet-20241022',
+};
+
+export const resolveVisionModel = (providerId: string, model: string): string =>
+  VISION_MODELS[providerId] || resolveProviderModel(providerId, model);
 
 export { detectProviderFromKey, getProviderById, API_PROVIDERS } from './api-providers';
 
@@ -514,9 +549,9 @@ export const callDeepSeek = async (messages: ChatMessage[], apiKey?: string, lan
 
   // ── DeepSeek / OpenAI 路由 ────────────────────────────────────────────────
   // 优先用户传入的 Key，其次配置中的 Key，最后用内置默认 Key
-  const key = apiKey || cfg.key || DEEPSEEK_API_KEY;
-  const endpoint = providerConfig.endpoint;
-  const model = cfg.model;
+  const key = getEffectiveApiKey(apiKey);
+  const model = resolveProviderModel(providerConfig.id, cfg.model);
+  const { url, headers } = buildProviderRequest(providerConfig.id, providerConfig.endpoint, key);
 
   try {
     const messagesToSend = [
@@ -524,17 +559,14 @@ export const callDeepSeek = async (messages: ChatMessage[], apiKey?: string, lan
       ...messages
     ];
 
-    const response = await fetch(endpoint, {
+    const response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${key}` // DeepSeek/OpenAI 用 Bearer Token 认证
-      },
+      headers,
       body: JSON.stringify({
         model,
         messages: messagesToSend,
-        temperature: 0.3, // 随机性：0=最确定，1=最随机，0.3 是低随机性（更精确）
-        stream: false      // 非流式：等全部回复后一次性返回
+        temperature: 0.3,
+        stream: false
       })
     });
 
@@ -592,9 +624,9 @@ export const callDeepSeekStream = async (
     return callClaudeStream(messages, onChunk, key, lang, useComputerUse);
   }
 
-  const key = apiKey || cfg.key || DEEPSEEK_API_KEY;
-  const endpoint = providerConfig.endpoint;
-  const model = cfg.model;
+  const key = getEffectiveApiKey(apiKey);
+  const model = resolveProviderModel(providerConfig.id, cfg.model);
+  const { url, headers } = buildProviderRequest(providerConfig.id, providerConfig.endpoint, key);
   const systemPrompt = getSystemPrompt(lang);
 
   try {
@@ -603,12 +635,9 @@ export const callDeepSeekStream = async (
       ...messages
     ];
 
-    const response = await fetch(endpoint, {
+    const response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${key}`
-      },
+      headers,
       body: JSON.stringify({
         model,
         messages: messagesToSend,
@@ -618,8 +647,9 @@ export const callDeepSeekStream = async (
     });
 
     if (!response.ok) {
-      if (response.status === 402) throw new Error('Insufficient Balance'); // 余额不足
-      if (response.status === 401) throw new Error('Unauthorized');          // Key 无效
+      if (response.status === 402) throw new Error('Insufficient Balance');
+      if (response.status === 401) throw new Error('Unauthorized');
+      if (response.status === 429) throw new Error('API Quota Exceeded');
       const errorData = await response.json().catch(() => ({}));
       throw new Error(`API Error: ${response.status} ${JSON.stringify(errorData)}`);
     }
@@ -667,6 +697,7 @@ export const callDeepSeekStream = async (
     }
 
   } catch (error) {
+    if (error instanceof TypeError) throw new Error('NetworkError');
     console.warn('[callDeepSeekStream] stream ended with error:', error);
     throw error;
   }
@@ -1013,8 +1044,8 @@ export const callOCRApi = async (imageDataUrl: string): Promise<string> => {
 const SOLVE_SYSTEM: Record<'zh' | 'en', string> = {
   zh: [
     '你是一位专业的解题助手，擅长数学、物理、化学等理科题目。',
-    '用户会提供一段从题目图片 OCR 识别出来的文字内容。',
-    '请仔细理解题意（OCR 可能有少量错误，请自行修正明显错误），然后给出解答。',
+    '用户会直接上传题目图片，请**直接阅读图片中的题目**并解答（无需依赖外部 OCR）。',
+    '若图片模糊或手写难辨，请根据可见信息合理推断并说明假设。',
     '',
     '**排版与 LaTeX 规范（必须遵守）：**',
     '1. 步骤清晰，分点说明；不同步骤之间空一行。',
@@ -1029,8 +1060,8 @@ const SOLVE_SYSTEM: Record<'zh' | 'en', string> = {
   ].join('\n'),
   en: [
     'You are a professional problem-solving assistant specializing in math, physics, and chemistry.',
-    'The user will provide text extracted via OCR from a problem image.',
-    'Please carefully interpret the problem (OCR may have minor errors — correct obvious mistakes), then give a full solution.',
+    'The user uploads a problem image directly — **read the image yourself** and solve (no external OCR).',
+    'If the image is blurry or handwritten, infer reasonably and state your assumptions.',
     '',
     '**Formatting & LaTeX (required):**',
     '1. Clear steps with bullet points or numbered lists; blank line between sections.',
@@ -1068,21 +1099,41 @@ const SOLVE_USER_PROMPTS: Record<'hint' | 'answer' | 'full', Record<'zh' | 'en',
 };
 
 /**
- * callDeepSeekSolveStream — 解题模式的主函数
- *
- * 【完整处理流程】
- *   1. 调用 onProgress('ocr') → 更新 UI 显示"OCR 识别中..."
- *   2. callOCRApi() → 图片文字识别
- *   3. 调用 onProgress('analyzing') → 更新 UI 显示"正在分析..."
- *   4. 调用 AI 流式 API → 逐字把解答传给 onChunk 更新 UI
- *
- * @param imageDataUrl - 题目图片的 Data URL
- * @param solveMode    - 解答模式：'hint'=仅提示 / 'answer'=完整解答 / 'full'=提示+解答
- * @param onChunk      - 文字片段回调（实时更新聊天 UI）
- * @param apiKey       - API Key
- * @param lang         - 语言
- * @param onProgress   - 进度回调，用于更新 UI 显示当前阶段（'ocr' 或 'analyzing'）
+ * callDeepSeekSolveStream — 解题模式：Gemini 视觉直读图片，流式解答（跳过 OCR）
  */
+const buildSolveVisionUserContent = (
+  imageDataUrl: string,
+  solveMode: 'hint' | 'answer' | 'full',
+  lang: 'zh' | 'en',
+) => {
+  const prompt = lang === 'zh'
+    ? `请直接阅读附件题目图片并解答。\n\n${SOLVE_USER_PROMPTS[solveMode].zh}`
+    : `Read the attached problem image and solve it.\n\n${SOLVE_USER_PROMPTS[solveMode].en}`;
+  return [
+    { type: 'text', text: prompt },
+    { type: 'image_url', image_url: { url: imageDataUrl } },
+  ];
+};
+
+const buildClaudeSolveVisionContent = (
+  imageDataUrl: string,
+  solveMode: 'hint' | 'answer' | 'full',
+  lang: 'zh' | 'en',
+) => {
+  const base64 = imageDataUrl.replace(/^data:image\/\w+;base64,/, '');
+  const mediaType = imageDataUrl.startsWith('data:image/png') ? 'image/png' : 'image/jpeg';
+  const prompt = lang === 'zh'
+    ? `请直接阅读附件题目图片并解答。\n\n${SOLVE_USER_PROMPTS[solveMode].zh}`
+    : `Read the attached problem image and solve it.\n\n${SOLVE_USER_PROMPTS[solveMode].en}`;
+  return [
+    {
+      type: 'image',
+      source: { type: 'base64', media_type: mediaType, data: base64 },
+    },
+    { type: 'text', text: prompt },
+  ];
+};
+
 export const callDeepSeekSolveStream = async (
   imageDataUrl: string,
   solveMode: 'hint' | 'answer' | 'full',
@@ -1093,17 +1144,13 @@ export const callDeepSeekSolveStream = async (
 ): Promise<void> => {
   const cfg = getApiConfig();
   const providerConfig = resolveProviderConfig(cfg.provider);
-  const key = apiKey || cfg.key || DEEPSEEK_API_KEY;
+  const key = getEffectiveApiKey(apiKey);
   const l = (lang === 'en' ? 'en' : 'zh') as 'zh' | 'en';
+  const visionModel = resolveVisionModel(providerConfig.id, cfg.model);
 
-  onProgress?.('ocr');
-  const ocrText = await callOCRApi(imageDataUrl);
   onProgress?.('analyzing');
 
-  const userMessage =
-    (l === 'zh'
-      ? `【题目内容（OCR 识别）】\n${ocrText}\n\n${SOLVE_USER_PROMPTS[solveMode].zh}`
-      : `[Problem Content (OCR)]\n${ocrText}\n\n${SOLVE_USER_PROMPTS[solveMode].en}`);
+  const compressedImage = await compressImageDataUrl(imageDataUrl);
 
   if (providerConfig.format === 'anthropic') {
     if (!key) throw new Error('Claude API key required. Please set it in Settings.');
@@ -1119,8 +1166,11 @@ export const callDeepSeekSolveStream = async (
       body: JSON.stringify({
         model: cfg.model,
         max_tokens: 4096,
-        system: SOLVE_SYSTEM[l],                        // 使用解题专用系统提示词
-        messages: [{ role: 'user', content: userMessage }], // 只有一条用户消息
+        system: SOLVE_SYSTEM[l],
+        messages: [{
+          role: 'user',
+          content: buildClaudeSolveVisionContent(compressedImage, solveMode, l),
+        }],
         stream: true,
       }),
     });
@@ -1160,22 +1210,18 @@ export const callDeepSeekSolveStream = async (
     return; // Claude 处理完成，函数结束
   }
 
-  const endpoint = providerConfig.endpoint;
-  const model = cfg.model;
+  const { url, headers } = buildProviderRequest(providerConfig.id, providerConfig.endpoint, key);
 
-  const response = await fetch(endpoint, {
+  const response = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${key}`,
-    },
+    headers,
     body: JSON.stringify({
-      model,
+      model: visionModel,
       messages: [
-        { role: 'system', content: SOLVE_SYSTEM[l] }, // 解题专用系统提示词
-        { role: 'user', content: userMessage },        // OCR 内容 + 解题指令
+        { role: 'system', content: SOLVE_SYSTEM[l] },
+        { role: 'user', content: buildSolveVisionUserContent(compressedImage, solveMode, l) },
       ],
-      temperature: 0.2, // 解题模式用更低随机性（要准确，不要创意）
+      temperature: 0.2,
       stream: true,
     }),
   });
@@ -1183,6 +1229,7 @@ export const callDeepSeekSolveStream = async (
   if (!response.ok) {
     if (response.status === 402) throw new Error('Insufficient Balance');
     if (response.status === 401) throw new Error('Unauthorized');
+    if (response.status === 429) throw new Error('API Quota Exceeded');
     const errData = await response.json().catch(() => ({}));
     throw new Error(`API Error: ${response.status} ${JSON.stringify(errData)}`);
   }

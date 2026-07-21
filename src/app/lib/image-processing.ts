@@ -6,12 +6,13 @@
 
 import {
   prepareSmartDrawImage,
+  type SmartDrawAIContour,
   type SmartDrawRepairPhase,
   type SmartDrawTuningParams,
 } from './smart-draw-repair';
 
 export type { SmartDrawMode } from './smart-draw-repair';
-export type { SmartDrawTuningParams, SmartDrawRepairPhase } from './smart-draw-repair';
+export type { SmartDrawTuningParams, SmartDrawRepairPhase, SmartDrawAIContour } from './smart-draw-repair';
 
 // ─── 类型定义 ────────────────────────────────────────────────────────────────
 
@@ -145,6 +146,56 @@ const calculatePathLength = (points: Point[]): number => {
   return len;
 };
 
+const contourCentroid = (points: Point[]): Point => {
+  let sx = 0;
+  let sy = 0;
+  for (const p of points) {
+    sx += p.x;
+    sy += p.y;
+  }
+  return { x: sx / points.length, y: sy / points.length };
+};
+
+/** AI 轮廓与 Sobel 边缘轮廓去重合并，AI 路径优先 */
+const mergeAIContoursWithEdge = (
+  aiContours: SmartDrawAIContour[],
+  edgeContours: Point[][],
+  edgeStrengths: number[],
+): { contours: Point[][]; strengths: number[]; closedHints: (boolean | null)[] } => {
+  const aiEntries = aiContours
+    .map(c => ({ points: smoothPoints(c.points), closed: c.closed }))
+    .filter(e => calculatePathLength(e.points) >= 20);
+
+  const edgeKeep: Point[][] = [];
+  const strengthKeep: number[] = [];
+
+  for (let i = 0; i < edgeContours.length; i++) {
+    const edge = edgeContours[i];
+    const overlapsAi = aiEntries.some(({ points: ai }) => {
+      const ca = contourCentroid(ai);
+      const ce = contourCentroid(edge);
+      const dist = Math.hypot(ca.x - ce.x, ca.y - ce.y);
+      const lenA = calculatePathLength(ai);
+      const lenB = calculatePathLength(edge);
+      const lenRatio = Math.min(lenA, lenB) / Math.max(lenA, lenB, 1);
+      return dist < 45 && lenRatio > 0.45;
+    });
+    if (!overlapsAi) {
+      edgeKeep.push(edge);
+      strengthKeep.push(edgeStrengths[i]);
+    }
+  }
+
+  return {
+    contours: [...aiEntries.map(e => e.points), ...edgeKeep],
+    strengths: [...aiEntries.map(() => 255), ...strengthKeep],
+    closedHints: [
+      ...aiEntries.map(e => e.closed),
+      ...edgeKeep.map(() => null),
+    ],
+  };
+};
+
 /**
  * calculatePolygonArea — 计算多边形面积（Shoelace 公式）
  *
@@ -181,17 +232,17 @@ const isCanvasBackground = (r: number, g: number, b: number): boolean => {
   return lum > 248 && spread < 18;
 };
 
-/** 仅用于区域连通分割，比显示色更粗一档即可 */
+/** 仅用于区域连通分割 */
 const quantizeColorKey = (r: number, g: number, b: number): number =>
-  ((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2);
+  ((r >> 1) << 15) | ((g >> 1) << 8) | (b >> 1);
 
 const colorDistance = (
   a: { r: number; g: number; b: number },
   b: { r: number; g: number; b: number },
 ): number => Math.abs(a.r - b.r) + Math.abs(a.g - b.g) + Math.abs(a.b - b.b);
 
-/** 允许抗锯齿边缘连通；略收紧以减少跨色块合并 */
-const FILL_COLOR_TOLERANCE = 42;
+/** 抗锯齿边缘允许小幅偏差；收紧以减少跨色块合并 */
+const FILL_COLOR_TOLERANCE = 22;
 
 const colorsSimilarForFill = (
   a: { r: number; g: number; b: number },
@@ -657,8 +708,8 @@ type FillRect = {
   sampleBottom: number;
 };
 
-/** 从原图像素区域取平均 RGB（用于 1:1 填色） */
-const sampleAreaRgb = (
+/** 取区域 RGB 中位数，比均值更贴近原图真实色（避免边缘混色） */
+const sampleAreaMedianRgb = (
   src: Uint8ClampedArray,
   imgWidth: number,
   imgHeight: number,
@@ -673,20 +724,52 @@ const sampleAreaRgb = (
   const y1 = Math.min(imgHeight, Math.ceil(bottom));
   if (x1 <= x0 || y1 <= y0) return { r: 0, g: 0, b: 0 };
 
-  let rs = 0;
-  let gs = 0;
-  let bs = 0;
-  const count = (x1 - x0) * (y1 - y0);
-  for (let y = y0; y < y1; y++) {
-    for (let x = x0; x < x1; x++) {
+  const rs: number[] = [];
+  const gs: number[] = [];
+  const bs: number[] = [];
+  const insetX = Math.min(1, Math.floor((x1 - x0) / 4));
+  const insetY = Math.min(1, Math.floor((y1 - y0) / 4));
+
+  for (let y = y0 + insetY; y < y1 - insetY; y++) {
+    for (let x = x0 + insetX; x < x1 - insetX; x++) {
       const i = (y * imgWidth + x) * 4;
-      rs += src[i];
-      gs += src[i + 1];
-      bs += src[i + 2];
+      rs.push(src[i]);
+      gs.push(src[i + 1]);
+      bs.push(src[i + 2]);
     }
   }
-  return { r: rs / count, g: gs / count, b: bs / count };
+
+  if (rs.length === 0) {
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const i = (y * imgWidth + x) * 4;
+        rs.push(src[i]);
+        gs.push(src[i + 1]);
+        bs.push(src[i + 2]);
+      }
+    }
+  }
+
+  const median = (values: number[]) => {
+    const sorted = [...values].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)];
+  };
+
+  return { r: median(rs), g: median(gs), b: median(bs) };
 };
+
+/** 从原图像素区域取 RGB（中位数，用于 1:1 填色） */
+const sampleAreaRgb = (
+  src: Uint8ClampedArray,
+  imgWidth: number,
+  imgHeight: number,
+  left: number,
+  top: number,
+  right: number,
+  bottom: number,
+): { r: number; g: number; b: number } => sampleAreaMedianRgb(
+  src, imgWidth, imgHeight, left, top, right, bottom,
+);
 
 const sampleRectColorFromSource = (
   src: Uint8ClampedArray,
@@ -870,36 +953,72 @@ const detectBorderBackgroundKey = (
 };
 
 /**
- * 提取填色 polygon：在性能上限内自动选最细网格与拆分方式
+ * 提取填色 polygon：逐格取原图中位数颜色，尽量 1:1 还原
  */
-const MAX_FILL_POLYGONS = 1200;
+const MAX_FILL_POLYGONS = 3600;
 
-const FILL_DETAIL_CONFIGS: { grid: number; mode: FillDetailMode }[] = [
-  { grid: 320, mode: 'cell' },
-  { grid: 300, mode: 'cell' },
-  { grid: 280, mode: 'cell' },
-  { grid: 320, mode: 'row' },
-  { grid: 300, mode: 'row' },
-  { grid: 280, mode: 'row' },
-  { grid: 260, mode: 'cell' },
-  { grid: 260, mode: 'row' },
-  { grid: 240, mode: 'cell' },
-  { grid: 240, mode: 'row' },
-  { grid: 220, mode: 'cell' },
-  { grid: 200, mode: 'cell' },
-  { grid: 220, mode: 'row' },
-  { grid: 200, mode: 'row' },
-  { grid: 180, mode: 'cell' },
-  { grid: 180, mode: 'row' },
-  { grid: 160, mode: 'row' },
-  { grid: 200, mode: 'merged' },
-  { grid: 140, mode: 'row' },
-  { grid: 160, mode: 'merged' },
-  { grid: 120, mode: 'row' },
-  { grid: 128, mode: 'merged' },
-  { grid: 96, mode: 'row' },
-  { grid: 96, mode: 'merged' },
-];
+const computeOptimalFillGrid = (width: number, height: number): number => {
+  const maxCells = MAX_FILL_POLYGONS;
+  let lo = 96;
+  let hi = Math.min(720, Math.max(width, height));
+  let best = 128;
+
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const scale = Math.min(1, mid / Math.max(width, height));
+    const gw = Math.max(1, Math.round(width * scale));
+    const gh = Math.max(1, Math.round(height * scale));
+    if (gw * gh <= maxCells) {
+      best = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return best;
+};
+
+const extractPerCellFillPolygons = (
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  offsetX: number,
+  offsetY: number,
+  desmosScale: number,
+): FillPolygon[] => {
+  const gridMax = computeOptimalFillGrid(width, height);
+  const seg = buildColorSegmentation(ctx, width, height, gridMax);
+  const { gw, gh, src, borderBg } = seg;
+  const cellW = width / gw;
+  const cellH = height / gh;
+  const polys: FillPolygon[] = [];
+
+  for (let gy = 0; gy < gh; gy++) {
+    for (let gx = 0; gx < gw; gx++) {
+      const idx = gy * gw + gx;
+      if (borderBg[idx]) continue;
+
+      const left = gx * cellW;
+      const top = gy * cellH;
+      const right = (gx + 1) * cellW;
+      const bottom = (gy + 1) * cellH;
+      const { r, g, b } = sampleAreaMedianRgb(src, width, height, left, top, right, bottom);
+      if (isCanvasBackground(r, g, b)) continue;
+
+      const bounds = canvasRectToDesmos(left, right, top, bottom, offsetX, offsetY, desmosScale);
+      const points = rectBoundsToPolygonPoints(bounds);
+      if (points.length < 3) continue;
+
+      polys.push({
+        color: rgbToHex(r, g, b),
+        points,
+        area: cellW * cellH,
+      });
+    }
+  }
+
+  return polys;
+};
 
 type ColorSegmentation = {
   gw: number;
@@ -1108,25 +1227,9 @@ const extractColorFillPolygons = (
   offsetX: number,
   offsetY: number,
   desmosScale: number,
-): FillPolygon[] => {
-  let best: FillPolygon[] = [];
-
-  for (const { grid, mode } of FILL_DETAIL_CONFIGS) {
-    const polys = extractColorFillPolygonsAtGrid(
-      ctx, width, height, offsetX, offsetY, desmosScale, grid, mode,
-    );
-    if (polys.length === 0) continue;
-    if (polys.length <= MAX_FILL_POLYGONS && polys.length >= best.length) {
-      best = polys;
-    }
-  }
-
-  if (best.length > 0) return best;
-
-  return extractColorFillPolygonsAtGrid(
-    ctx, width, height, offsetX, offsetY, desmosScale, 96, 'merged',
-  );
-};
+): FillPolygon[] => extractPerCellFillPolygons(
+  ctx, width, height, offsetX, offsetY, desmosScale,
+);
 
 const extractColorFillPolygonsAtGrid = (
   ctx: CanvasRenderingContext2D,
@@ -1174,12 +1277,35 @@ const buildFillPolygonExpressions = (polys: FillPolygon[]): any[] => {
 
 // ─── 生成 Desmos 表达式 ───────────────────────────────────────────────────────
 
+const createFillContext = (
+  width: number,
+  height: number,
+  fillImageData?: ImageData,
+  fallbackCtx?: CanvasRenderingContext2D,
+): CanvasRenderingContext2D => {
+  if (fillImageData) {
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const fillCtx = canvas.getContext('2d');
+    if (!fillCtx) throw new Error('Fill canvas unavailable');
+    fillCtx.putImageData(fillImageData, 0, 0);
+    return fillCtx;
+  }
+  if (!fallbackCtx) throw new Error('Fill context unavailable');
+  return fallbackCtx;
+};
+
 export type ImageFourierOptions = {
   /** 智能绘图模式：仅轮廓 / 仅涂色 / 轮廓+涂色，默认 both */
   mode?: import('./smart-draw-repair').SmartDrawMode;
   /** AI/启发式修复后的拟合参数 */
   tuning?: SmartDrawTuningParams;
-  /** 是否启用 AI 视觉分析（需 API Key，默认 true） */
+  /** AI 视觉模型追踪的主轮廓（与边缘检测合并） */
+  aiContours?: SmartDrawAIContour[];
+  /** 填色专用原图像素（未经对比度/锐化修复，保证颜色 1:1） */
+  fillImageData?: ImageData;
+  /** 是否启用 AI 视觉分析（默认 true；DeepSeek/Gemini 可走服务端代理） */
   enableAiRepair?: boolean;
   apiKey?: string;
   onRepairProgress?: (phase: SmartDrawRepairPhase) => void;
@@ -1221,7 +1347,8 @@ const generateFourierExpressions = (
   let fillExpressions: any[] = [];
 
   if (includeFill) {
-    fillPolys = extractColorFillPolygons(ctx, width, height, offsetX, offsetY, desmosScale);
+    const fillCtx = createFillContext(width, height, options.fillImageData, ctx);
+    fillPolys = extractColorFillPolygons(fillCtx, width, height, offsetX, offsetY, desmosScale);
     fillPolys.sort((a, b) => {
       const avgY = (poly: FillPolygon) =>
         poly.points.reduce((sum, p) => sum + p.y, 0) / poly.points.length;
@@ -1240,7 +1367,15 @@ const generateFourierExpressions = (
   }
 
   // 第一步：Sobel 边缘检测提取线稿轮廓
-  const { contours: rawContours, strengths } = extractContours(ctx, width, height, tuning);
+  let { contours: rawContours, strengths } = extractContours(ctx, width, height, tuning);
+  let closedHints: (boolean | null)[] = rawContours.map(() => null);
+
+  if (options.aiContours && options.aiContours.length > 0 && includeOutline) {
+    const merged = mergeAIContoursWithEdge(options.aiContours, rawContours, strengths);
+    rawContours = merged.contours;
+    strengths = merged.strengths;
+    closedHints = merged.closedHints;
+  }
   const W = width;
   const H = height;
 
@@ -1267,8 +1402,10 @@ const generateFourierExpressions = (
     const start = pts[0];
     const end = pts[pts.length - 1];
     const gap = Math.sqrt((start.x - end.x) ** 2 + (start.y - end.y) ** 2);
-    // 闭合条件：绝对距离 < 8 像素，或者相对距离 < 路径长度的 3%
-    const isClosed = gap < 8 || gap < pathLength * 0.03;
+    const closedHint = closedHints[i];
+    const isClosed = closedHint != null
+      ? closedHint
+      : (gap < 8 || gap < pathLength * 0.03);
 
     const area = calculatePolygonArea(pts); // 多边形面积
     const boundsArea = w * h;               // 包围盒面积
@@ -1468,13 +1605,18 @@ const generateFourierExpressions = (
     ? [...contourExpressions, ...fillExpressions]
     : contourExpressions;
 
+  const aiUsed = (options.aiContours?.length ?? 0) > 0;
+  const outlineNote = aiUsed
+    ? `（AI 精确轮廓 ${Math.min(options.aiContours!.length, finalContours.length)} 条 + 边缘检测补充）`
+    : '';
+
   return {
     expressions,
     explanation: includeFill && fillPolys.length > 0
-      ? `绘画已完成（${fillPolys.length} 个色块 + ${finalContours.length} 条黑色轮廓）。`
+      ? `绘画已完成（${fillPolys.length} 个色块 + ${finalContours.length} 条黑色轮廓${outlineNote}）。`
       : includeFill
         ? '绘画已完成。'
-        : `绘画已完成（${finalContours.length} 条黑色轮廓，仅勾线）。`,
+        : `绘画已完成（${finalContours.length} 条黑色轮廓${outlineNote}，仅勾线）。`,
   };
 };
 
@@ -1708,7 +1850,7 @@ export const processImageToFourier = (
       img.onload = async () => {
         try {
           const canvas = document.createElement('canvas');
-          const MAX_DIM = 1024;
+          const MAX_DIM = 1280;
           const scale = Math.min(1, MAX_DIM / Math.max(img.width, img.height));
           canvas.width = img.width * scale;
           canvas.height = img.height * scale;
@@ -1720,8 +1862,9 @@ export const processImageToFourier = (
           ctx.fillRect(0, 0, canvas.width, canvas.height);
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
+          const fillImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
           const mode = options.mode ?? 'both';
-          const tuning = await prepareSmartDrawImage(
+          const { tuning, aiContours } = await prepareSmartDrawImage(
             ctx,
             canvas.width,
             canvas.height,
@@ -1738,6 +1881,8 @@ export const processImageToFourier = (
             ...options,
             mode,
             tuning,
+            aiContours,
+            fillImageData,
           }));
         } catch (err) {
           reject(err);
@@ -1793,10 +1938,11 @@ export const processEmojiToFourier = (
     ctx.fillText(emoji, size / 2, size / 2 + size * 0.05);
 
     const dataUrl = canvas.toDataURL('image/png');
+    const fillImageData = ctx.getImageData(0, 0, size, size);
     const mode = options.mode ?? 'both';
 
     try {
-      const tuning = await prepareSmartDrawImage(
+      const { tuning, aiContours } = await prepareSmartDrawImage(
         ctx, size, size, dataUrl, mode,
         {
           apiKey: options.apiKey,
@@ -1804,7 +1950,9 @@ export const processEmojiToFourier = (
           onProgress: options.onRepairProgress,
         },
       );
-      resolve(generateFourierExpressions(ctx, size, size, { ...options, mode, tuning }));
+      resolve(generateFourierExpressions(ctx, size, size, {
+        ...options, mode, tuning, aiContours, fillImageData,
+      }));
     } catch {
       resolve(generateFourierExpressions(ctx, size, size, options));
     }
