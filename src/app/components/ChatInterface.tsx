@@ -957,7 +957,17 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
       drawingProgressPhase: 'processing',
     }]);
 
-    const result = await processEmojiToFourier(emoji, { mode });
+    const result = await processEmojiToFourier(emoji, {
+      mode,
+      apiKey: customApiKey,
+      enableAiRepair: true,
+      onRepairProgress: (phase) => {
+        const key = phase === 'ai_analyze' ? 'drawing_ai_repair' : 'drawing_local_repair';
+        setMessages(prev => prev.map(m =>
+          m.id === aiMsgId ? { ...m, content: t(key), translationKey: key } : m
+        ));
+      },
+    });
     if (signal?.aborted) return;
     await revealDrawingProgress(result.expressions, aiMsgId, signal);
 
@@ -1224,7 +1234,19 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
             drawingProgressPhase: 'processing',
         }]);
 
-        const result = await processImageToFourier(file, { mode });
+        const result = await processImageToFourier(file, {
+            mode,
+            apiKey: customApiKey,
+            enableAiRepair: true,
+            onRepairProgress: (phase) => {
+                const key = phase === 'ai_analyze' ? 'drawing_ai_repair' : 'drawing_local_repair';
+                setMessages(prev => prev.map(m =>
+                    m.id === progressMsgId
+                        ? { ...m, content: t(key), translationKey: key }
+                        : m
+                ));
+            },
+        });
         if (task.signal.aborted) return;
         const { expressions } = result;
 

@@ -36,6 +36,10 @@ export function normalizeDesmosFormulaLatex(formula: string): string {
     .trim()
     .replace(/\\\\/g, '\\');
 
+  // a1 / b12 → a_{1} / b_{12}（Desmos 不支持字母紧接数字作变量名，必须用下标）
+  // 排除：反斜杠命令（\sin1 不转）、已有下标（a_1 不动）、字母序列（sin、cos 等函数名）
+  clean = clean.replace(/(?<![\\a-zA-Z_])([a-zA-Z])(\d+)(?![a-zA-Z_{])/g, '$1_{$2}');
+
   // \int ... x^2, dx → 去掉微分符号前的逗号
   clean = clean.replace(/,\s*(d[a-zA-Zθωπ]+)\b/g, ' $1');
 

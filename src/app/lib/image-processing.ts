@@ -2,38 +2,16 @@
  * ============================================================================
  * lib/image-processing.ts — 图像处理与傅里叶级数可视化
  * ============================================================================
- *
- * 【这个文件做什么？】
- * 把图片或 Emoji 转化为 Desmos 能绘制的参数方程（曲线）。
- *
- * 听起来很神奇，其实背后的数学原理是：
- *   📐 任何封闭的曲线都可以用"旋转向量叠加"来近似
- *   🎵 就像音乐是多个正弦波叠加的——图形也可以！
- *
- * 【完整处理流程】
- *   图片/Emoji
- *     → Canvas 绘制（把图片渲染到内存画布）
- *     → 灰度化（彩色 → 黑白）
- *     → 盒式模糊（去噪点）
- *     → Sobel 梯度（检测边缘）
- *     → 自适应阈值 + 轮廓追踪（找出所有边缘线条）
- *     → 噪声过滤（强度/长度/几何形状过滤）
- *     → 降采样（减少点数，提高 DFT 效率）
- *     → DFT 计算（离散傅里叶变换，求各频率的振幅/相位）
- *     → 生成 Desmos 参数方程（X(t) 和 Y(t) 函数）
- *     → 注入 Desmos 画板显示
- *
- * 【什么是 DFT？】
- * DFT = Discrete Fourier Transform（离散傅里叶变换）
- * 把一组点（轮廓坐标）分解成若干个"旋转圆"的叠加。
- * 每个旋转圆有自己的：频率（转多快）、振幅（半径多大）、相位（初始角度）。
- * 把所有圆的轨迹叠加，就能近似重现原始轮廓。
- *
- * 【导出函数】
- * - processImageToFourier(file) — 图片文件 → Desmos 表达式数组
- * - processEmojiToFourier(emoji) — Emoji 字符 → Desmos 表达式数组
- * - processImageToPoints — processImageToFourier 的别名（兼容旧代码）
  */
+
+import {
+  prepareSmartDrawImage,
+  type SmartDrawRepairPhase,
+  type SmartDrawTuningParams,
+} from './smart-draw-repair';
+
+export type { SmartDrawMode } from './smart-draw-repair';
+export type { SmartDrawTuningParams, SmartDrawRepairPhase } from './smart-draw-repair';
 
 // ─── 类型定义 ────────────────────────────────────────────────────────────────
 
@@ -332,7 +310,8 @@ const sampleContourColor = (
 const extractContours = (
   ctx: CanvasRenderingContext2D,
   width: number,
-  height: number
+  height: number,
+  tuning?: SmartDrawTuningParams,
 ): { contours: Point[][], strengths: number[] } => {
 
   // 读取 canvas 上所有像素的 RGBA 数据
@@ -363,6 +342,12 @@ const extractContours = (
 
   // ── 步骤 2：盒式模糊（去噪）─────────────────────────────────────────────
   let blurred = boxBlur(gray, width, height);
+  const blurPasses = tuning?.blurPasses ?? 1;
+  for (let p = 1; p < blurPasses; p++) {
+    blurred = boxBlur(blurred, width, height);
+  }
+
+  const edgeFactor = tuning?.edgeThresholdFactor ?? 1;
 
   // ── 步骤 3：计算梯度图（Sobel 边缘检测简化版）────────────────────────────
   // 梯度 = 像素亮度变化的速率
@@ -420,7 +405,7 @@ const extractContours = (
     const dy = y - cy;
     const dist = Math.sqrt(dx * dx + dy * dy);            // 到中心的距离
     const maxDist = Math.sqrt(cx * cx + cy * cy);         // 最大可能距离（角点）
-    const factor = 0.6 + (dist / maxDist) * 0.8;          // 0.6（中心）到 1.4（角点）
+    const factor = (0.6 + (dist / maxDist) * 0.8) * edgeFactor;
     return globalAvgStrength * factor;
   };
 
@@ -1189,11 +1174,15 @@ const buildFillPolygonExpressions = (polys: FillPolygon[]): any[] => {
 
 // ─── 生成 Desmos 表达式 ───────────────────────────────────────────────────────
 
-export type SmartDrawMode = 'outline' | 'fill' | 'both';
-
 export type ImageFourierOptions = {
   /** 智能绘图模式：仅轮廓 / 仅涂色 / 轮廓+涂色，默认 both */
-  mode?: SmartDrawMode;
+  mode?: import('./smart-draw-repair').SmartDrawMode;
+  /** AI/启发式修复后的拟合参数 */
+  tuning?: SmartDrawTuningParams;
+  /** 是否启用 AI 视觉分析（需 API Key，默认 true） */
+  enableAiRepair?: boolean;
+  apiKey?: string;
+  onRepairProgress?: (phase: SmartDrawRepairPhase) => void;
 };
 
 /**
@@ -1220,7 +1209,8 @@ const generateFourierExpressions = (
   height: number,
   options: ImageFourierOptions = {},
 ): { expressions: any[], explanation: string } => {
-  const mode: SmartDrawMode = options.mode ?? 'both';
+  const mode = options.mode ?? 'both';
+  const tuning = options.tuning;
   const includeOutline = mode !== 'fill';
   const includeFill = mode !== 'outline';
   const desmosScale = 20 / Math.max(width, height);
@@ -1250,7 +1240,7 @@ const generateFourierExpressions = (
   }
 
   // 第一步：Sobel 边缘检测提取线稿轮廓
-  const { contours: rawContours, strengths } = extractContours(ctx, width, height);
+  const { contours: rawContours, strengths } = extractContours(ctx, width, height, tuning);
   const W = width;
   const H = height;
 
@@ -1311,10 +1301,10 @@ const generateFourierExpressions = (
   const activeSet = new Set(meta.map(m => m.index));
 
   // ── 过滤 A：强度过滤 ──────────────────────────────────────────────────────
-  // 以最强轮廓为基准，过滤掉强度不足 28% 的弱轮廓
+  const strengthRatio = tuning?.strengthThresholdRatio ?? 0.28;
   const sortedStrength = [...meta].map(m => m.averageStrength).sort((a, b) => b - a);
   const topStrength = sortedStrength.length > 0 ? sortedStrength[0] : 10;
-  const strengthThreshold = Math.max(12, topStrength * 0.28); // 至少 12，最多 topStrength × 28%
+  const strengthThreshold = Math.max(8, topStrength * strengthRatio);
 
   meta.forEach(m => {
     if (m.averageStrength < strengthThreshold) {
@@ -1323,22 +1313,24 @@ const generateFourierExpressions = (
   });
 
   // ── 过滤 B：几何过滤（消除各种噪声类型）─────────────────────────────────
+  const preserveFine = tuning?.preserveFineDetails ?? false;
+  const minOpenLength = preserveFine ? 40 : 60;
+  const minClosedLength = preserveFine ? 20 : 30;
+  const minBlobSize = preserveFine ? 14 : 20;
+
   meta.forEach(m => {
-    if (!activeSet.has(m.index)) return; // 已被过滤掉的，跳过
+    if (!activeSet.has(m.index)) return;
 
-    // B1：长度过滤：非闭合轮廓必须足够长（≥60px），闭合轮廓宽松一点（≥30px）
-    if (m.pathLength < 60 && !m.isClosed) {
+    if (m.pathLength < minOpenLength && !m.isClosed) {
       activeSet.delete(m.index);
       return;
     }
-    if (m.pathLength < 30) { // 绝对最小长度（连闭合轮廓也要满足）
+    if (m.pathLength < minClosedLength) {
       activeSet.delete(m.index);
       return;
     }
 
-    // B2：斑点过滤：非常小的实心圆点（如灰尘、噪点）
-    // 包围盒小于 20×20 且填充率 > 40%（接近实心）→ 是噪点，删除
-    if (m.w < 20 && m.h < 20 && m.fillRatio > 0.4) {
+    if (m.w < minBlobSize && m.h < minBlobSize && m.fillRatio > 0.4) {
       activeSet.delete(m.index);
       return;
     }
@@ -1367,8 +1359,8 @@ const generateFourierExpressions = (
     return (mB.pathLength * mB.averageStrength) - (mA.pathLength * mA.averageStrength);
   });
 
-  // 最多保留 50 条轮廓（平衡细节与性能）
-  finalContours = finalContours.slice(0, 50);
+  const maxContours = tuning?.maxContours ?? 50;
+  finalContours = finalContours.slice(0, maxContours);
 
   // ── 色块 + 轮廓：动画先勾线再填色；表达式列表中轮廓在前（最终层级仍保持线条置顶）──
   const contourExpressions: any[] = [];
@@ -1397,9 +1389,7 @@ const generateFourierExpressions = (
       processedPoints = [...processedPoints, ...pauseTip, ...reversed, ...pauseRoot];
     }
 
-    // ── 降采样：减少点数（提高 DFT 效率）───────────────────────────────────
-    // 目标：约 400 个点（太多 DFT 很慢，太少细节丢失）
-    const targetCount = 400;
+    const targetCount = tuning?.targetPointCount ?? 400;
     const step = Math.max(1, Math.floor(processedPoints.length / targetCount));
     // 每隔 step 个点取一个（i % step === 0 时保留）
     const points = processedPoints.filter((_, i) => i % step === 0);
@@ -1410,11 +1400,8 @@ const generateFourierExpressions = (
       y: -(p.y - offsetY) * desmosScale   // 中心化 + 缩放 + 翻转 Y 轴（Canvas Y 向下，Desmos Y 向上）
     }));
 
-    // ── DFT 参数选择 ──────────────────────────────────────────────────────
-    // K = 保留的频率个数（越大细节越多，但计算量越大）
-    // 最多 100 个频率（经验值：足够细节但不过拟合噪声）
-    // 不超过点数的一半（奈奎斯特限制）
-    let K = Math.min(100, Math.floor((points.length - 1) / 2));
+    const fourierCap = tuning?.fourierK ?? 100;
+    let K = Math.min(fourierCap, Math.floor((points.length - 1) / 2));
     if (K < 5) K = 5; // 至少 5 个频率（否则图形太粗糙）
 
     // ── 计算 DFT ──────────────────────────────────────────────────────────
@@ -1711,50 +1698,57 @@ export const processImageToFourier = (
   expressions: any[],
   explanation: string
 }> => {
-  // 返回一个 Promise（异步操作的容器）
-  // Promise 有两个回调：resolve（成功）和 reject（失败）
   return new Promise((resolve, reject) => {
-
-    // FileReader：浏览器 API，把文件读成各种格式
     const reader = new FileReader();
 
-    // readAsDataURL 完成后触发 onload
     reader.onload = (event) => {
-      // 创建一个 HTML Image 对象
+      const dataUrl = event.target?.result as string;
       const img = new Image();
 
-      // 图片加载完成后触发
-      img.onload = () => {
-        // 创建 Canvas（内存中的画布，不显示在页面上）
-        const canvas = document.createElement('canvas');
+      img.onload = async () => {
+        try {
+          const canvas = document.createElement('canvas');
+          const MAX_DIM = 1024;
+          const scale = Math.min(1, MAX_DIM / Math.max(img.width, img.height));
+          canvas.width = img.width * scale;
+          canvas.height = img.height * scale;
 
-        // V30 优化：限制最大分辨率为 1024px，在细节和性能之间取平衡
-        const MAX_DIM = 1024;
-        // 计算缩放比例（如果图片比 1024px 大，则缩小；比 1024px 小则不放大）
-        const scale = Math.min(1, MAX_DIM / Math.max(img.width, img.height));
-        canvas.width  = img.width  * scale;
-        canvas.height = img.height * scale;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) { reject('No ctx'); return; }
 
-        // 获取 2D 绘图上下文
-        const ctx = canvas.getContext('2d');
-        if (!ctx) { reject('No ctx'); return; }
+          ctx.fillStyle = 'white';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-        // 先填充白色背景（透明 PNG 图片的透明区域会变成白色）
-        ctx.fillStyle = 'white';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+          const mode = options.mode ?? 'both';
+          const tuning = await prepareSmartDrawImage(
+            ctx,
+            canvas.width,
+            canvas.height,
+            dataUrl,
+            mode,
+            {
+              apiKey: options.apiKey,
+              enableAiRepair: options.enableAiRepair,
+              onProgress: options.onRepairProgress,
+            },
+          );
 
-        // 把图片画到 canvas（自动缩放到 canvas 大小）
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
-        // 生成傅里叶表达式
-        resolve(generateFourierExpressions(ctx, canvas.width, canvas.height, options));
+          resolve(generateFourierExpressions(ctx, canvas.width, canvas.height, {
+            ...options,
+            mode,
+            tuning,
+          }));
+        } catch (err) {
+          reject(err);
+        }
       };
 
-      // 把 FileReader 读取到的 base64 字符串赋给 img.src，触发图片加载
-      img.src = event.target?.result as string;
+      img.onerror = () => reject(new Error('Image load failed'));
+      img.src = dataUrl;
     };
 
-    // 以 Data URL（base64）格式读取文件
+    reader.onerror = () => reject(new Error('File read failed'));
     reader.readAsDataURL(file);
   });
 };
@@ -1778,8 +1772,7 @@ export const processEmojiToFourier = (
   expressions: any[],
   explanation: string
 }> => {
-  return new Promise((resolve) => {
-    // 创建 1024×1024 的 Canvas（高分辨率保证 Emoji 细节清晰）
+  return new Promise(async (resolve) => {
     const canvas = document.createElement('canvas');
     const size = 1024;
     canvas.width = size;
@@ -1787,26 +1780,34 @@ export const processEmojiToFourier = (
 
     const ctx = canvas.getContext('2d');
     if (!ctx) {
-      // 极少数情况下（低端设备内存不足）getContext 可能返回 null
       resolve({ expressions: [], explanation: 'Failed to create canvas' });
       return;
     }
 
-    // 填充白色背景
     ctx.fillStyle = 'white';
     ctx.fillRect(0, 0, size, size);
-
-    // 把 Emoji 绘制到 Canvas 中央，字体大小约为 canvas 的 75%（768px）
-    ctx.font = `${size * 0.75}px serif`; // serif 字体更完整地显示 Emoji
-    ctx.textAlign = 'center';            // 水平居中
-    ctx.textBaseline = 'middle';         // 垂直居中
-    ctx.fillStyle = 'black';             // 黑色（边缘检测基于亮度差）
-
-    // 把 Emoji 绘制在画布中央（稍微偏下 5% 以补偿不同字体的基线差异）
+    ctx.font = `${size * 0.75}px serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = 'black';
     ctx.fillText(emoji, size / 2, size / 2 + size * 0.05);
 
-    // 调用核心处理函数
-    resolve(generateFourierExpressions(ctx, size, size, options));
+    const dataUrl = canvas.toDataURL('image/png');
+    const mode = options.mode ?? 'both';
+
+    try {
+      const tuning = await prepareSmartDrawImage(
+        ctx, size, size, dataUrl, mode,
+        {
+          apiKey: options.apiKey,
+          enableAiRepair: options.enableAiRepair,
+          onProgress: options.onRepairProgress,
+        },
+      );
+      resolve(generateFourierExpressions(ctx, size, size, { ...options, mode, tuning }));
+    } catch {
+      resolve(generateFourierExpressions(ctx, size, size, options));
+    }
   });
 };
 

@@ -100,7 +100,7 @@ export const translations = {
     smart_draw_mode_fill: '仅涂色',
     smart_draw_mode_fill_desc: '只用色块还原颜色，不勾线',
     smart_draw_mode_both: '轮廓 + 涂色',
-    smart_draw_mode_both_desc: '先勾线再填色，还原度最高',
+    smart_draw_mode_both_desc: '先勾线再填色，AI 修复细节后还原度最高',
 
     // ── 快速示例（帮助面板） ──────────────────────────────────────────────────
     example_sine: '画一个正弦函数',
@@ -183,6 +183,8 @@ export const translations = {
     canvas_cleared: '画板已清空。',              // 清空画板后在聊天中显示的消息
     drawing_complete: '绘画已完成。',            // 图片拟合成功后的消息
     drawing_processing: '正在分析图片…',
+    drawing_local_repair: '正在修复图片对比度与边缘…',
+    drawing_ai_repair: 'AI 正在分析并优化细节参数…',
     drawing_progress_outline: '正在勾勒轮廓 {current}/{total}…',
     drawing_progress_fill: '正在填色 {current}/{total}…',
     drawing_cancelled: '绘画已终止。',
@@ -488,7 +490,7 @@ export const translations = {
     smart_draw_mode_fill: 'Fill only',
     smart_draw_mode_fill_desc: 'Color blocks only, no outlines',
     smart_draw_mode_both: 'Outline + fill',
-    smart_draw_mode_both_desc: 'Outlines first, then fill — highest fidelity',
+    smart_draw_mode_both_desc: 'Outlines first, then fill — AI detail repair for highest fidelity',
 
     // ── 快速示例 ──────────────────────────────────────────────────────────────
     example_sine: 'Draw a sine wave',
@@ -565,6 +567,8 @@ export const translations = {
     canvas_cleared: 'Canvas cleared.',
     drawing_complete: 'Drawing complete.',
     drawing_processing: 'Analyzing image…',
+    drawing_local_repair: 'Enhancing contrast and edges…',
+    drawing_ai_repair: 'AI is analyzing and tuning detail parameters…',
     drawing_progress_outline: 'Drawing outlines {current}/{total}…',
     drawing_progress_fill: 'Filling blocks {current}/{total}…',
     drawing_cancelled: 'Drawing stopped.',
