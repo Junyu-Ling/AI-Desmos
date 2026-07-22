@@ -9,14 +9,25 @@ type PendingTask = {
   reject: (err: Error) => void;
 };
 
+/** 从第 0 帧起连续完成的结果数量 */
+export function countContinuousFrameResults(results: any[][]): number {
+  let n = 0;
+  for (let i = 0; i < results.length; i++) {
+    if (!results[i] || results[i].length === 0) break;
+    n = i + 1;
+  }
+  return n;
+}
+
 export class GifWorkerPool {
   private workers: Worker[] = [];
   private idleWorkers: Worker[] = [];
   private queue: PendingTask[] = [];
   private activeJobs = new Map<Worker, PendingTask>();
+  private aborted = false;
 
   constructor(size: number) {
-    const count = Math.max(1, Math.min(size, 6));
+    const count = Math.max(1, Math.min(size, 8));
     for (let i = 0; i < count; i++) {
       const worker = new Worker(
         new URL('./gif-frame.worker.ts', import.meta.url),
@@ -52,6 +63,11 @@ export class GifWorkerPool {
   }
 
   private dispatch(worker: Worker): void {
+    if (this.aborted) {
+      this.idleWorkers.push(worker);
+      return;
+    }
+
     const next = this.queue.shift();
     if (!next) {
       this.idleWorkers.push(worker);
@@ -59,15 +75,28 @@ export class GifWorkerPool {
     }
 
     this.activeJobs.set(worker, next);
-    const pixels = new Uint8ClampedArray(next.input.pixels);
-    worker.postMessage(
-      { ...next.input, pixels },
-      [pixels.buffer],
-    );
+    const payload = next.input;
+    const transferables: ArrayBuffer[] = [payload.pixels.buffer];
+    if (payload.fillPixels) {
+      transferables.push(payload.fillPixels.buffer);
+    }
+    worker.postMessage(payload, transferables);
+  }
+
+  abortPending(): void {
+    this.aborted = true;
+    while (this.queue.length > 0) {
+      const task = this.queue.shift()!;
+      task.reject(new DOMException('Aborted', 'AbortError'));
+    }
   }
 
   run(input: GifFrameWorkerInput): Promise<any[]> {
     return new Promise((resolve, reject) => {
+      if (this.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
+      }
       this.queue.push({ input, resolve, reject });
       const worker = this.idleWorkers.pop();
       if (worker) this.dispatch(worker);
@@ -78,7 +107,60 @@ export class GifWorkerPool {
     return Promise.all(inputs.map(input => this.run(input)));
   }
 
+  /**
+   * 并行处理；abort 时立刻停止排队，返回已从第 0 帧起连续完成的表达式。
+   * 已在飞的 Worker 任务仍会计入结果。
+   */
+  async runUntilAbort(
+    inputs: GifFrameWorkerInput[],
+    signal?: AbortSignal,
+    onProgress?: (continuous: number, total: number) => void,
+    onFrameReady?: (index: number, expressions: any[]) => void | Promise<void>,
+  ): Promise<any[][]> {
+    if (inputs.length === 0) return [];
+
+    const results: any[][] = new Array(inputs.length);
+    const notify = () => {
+      onProgress?.(countContinuousFrameResults(results), inputs.length);
+    };
+
+    const onAbort = () => this.abortPending();
+    if (signal?.aborted) {
+      this.abortPending();
+    } else {
+      signal?.addEventListener('abort', onAbort, { once: true });
+    }
+
+    const jobs = inputs.map((input, i) =>
+      this.run(input)
+        .then(async exprs => {
+          results[i] = exprs;
+          notify();
+          if (onFrameReady) await onFrameReady(i, exprs);
+        })
+        .catch(() => { /* 队列取消或 Worker 错误 */ }),
+    );
+
+    try {
+      if (signal && !signal.aborted) {
+        await Promise.race([
+          Promise.all(jobs),
+          new Promise<void>(resolve => {
+            signal.addEventListener('abort', () => resolve(), { once: true });
+          }),
+        ]);
+      } else if (!this.aborted) {
+        await Promise.all(jobs);
+      }
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+    }
+
+    return results;
+  }
+
   terminate(): void {
+    this.abortPending();
     for (const worker of this.workers) {
       worker.terminate();
     }

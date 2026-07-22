@@ -1,7 +1,10 @@
 /**
- * GIF 单帧处理 Worker：本地修复 + 傅里叶/填色表达式生成（并行加速）
+ * GIF 单帧处理 Worker：与单图相同的傅里叶/填色表达式生成（不降级）
  */
-import { generateFourierExpressionsFromContext } from './image-processing';
+import {
+  generateFourierExpressionsFromContext,
+  SINGLE_IMAGE_MAX_FILL_POLYGONS,
+} from './image-processing';
 import {
   analyzeImageHeuristically,
   applyLocalImageRepair,
@@ -18,17 +21,16 @@ export type GifFrameWorkerInput = {
   width: number;
   height: number;
   mode: SmartDrawMode;
-  aiTuning?: Partial<SmartDrawTuningParams>;
+  /** 完整 tuning（来自 prepareSmartDrawImage，不截断） */
+  tuning: SmartDrawTuningParams;
   aiContours: SmartDrawAIContour[];
-  limits: {
-    maxContours: number;
-    maxFillPolygons: number;
-    fourierK: number;
-    targetPointCount: number;
-  };
+  /** 填色用原图像素（1:1 取色，未经修复） */
+  fillPixels?: Uint8ClampedArray;
   frameSlot: number;
   timeStartSec: number;
   timeEndSec: number;
+  /** 主线程已执行 applyLocalImageRepair */
+  alreadyRepaired?: boolean;
 };
 
 export type GifFrameWorkerOutput = {
@@ -44,22 +46,22 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Worker canvas unavailable');
 
-    const imageData = new ImageData(new Uint8ClampedArray(msg.pixels), msg.width, msg.height);
+    const imageData = new ImageData(msg.pixels, msg.width, msg.height);
     ctx.putImageData(imageData, 0, 0);
-    const fillImageData = new ImageData(new Uint8ClampedArray(msg.pixels), msg.width, msg.height);
 
-    let tuning: SmartDrawTuningParams;
-    const base = analyzeImageHeuristically(ctx, msg.width, msg.height, msg.mode);
-    tuning = mergeSmartDrawTuning({
-      ...base,
-      ...msg.aiTuning,
-      maxContours: msg.limits.maxContours,
-      fourierK: msg.limits.fourierK,
-      targetPointCount: msg.limits.targetPointCount,
-      preserveFineDetails: true,
-    });
+    let tuning = msg.tuning;
+    if (!msg.alreadyRepaired) {
+      tuning = mergeSmartDrawTuning({
+        ...analyzeImageHeuristically(ctx as unknown as CanvasRenderingContext2D, msg.width, msg.height, msg.mode),
+        ...msg.tuning,
+      });
+      applyLocalImageRepair(ctx as unknown as CanvasRenderingContext2D, msg.width, msg.height, tuning);
+    }
 
-    applyLocalImageRepair(ctx, msg.width, msg.height, tuning);
+    const fillSource = msg.fillPixels ?? msg.pixels;
+    const fillImageData = msg.fillPixels
+      ? new ImageData(msg.fillPixels, msg.width, msg.height)
+      : imageData;
 
     const { expressions } = generateFourierExpressionsFromContext(
       ctx as unknown as CanvasRenderingContext2D,
@@ -70,7 +72,7 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
         tuning,
         aiContours: msg.aiContours,
         fillImageData,
-        maxFillPolygons: msg.limits.maxFillPolygons,
+        maxFillPolygons: SINGLE_IMAGE_MAX_FILL_POLYGONS,
         varNamespace: msg.frameSlot,
         frameSlot: msg.frameSlot,
         frameSliderVar: GIF_TIME_SLIDER,
@@ -81,14 +83,12 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
       },
     );
 
-    const output: GifFrameWorkerOutput = { taskId: msg.taskId, expressions };
-    self.postMessage(output);
+    self.postMessage({ taskId: msg.taskId, expressions } satisfies GifFrameWorkerOutput);
   } catch (err) {
-    const output: GifFrameWorkerOutput = {
+    self.postMessage({
       taskId: msg.taskId,
       expressions: [],
       error: err instanceof Error ? err.message : String(err),
-    };
-    self.postMessage(output);
+    } satisfies GifFrameWorkerOutput);
   }
 };

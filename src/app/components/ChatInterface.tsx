@@ -303,23 +303,20 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
   const handleCancelTask = () => {
     const drawingActive = messages.some(m => m.drawingProgressPhase);
     taskAbortRef.current?.abort();
-    taskAbortRef.current = null;
     setIsLoading(false);
     if (drawingActive) {
       setMessages(prev => prev.map(m => {
-        if (m.drawingProgressPhase !== 'processing') return m;
+        if (!m.drawingProgressPhase) return m;
+        const isGif = Boolean(m.translationKey?.startsWith('gif_drawing'));
         return {
           ...m,
-          drawingProgressPhase: undefined,
-          drawingProgressCurrent: undefined,
-          drawingProgressTotal: undefined,
-          content: t('drawing_cancelled'),
-          translationKey: 'drawing_cancelled',
-          translationParams: undefined,
+          content: t(isGif ? 'gif_drawing_saving_partial' : 'drawing_saving_partial'),
+          translationKey: isGif ? 'gif_drawing_saving_partial' : 'drawing_saving_partial',
         };
       }));
       return;
     }
+    taskAbortRef.current = null;
     setMessages(prev => [
       ...prev,
       {
@@ -775,32 +772,17 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
       String(e.id || '').startsWith('fill_poly_'),
     ).length;
 
-    await applyFourierExpressionsProgressively(calc, expressions, {
-      signal,
-      onProgress: (done, total, phase: ProgressiveDrawPhase) => {
-        if (signal?.aborted) return;
-        setMessages(prev => prev.map(m => {
-          if (m.id !== progressMsgId) return m;
-          if (phase === 'outline') {
-            const outlineDone = Math.min(outlinePlotCount, done);
-            const outlineTotal = Math.max(1, outlinePlotCount);
-            return {
-              ...m,
-              drawingProgressPhase: 'outline',
-              drawingProgressCurrent: outlineDone,
-              drawingProgressTotal: outlineTotal,
-              content: t('drawing_progress_outline', {
-                current: String(outlineDone),
-                total: String(outlineTotal),
-              }),
-              translationKey: 'drawing_progress_outline',
-              translationParams: {
-                current: String(outlineDone),
-                total: String(outlineTotal),
-              },
-            };
-          }
-          const fillDone = Math.min(fillCount, Math.max(0, done - outlinePlotCount));
+    let progressRaf = 0;
+    let pendingProgress: { done: number; total: number; phase: ProgressiveDrawPhase } | null = null;
+
+    const flushProgress = () => {
+      if (!pendingProgress) return;
+      const { done, total, phase } = pendingProgress;
+      pendingProgress = null;
+      setMessages(prev => prev.map(m => {
+        if (m.id !== progressMsgId) return m;
+        if (phase === 'fill') {
+          const fillDone = Math.min(fillCount, done);
           const fillTotal = Math.max(1, fillCount);
           return {
             ...m,
@@ -817,9 +799,40 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
               total: String(fillTotal),
             },
           };
-        }));
+        }
+        const outlineDone = Math.min(outlinePlotCount, Math.max(0, done - fillCount));
+        const outlineTotal = Math.max(1, outlinePlotCount);
+        return {
+          ...m,
+          drawingProgressPhase: 'outline',
+          drawingProgressCurrent: outlineDone,
+          drawingProgressTotal: outlineTotal,
+          content: t('drawing_progress_outline', {
+            current: String(outlineDone),
+            total: String(outlineTotal),
+          }),
+          translationKey: 'drawing_progress_outline',
+          translationParams: {
+            current: String(outlineDone),
+            total: String(outlineTotal),
+          },
+        };
+      }));
+    };
+
+    await applyFourierExpressionsProgressively(calc, expressions, {
+      signal,
+      onProgress: (done, total, phase: ProgressiveDrawPhase) => {
+        if (signal?.aborted) return;
+        pendingProgress = { done, total, phase };
+        if (progressRaf) return;
+        progressRaf = requestAnimationFrame(() => {
+          progressRaf = 0;
+          flushProgress();
+        });
       },
     });
+    if (pendingProgress) flushProgress();
   };
 
   /**
@@ -1254,6 +1267,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
         apiKey: customApiKey,
         enableAiRepair: true,
         signal: task.signal,
+        calculator: calculatorRef.current ?? undefined,
+        streamToCalculator: true,
         onProgress: (current, total, phase) => {
           const key = phase === 'decode'
             ? 'gif_drawing_processing'
@@ -1286,50 +1301,82 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
         },
       });
 
-      if (task.signal.aborted) return;
+      const streamed = Boolean(result.streamed);
+      let injectPartial = false;
 
-      if (calculatorRef.current) {
-        await applyGifExpressionsToCalculator(
+      if (!streamed && calculatorRef.current && result.expressions.length > 0) {
+        let injectProgressRaf = 0;
+        let pendingInject: { done: number; total: number } | null = null;
+
+        const injectResult = await applyGifExpressionsToCalculator(
           calculatorRef.current,
           result.expressions,
           {
-            signal: task.signal,
+            commitPartialOnAbort: true,
             onProgress: (done, total) => {
-              setMessages(prev => prev.map(m =>
-                m.id === progressMsgId
-                  ? {
-                      ...m,
-                      content: t('gif_drawing_inject', {
-                        current: String(done),
-                        total: String(total),
-                      }),
-                      translationKey: 'gif_drawing_inject',
-                      translationParams: {
-                        current: String(done),
-                        total: String(total),
-                      },
-                      drawingProgressCurrent: done,
-                      drawingProgressTotal: total,
-                    }
-                  : m,
-              ));
+              pendingInject = { done, total };
+              if (injectProgressRaf) return;
+              injectProgressRaf = requestAnimationFrame(() => {
+                injectProgressRaf = 0;
+                if (!pendingInject) return;
+                const { done: d, total: tot } = pendingInject;
+                pendingInject = null;
+                setMessages(prev => prev.map(m =>
+                  m.id === progressMsgId
+                    ? {
+                        ...m,
+                        content: t('gif_drawing_inject', {
+                          current: String(d),
+                          total: String(tot),
+                        }),
+                        translationKey: 'gif_drawing_inject',
+                        translationParams: {
+                          current: String(d),
+                          total: String(tot),
+                        },
+                        drawingProgressCurrent: d,
+                        drawingProgressTotal: tot,
+                      }
+                    : m,
+                ));
+              });
             },
           },
         );
+        injectPartial = injectResult.partial;
       }
 
-      setMessages(prev => prev.map(m =>
-        m.id === progressMsgId ? {
-          ...m,
-          content: 'GIF complete',
-          translationKey: 'gif_drawing_complete',
-          drawingProgressPhase: undefined,
-          drawingProgressCurrent: undefined,
-          drawingProgressTotal: undefined,
-        } : m,
-      ));
+      if (streamed || result.expressions.length > 0) {
+        const partialDeliver = result.partial || injectPartial;
+        setMessages(prev => prev.map(m =>
+          m.id === progressMsgId ? {
+            ...m,
+            content: partialDeliver ? 'GIF partial' : 'GIF complete',
+            translationKey: partialDeliver ? 'gif_drawing_partial_complete' : 'gif_drawing_complete',
+            translationParams: partialDeliver ? {
+              current: String(result.completedFrames),
+              total: String(result.totalFrames),
+            } : undefined,
+            drawingProgressPhase: undefined,
+            drawingProgressCurrent: undefined,
+            drawingProgressTotal: undefined,
+          } : m,
+        ));
+      }
     } catch (error) {
-      if (isAbortError(error)) return;
+      if (isAbortError(error)) {
+        setMessages(prev => prev.map(m =>
+          m.id === progressMsgId ? {
+            ...m,
+            content: 'Task cancelled',
+            translationKey: 'task_cancelled',
+            drawingProgressPhase: undefined,
+            drawingProgressCurrent: undefined,
+            drawingProgressTotal: undefined,
+          } : m,
+        ));
+        return;
+      }
       setMessages(prev => [...prev, {
         id: Date.now().toString(),
         role: 'system',
@@ -1390,11 +1437,30 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
                 ));
             },
         });
-        if (task.signal.aborted) return;
         const { expressions } = result;
 
-        if (calculatorRef.current) {
-            await revealDrawingProgress(expressions, progressMsgId, task.signal);
+        if (calculatorRef.current && expressions.length > 0) {
+            await revealDrawingProgress(
+              expressions,
+              progressMsgId,
+              task.signal.aborted ? undefined : task.signal,
+            );
+        }
+
+        if (task.signal.aborted) {
+          if (expressions.length > 0) {
+            setMessages(prev => prev.map(m =>
+              m.id === progressMsgId ? {
+                ...m,
+                content: 'Drawing partial',
+                translationKey: 'drawing_partial_complete',
+                drawingProgressPhase: undefined,
+                drawingProgressCurrent: undefined,
+                drawingProgressTotal: undefined,
+              } : m,
+            ));
+          }
+          return;
         }
 
         setMessages(prev => prev.map(m =>

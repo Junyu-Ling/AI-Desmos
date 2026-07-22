@@ -232,6 +232,26 @@ const isCanvasBackground = (r: number, g: number, b: number): boolean => {
   return lum > 248 && spread < 18;
 };
 
+/**
+ * 轮廓+填色模式下，近纯黑/深灰区域由黑色勾线负责，跳过填色避免与线稿重复。
+ */
+const isOutlineBlackFillRgb = (r: number, g: number, b: number): boolean => {
+  const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+  const spread = Math.max(r, g, b) - Math.min(r, g, b);
+  return lum <= 45 && spread <= 28;
+};
+
+const isOutlineBlackFillHex = (color: string): boolean => {
+  const m = /^#?([0-9a-f]{6})$/i.exec(color.trim());
+  if (!m) return false;
+  const hex = m[1];
+  return isOutlineBlackFillRgb(
+    parseInt(hex.slice(0, 2), 16),
+    parseInt(hex.slice(2, 4), 16),
+    parseInt(hex.slice(4, 6), 16),
+  );
+};
+
 /** 仅用于区域连通分割 */
 const quantizeColorKey = (r: number, g: number, b: number): number =>
   ((r >> 1) << 15) | ((g >> 1) << 8) | (b >> 1);
@@ -589,41 +609,29 @@ const extractContours = (
  * @returns 傅里叶系数数组（每个包含频率 freq、实部 re、虚部 im）
  */
 const computeDFT = (points: Point[], numCoeffs: number) => {
-  const N = points.length; // 点的总数
-
-  // 频率上限 = N/2（奈奎斯特采样定理：最高频率不超过采样率的一半）
+  const N = points.length;
   const maxK = Math.floor((N - 1) / 2);
-  const actualCoeffs = Math.min(numCoeffs, maxK); // 不超过理论上限
+  const actualCoeffs = Math.min(numCoeffs, maxK);
 
-  // 计算所有 N 个频率的 DFT 系数（X[k] 是频率 k 的复数系数）
-  const X: Complex[] = [];
-  for (let k = 0; k < N; k++) {
-    let sumRe = 0; // 实部累加
-    let sumIm = 0; // 虚部累加
-
+  const computeXk = (k: number): Complex => {
+    let sumRe = 0;
+    let sumIm = 0;
     for (let n = 0; n < N; n++) {
-      // φ = 2πkn/N 是当前点对频率 k 的贡献角度
       const phi = (2 * Math.PI * k * n) / N;
-      const cos = Math.cos(phi); // 余弦值（实部基函数）
-      const sin = Math.sin(phi); // 正弦值（虚部基函数）
-
-      // 把 (x, y) 点编码为复数 z = x + iy，并与基函数相乘
+      const cos = Math.cos(phi);
+      const sin = Math.sin(phi);
       sumRe += points[n].x * cos + points[n].y * sin;
       sumIm += points[n].y * cos - points[n].x * sin;
     }
+    return { re: sumRe / N, im: sumIm / N };
+  };
 
-    // 除以 N 进行归一化（使结果不随点数变化而缩放）
-    X.push({ re: sumRe / N, im: sumIm / N });
-  }
-
-  // 组合结果：选取最有用的频率
   const coeffs = [];
-  coeffs.push({ freq: 0, ...X[0] }); // 频率 0 = DC 分量（轮廓的平均位置/中心）
+  coeffs.push({ freq: 0, ...computeXk(0) });
 
-  // 选取频率 1, -1, 2, -2, ..., K, -K（正负频率对称配对）
   for (let i = 1; i <= actualCoeffs; i++) {
-    coeffs.push({ freq: i, ...X[i] });         // 正频率 i
-    coeffs.push({ freq: -i, ...X[N - i] });    // 负频率 -i（X[N-i] 对应负频率）
+    coeffs.push({ freq: i, ...computeXk(i) });
+    coeffs.push({ freq: -i, ...computeXk(N - i) });
   }
 
   return coeffs;
@@ -709,6 +717,17 @@ type FillRect = {
 };
 
 /** 取区域 RGB 中位数，比均值更贴近原图真实色（避免边缘混色） */
+const medianFromHistogram = (hist: Uint32Array, total: number): number => {
+  if (total <= 0) return 0;
+  const half = Math.floor(total / 2);
+  let count = 0;
+  for (let v = 0; v < 256; v++) {
+    count += hist[v];
+    if (count > half) return v;
+  }
+  return 0;
+};
+
 const sampleAreaMedianRgb = (
   src: Uint8ClampedArray,
   imgWidth: number,
@@ -724,38 +743,35 @@ const sampleAreaMedianRgb = (
   const y1 = Math.min(imgHeight, Math.ceil(bottom));
   if (x1 <= x0 || y1 <= y0) return { r: 0, g: 0, b: 0 };
 
-  const rs: number[] = [];
-  const gs: number[] = [];
-  const bs: number[] = [];
+  const histR = new Uint32Array(256);
+  const histG = new Uint32Array(256);
+  const histB = new Uint32Array(256);
+  let count = 0;
   const insetX = Math.min(1, Math.floor((x1 - x0) / 4));
   const insetY = Math.min(1, Math.floor((y1 - y0) / 4));
 
-  for (let y = y0 + insetY; y < y1 - insetY; y++) {
-    for (let x = x0 + insetX; x < x1 - insetX; x++) {
-      const i = (y * imgWidth + x) * 4;
-      rs.push(src[i]);
-      gs.push(src[i + 1]);
-      bs.push(src[i + 2]);
-    }
-  }
-
-  if (rs.length === 0) {
-    for (let y = y0; y < y1; y++) {
-      for (let x = x0; x < x1; x++) {
+  const accumulate = (xStart: number, xEnd: number, yStart: number, yEnd: number) => {
+    for (let y = yStart; y < yEnd; y++) {
+      for (let x = xStart; x < xEnd; x++) {
         const i = (y * imgWidth + x) * 4;
-        rs.push(src[i]);
-        gs.push(src[i + 1]);
-        bs.push(src[i + 2]);
+        histR[src[i]]++;
+        histG[src[i + 1]]++;
+        histB[src[i + 2]]++;
+        count++;
       }
     }
-  }
-
-  const median = (values: number[]) => {
-    const sorted = [...values].sort((a, b) => a - b);
-    return sorted[Math.floor(sorted.length / 2)];
   };
 
-  return { r: median(rs), g: median(gs), b: median(bs) };
+  accumulate(x0 + insetX, x1 - insetX, y0 + insetY, y1 - insetY);
+  if (count === 0) {
+    accumulate(x0, x1, y0, y1);
+  }
+
+  return {
+    r: medianFromHistogram(histR, count),
+    g: medianFromHistogram(histG, count),
+    b: medianFromHistogram(histB, count),
+  };
 };
 
 /** 从原图像素区域取 RGB（中位数，用于 1:1 填色） */
@@ -957,6 +973,10 @@ const detectBorderBackgroundKey = (
  */
 const MAX_FILL_POLYGONS = 3600;
 
+/** 单张图片 / GIF 每帧共用的最高分辨率与填色精度 */
+export const SINGLE_IMAGE_MAX_DIM = 1280;
+export const SINGLE_IMAGE_MAX_FILL_POLYGONS = MAX_FILL_POLYGONS;
+
 const computeOptimalFillGrid = (width: number, height: number, maxCells = MAX_FILL_POLYGONS): number => {
   let lo = 96;
   let hi = Math.min(720, Math.max(width, height));
@@ -985,10 +1005,11 @@ const extractPerCellFillPolygons = (
   offsetY: number,
   desmosScale: number,
   maxFillPolygons = MAX_FILL_POLYGONS,
+  skipOutlineBlackFills = false,
 ): FillPolygon[] => {
   const gridMax = computeOptimalFillGrid(width, height, maxFillPolygons);
   const seg = buildColorSegmentation(ctx, width, height, gridMax);
-  const { gw, gh, src, borderBg } = seg;
+  const { gw, gh, borderBg, cellColors } = seg;
   const cellW = width / gw;
   const cellH = height / gh;
   const polys: FillPolygon[] = [];
@@ -998,12 +1019,17 @@ const extractPerCellFillPolygons = (
       const idx = gy * gw + gx;
       if (borderBg[idx]) continue;
 
+      const rgbBase = idx * 3;
+      const r = cellColors[rgbBase];
+      const g = cellColors[rgbBase + 1];
+      const b = cellColors[rgbBase + 2];
+      if (isCanvasBackground(r, g, b)) continue;
+      if (skipOutlineBlackFills && isOutlineBlackFillRgb(r, g, b)) continue;
+
       const left = gx * cellW;
       const top = gy * cellH;
       const right = (gx + 1) * cellW;
       const bottom = (gy + 1) * cellH;
-      const { r, g, b } = sampleAreaMedianRgb(src, width, height, left, top, right, bottom);
-      if (isCanvasBackground(r, g, b)) continue;
 
       const bounds = canvasRectToDesmos(left, right, top, bottom, offsetX, offsetY, desmosScale);
       const points = rectBoundsToPolygonPoints(bounds);
@@ -1029,6 +1055,8 @@ type ColorSegmentation = {
   labels: Int32Array;
   borderBg: Uint8Array;
   rawRegions: { label: number; size: number }[];
+  /** 每格 RGB（与 gw×gh 对齐，避免 flood-fill 重复采样） */
+  cellColors: Uint8Array;
   rgbAt: (gx: number, gy: number) => { r: number; g: number; b: number };
 };
 
@@ -1045,20 +1073,32 @@ const buildColorSegmentation = (
 
   const src = ctx.getImageData(0, 0, width, height).data;
   const keys = new Uint32Array(gw * gh);
-  const rgbAt = (gx: number, gy: number) => {
-    const left = (gx * width) / gw;
-    const right = ((gx + 1) * width) / gw;
-    const top = (gy * height) / gh;
-    const bottom = ((gy + 1) * height) / gh;
-    return sampleAreaRgb(src, width, height, left, top, right, bottom);
-  };
+  const cellColors = new Uint8Array(gw * gh * 3);
 
   for (let gy = 0; gy < gh; gy++) {
     for (let gx = 0; gx < gw; gx++) {
-      const { r, g, b } = rgbAt(gx, gy);
-      keys[gy * gw + gx] = quantizeColorKey(r, g, b);
+      const left = (gx * width) / gw;
+      const right = ((gx + 1) * width) / gw;
+      const top = (gy * height) / gh;
+      const bottom = ((gy + 1) * height) / gh;
+      const { r, g, b } = sampleAreaMedianRgb(src, width, height, left, top, right, bottom);
+      const cellIdx = gy * gw + gx;
+      const rgbBase = cellIdx * 3;
+      cellColors[rgbBase] = r;
+      cellColors[rgbBase + 1] = g;
+      cellColors[rgbBase + 2] = b;
+      keys[cellIdx] = quantizeColorKey(r, g, b);
     }
   }
+
+  const rgbAt = (gx: number, gy: number) => {
+    const rgbBase = (gy * gw + gx) * 3;
+    return {
+      r: cellColors[rgbBase],
+      g: cellColors[rgbBase + 1],
+      b: cellColors[rgbBase + 2],
+    };
+  };
 
   const bgKey = detectBorderBackgroundKey(keys, gw, gh);
   const borderBg = buildBorderBackgroundMask(keys, gw, gh, rgbAt, bgKey);
@@ -1109,7 +1149,7 @@ const buildColorSegmentation = (
     }
   }
 
-  return { gw, gh, width, height, src, labels, borderBg, rawRegions, rgbAt };
+  return { gw, gh, width, height, src, labels, borderBg, rawRegions, cellColors, rgbAt };
 };
 
 const ptKey = (x: number, y: number) =>
@@ -1228,8 +1268,9 @@ const extractColorFillPolygons = (
   offsetY: number,
   desmosScale: number,
   maxFillPolygons = MAX_FILL_POLYGONS,
+  skipOutlineBlackFills = false,
 ): FillPolygon[] => extractPerCellFillPolygons(
-  ctx, width, height, offsetX, offsetY, desmosScale, maxFillPolygons,
+  ctx, width, height, offsetX, offsetY, desmosScale, maxFillPolygons, skipOutlineBlackFills,
 );
 
 const extractColorFillPolygonsAtGrid = (
@@ -1439,9 +1480,12 @@ const generateFourierExpressions = (
 
   if (includeFill) {
     const fillCtx = createFillContext(width, height, options.fillImageData, ctx);
+    const skipOutlineBlackFills = includeOutline;
     fillPolys = extractColorFillPolygons(
       fillCtx, width, height, offsetX, offsetY, desmosScale, options.maxFillPolygons,
+      skipOutlineBlackFills,
     );
+    fillPolys = fillPolys.filter(poly => !skipOutlineBlackFills || !isOutlineBlackFillHex(poly.color));
     fillPolys.sort((a, b) => {
       const avgY = (poly: FillPolygon) =>
         poly.points.reduce((sum, p) => sum + p.y, 0) / poly.points.length;
@@ -1688,7 +1732,7 @@ const generateFourierExpressions = (
   });
 
   const expressions = includeFill
-    ? [...contourExpressions, ...fillExpressions]
+    ? [...fillExpressions, ...contourExpressions]
     : contourExpressions;
 
   const aiUsed = (options.aiContours?.length ?? 0) > 0;
@@ -1786,18 +1830,27 @@ const groupContourExpressions = (contours: any[]): any[][] => {
   return order.map(key => groups.get(key)!);
 };
 
-/** 填色完成后把可见轮廓线移到最上层，避免被 polygon 盖住 */
-const bringOutlinePlotsToFront = (calculator: any, contourGroups: any[][]) => {
-  if (typeof calculator.removeExpression !== 'function') return;
-
-  for (const group of contourGroups) {
-    const plot = group.find(e => /_(plot)_/.test(String(e.id || '')));
-    if (!plot?.id) continue;
-    const prepared = prepareFourierExpression(plot);
-    calculator.removeExpression({ id: prepared.id });
-    calculator.setExpression(prepared);
-  }
+const isSliderExpression = (expr: any): boolean => {
+  const id = String(expr?.id || '');
+  return id === 'gif_time_slider' || id === 'gif_frame_slider';
 };
+
+const partitionExpressions = (expressions: any[]) => {
+  const meta: any[] = [];
+  const fills: any[] = [];
+  const contours: any[] = [];
+  for (const expr of expressions) {
+    if (isSliderExpression(expr)) meta.push(expr);
+    else if (isFillExpression(expr)) fills.push(expr);
+    else contours.push(expr);
+  }
+  return { meta, fills, contours };
+};
+
+const yieldFrame = (): Promise<void> =>
+  new Promise(resolve => {
+    requestAnimationFrame(() => resolve());
+  });
 
 export type ProgressiveDrawPhase = 'fill' | 'outline';
 
@@ -1822,7 +1875,7 @@ const pushExprBatch = (calculator: any, chunk: any[]) => {
   chunk.forEach(expr => calculator.setExpression(expr));
 };
 
-/** 先逐条勾勒轮廓，再逐个 polygon 填色（逐条写入，避免 Desmos 卡死） */
+/** 先批量填色，再逐组勾勒轮廓（填色在前则轮廓自然置顶，无需 reorder） */
 export async function applyFourierExpressionsProgressively(
   calculator: any,
   expressions: any[],
@@ -1840,49 +1893,51 @@ export async function applyFourierExpressionsProgressively(
 
   if (clearFirst) calculator.setBlank();
 
-  const prepared = expressions.map(prepareFourierExpression);
-  const fills = prepared.filter(isFillExpression);
-  const contours = prepared.filter(expr => !isFillExpression(expr));
+  const { fills: rawFills, contours: rawContours } = partitionExpressions(expressions);
+  const fills = rawFills.map(prepareFourierExpression);
+  const contours = rawContours.map(prepareFourierExpression);
   const contourGroups = groupContourExpressions(contours);
-  const totalSteps = contourGroups.length + fills.length;
+  const totalSteps = fills.length + contourGroups.length;
   let done = 0;
-  let nextContour = 0;
   let nextFill = 0;
+  let nextContour = 0;
 
   const flushRemaining = () => {
+    if (nextFill < fills.length) {
+      pushExprBatch(calculator, fills.slice(nextFill));
+      nextFill = fills.length;
+    }
     for (let i = nextContour; i < contourGroups.length; i++) {
       pushExprBatch(calculator, contourGroups[i]);
     }
-    for (let i = nextFill; i < fills.length; i++) {
-      calculator.setExpression(prepareFourierExpression(fills[i]));
-    }
-    bringOutlinePlotsToFront(calculator, contourGroups);
-    onProgress?.(totalSteps, totalSteps, 'fill');
+    nextContour = contourGroups.length;
+    onProgress?.(totalSteps, totalSteps, 'outline');
   };
 
-  // 1) 轮廓：每组（隐藏辅助式 + 可见曲线）逐条出现
-  for (let i = 0; i < contourGroups.length; i++) {
+  // 1) 填色：批量写入（3600 条逐条 setExpression 会卡死浏览器）
+  for (let i = 0; i < fills.length; i += DESMOS_EXPR_BATCH) {
     if (signal?.aborted) break;
-    pushExprBatch(calculator, contourGroups[i]);
-    nextContour = i + 1;
-    done += 1;
-    onProgress?.(done, totalSteps, 'outline');
-    if (i + 1 < contourGroups.length) {
-      await sleep(contourDelayMs, signal);
+    const batch = fills.slice(i, i + DESMOS_EXPR_BATCH);
+    pushExprBatch(calculator, batch);
+    nextFill = i + batch.length;
+    done = nextFill;
+    onProgress?.(done, totalSteps, 'fill');
+    if (i + DESMOS_EXPR_BATCH < fills.length) {
+      await sleep(fillDelayMs, signal);
       if (signal?.aborted) break;
     }
   }
 
-  // 2) 填色：一个 polygon 一条表达式
+  // 2) 轮廓：每组（隐藏辅助式 + 可见曲线）逐组出现
   if (!signal?.aborted) {
-    for (let i = 0; i < fills.length; i++) {
+    for (let i = 0; i < contourGroups.length; i++) {
       if (signal?.aborted) break;
-      calculator.setExpression(prepareFourierExpression(fills[i]));
-      nextFill = i + 1;
-      done += 1;
-      onProgress?.(done, totalSteps, 'fill');
-      if (i + 1 < fills.length) {
-        await sleep(fillDelayMs, signal);
+      pushExprBatch(calculator, contourGroups[i]);
+      nextContour = i + 1;
+      done = fills.length + i + 1;
+      onProgress?.(done, totalSteps, 'outline');
+      if (i + 1 < contourGroups.length) {
+        await sleep(contourDelayMs, signal);
         if (signal?.aborted) break;
       }
     }
@@ -1890,58 +1945,144 @@ export async function applyFourierExpressionsProgressively(
 
   if (signal?.aborted) {
     flushRemaining();
-    return;
   }
-
-  bringOutlinePlotsToFront(calculator, contourGroups);
 }
 
-/** 立即写入全部表达式（无动画） */
+/** 立即写入全部表达式（无动画）；填色在前、轮廓在后 */
 export function applyFourierExpressionsToCalculator(
   calculator: any,
   expressions: any[],
 ) {
   if (!calculator) return;
   calculator.setBlank();
-  const prepared = expressions.map(prepareFourierExpression);
-  for (let i = 0; i < prepared.length; i += DESMOS_EXPR_BATCH) {
-    pushExprBatch(calculator, prepared.slice(i, i + DESMOS_EXPR_BATCH));
+  const { meta, fills, contours } = partitionExpressions(expressions);
+  const ordered = [
+    ...meta.map(prepareFourierExpression),
+    ...fills.map(prepareFourierExpression),
+    ...contours.map(prepareFourierExpression),
+  ];
+  for (let i = 0; i < ordered.length; i += DESMOS_EXPR_BATCH) {
+    pushExprBatch(calculator, ordered.slice(i, i + DESMOS_EXPR_BATCH));
   }
 }
 
-/** GIF 动画：分批写入，避免 Desmos / 主线程卡死 */
+/** GIF 动画：分批写入，填色优先；避免 Desmos / 主线程卡死 */
 export async function applyGifExpressionsToCalculator(
   calculator: any,
   expressions: any[],
   options: {
     signal?: AbortSignal;
     onProgress?: (done: number, total: number) => void;
+    /** 终止时保留已写入部分 */
+    commitPartialOnAbort?: boolean;
   } = {},
-): Promise<void> {
-  if (!calculator || expressions.length === 0) return;
-
-  const GIF_BATCH = 36;
-  const BATCH_PAUSE_MS = 12;
-
-  calculator.setBlank();
-  const prepared = expressions.map(prepareFourierExpression);
-  const total = prepared.length;
-
-  for (let i = 0; i < prepared.length; i += GIF_BATCH) {
-    if (options.signal?.aborted) return;
-    pushExprBatch(calculator, prepared.slice(i, i + GIF_BATCH));
-    options.onProgress?.(Math.min(i + GIF_BATCH, total), total);
-    if (i + GIF_BATCH < prepared.length) {
-      await sleep(BATCH_PAUSE_MS, options.signal);
-    }
+): Promise<{ committed: number; total: number; partial: boolean }> {
+  if (!calculator || expressions.length === 0) {
+    return { committed: 0, total: 0, partial: false };
   }
 
-  const contourGroups = groupContourExpressions(
-    prepared.filter(expr => !isFillExpression(expr)
-      && expr.id !== 'gif_frame_slider'
-      && expr.id !== 'gif_time_slider'),
-  );
-  bringOutlinePlotsToFront(calculator, contourGroups);
+  const GIF_FILL_BATCH = 96;
+  const GIF_CONTOUR_BATCH = 48;
+  const total = expressions.length;
+
+  calculator.setBlank();
+  const { meta, fills, contours } = partitionExpressions(expressions);
+  let committed = 0;
+
+  const injectBatch = async (batch: any[]) => {
+    if (batch.length === 0) return;
+    pushExprBatch(calculator, batch.map(prepareFourierExpression));
+    committed += batch.length;
+    options.onProgress?.(committed, total);
+    await yieldFrame();
+  };
+
+  const injectSection = async (items: any[], batchSize: number) => {
+    for (let i = 0; i < items.length; i += batchSize) {
+      if (options.signal?.aborted) {
+        return false;
+      }
+      await injectBatch(items.slice(i, i + batchSize));
+    }
+    return true;
+  };
+
+  await injectBatch(meta);
+  if (options.signal?.aborted) {
+    return { committed, total, partial: committed > 0 };
+  }
+
+  if (!await injectSection(fills, GIF_FILL_BATCH)) {
+    return { committed, total, partial: options.commitPartialOnAbort !== false && committed > 0 };
+  }
+  if (!await injectSection(contours, GIF_CONTOUR_BATCH)) {
+    return { committed, total, partial: options.commitPartialOnAbort !== false && committed > 0 };
+  }
+
+  return { committed: total, total, partial: false };
+}
+
+const GIF_STREAM_FILL_BATCH = 96;
+const GIF_STREAM_CONTOUR_BATCH = 48;
+
+/** 流式注入：写入时间滑块（首次 setBlank） */
+export function initGifStreamCalculator(
+  calculator: any,
+  durationSec: number,
+  sliderVar = 's',
+  sliderStep = '0.01',
+): void {
+  if (!calculator) return;
+  calculator.setBlank();
+  const max = Math.max(0.1, Math.round(durationSec * 100) / 100);
+  pushExprBatch(calculator, [prepareFourierExpression({
+    id: 'gif_time_slider',
+    latex: `${sliderVar}=0`,
+    sliderBounds: { min: '0', max: String(max), step: sliderStep },
+    hidden: false,
+  })]);
+}
+
+/** 流式注入：追加单帧表达式（填色→轮廓） */
+export async function appendGifFrameToCalculator(
+  calculator: any,
+  frameExpressions: any[],
+): Promise<number> {
+  if (!calculator || frameExpressions.length === 0) return 0;
+
+  const { fills, contours } = partitionExpressions(frameExpressions);
+  let added = 0;
+
+  for (let i = 0; i < fills.length; i += GIF_STREAM_FILL_BATCH) {
+    const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH).map(prepareFourierExpression);
+    pushExprBatch(calculator, batch);
+    added += batch.length;
+    await yieldFrame();
+  }
+  for (let i = 0; i < contours.length; i += GIF_STREAM_CONTOUR_BATCH) {
+    const batch = contours.slice(i, i + GIF_STREAM_CONTOUR_BATCH).map(prepareFourierExpression);
+    pushExprBatch(calculator, batch);
+    added += batch.length;
+    await yieldFrame();
+  }
+  return added;
+}
+
+/** 流式注入：更新部分完成时的滑块时长上限 */
+export function updateGifStreamDuration(
+  calculator: any,
+  durationSec: number,
+  sliderVar = 's',
+  sliderStep = '0.01',
+): void {
+  if (!calculator) return;
+  const max = Math.max(0.1, Math.round(durationSec * 100) / 100);
+  calculator.setExpression(prepareFourierExpression({
+    id: 'gif_time_slider',
+    latex: `${sliderVar}=0`,
+    sliderBounds: { min: '0', max: String(max), step: sliderStep },
+    hidden: false,
+  }));
 }
 
 /**

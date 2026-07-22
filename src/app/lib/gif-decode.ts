@@ -106,6 +106,34 @@ const thumbDiff = (a: Uint8Array, b: Uint8Array): number => {
   return sum / a.length;
 };
 
+const decodeYield = (): Promise<void> =>
+  new Promise(resolve => {
+    if (typeof requestIdleCallback !== 'undefined') {
+      requestIdleCallback(() => resolve(), { timeout: 16 });
+    } else {
+      setTimeout(resolve, 0);
+    }
+  });
+
+/** 在单调递增的时间轴上找最近帧（O(log n)） */
+const findNearestFrameIndex = (frameTimesSec: number[], sec: number): number => {
+  const total = frameTimesSec.length;
+  if (total === 0) return 0;
+  if (total === 1) return 0;
+
+  let lo = 0;
+  let hi = total - 1;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (frameTimesSec[mid] < sec) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo > 0 && Math.abs(frameTimesSec[lo - 1] - sec) <= Math.abs(frameTimesSec[lo] - sec)) {
+    return lo - 1;
+  }
+  return lo;
+};
+
 /** 均匀采样帧索引，保留首尾 */
 export function sampleFrameIndices(total: number, maxFrames: number): number[] {
   if (total <= maxFrames) {
@@ -159,30 +187,12 @@ export function pickTimelineKeyframeIndices(
   // 按目标帧率均匀取时间点
   for (let k = 1; k < targetCount - 1; k++) {
     const sec = (k / (targetCount - 1)) * durationSec;
-    let bestIdx = 0;
-    let bestDist = Infinity;
-    for (let i = 0; i < total; i++) {
-      const dist = Math.abs(frameTimesSec[i] - sec);
-      if (dist < bestDist) {
-        bestDist = dist;
-        bestIdx = i;
-      }
-    }
-    picked.add(bestIdx);
+    picked.add(findNearestFrameIndex(frameTimesSec, sec));
   }
 
   // 固定间隔边界补帧
   for (let sec = minInterval; sec < durationSec; sec += minInterval) {
-    let bestIdx = 0;
-    let bestDist = Infinity;
-    for (let i = 0; i < total; i++) {
-      const dist = Math.abs(frameTimesSec[i] - sec);
-      if (dist < bestDist) {
-        bestDist = dist;
-        bestIdx = i;
-      }
-    }
-    picked.add(bestIdx);
+    picked.add(findNearestFrameIndex(frameTimesSec, sec));
   }
 
   // 场景变化：相邻原帧差异超过阈值
@@ -278,7 +288,8 @@ export async function decodeGifWithTimeline(
   const frameThumbs: Uint8Array[] = [];
   let cumulativeMs = 0;
 
-  rawFrames.forEach((frame, index) => {
+  for (let index = 0; index < rawFrames.length; index++) {
+    const frame = rawFrames[index];
     blitPatch(composite, frame.patch, frame.dims, width);
     const delayMs = Math.max(20, (frame.delay || 8) * 10);
     frameTimesSec.push(cumulativeMs / 1000);
@@ -294,7 +305,11 @@ export async function decodeGifWithTimeline(
     if (frame.disposalType !== 3) {
       previous = copyImageData(composite);
     }
-  });
+
+    if (index > 0 && index % 24 === 0) {
+      await decodeYield();
+    }
+  }
 
   const durationSec = cumulativeMs / 1000;
   const pickedIndices = pickTimelineKeyframeIndices(
@@ -314,7 +329,8 @@ export async function decodeGifWithTimeline(
   const pickedSet = new Set(pickedIndices);
   const keyframes: DecodedGifKeyframe[] = [];
 
-  rawFrames.forEach((frame, index) => {
+  for (let index = 0; index < rawFrames.length; index++) {
+    const frame = rawFrames[index];
     blitPatch(composite, frame.patch, frame.dims, width);
     const delayMs = Math.max(20, (frame.delay || 8) * 10);
 
@@ -346,7 +362,11 @@ export async function decodeGifWithTimeline(
     if (frame.disposalType !== 3) {
       previous = copyImageData(composite);
     }
-  });
+
+    if (index > 0 && index % 24 === 0) {
+      await decodeYield();
+    }
+  }
 
   return {
     width,

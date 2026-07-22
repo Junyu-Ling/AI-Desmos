@@ -284,6 +284,7 @@ async function callOpenAiVisionBatch(
   batch: Array<{ dataUrl: string; frameIndex: number; width: number; height: number }>,
   mode: SmartDrawMode,
   headersOverride?: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<Map<number, { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] }> | null> {
   const n = batch.length;
   const content: Array<{ type: string; text?: string; image_url?: { url: string; detail: string } }> = [
@@ -305,6 +306,7 @@ async function callOpenAiVisionBatch(
   const response = await fetch(endpoint, {
     method: 'POST',
     headers,
+    signal,
     body: JSON.stringify({
       model,
       temperature: 0.1,
@@ -332,6 +334,7 @@ async function callClaudeVisionBatch(
   batch: Array<{ dataUrl: string; frameIndex: number }>,
   mode: SmartDrawMode,
   frameMeta: Array<{ frameIndex: number; width: number; height: number }>,
+  signal?: AbortSignal,
 ): Promise<Map<number, { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] }> | null> {
   const n = batch.length;
   const content: Array<{ type: string; text?: string; source?: { type: string; media_type: string; data: string } }> = [
@@ -356,6 +359,7 @@ async function callClaudeVisionBatch(
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
+    signal,
     headers: {
       'Content-Type': 'application/json',
       'x-api-key': apiKey,
@@ -389,9 +393,11 @@ export async function analyzeSmartDrawBatchWithAI(
   frames: SmartDrawBatchFrameInput[],
   mode: SmartDrawMode,
   apiKey?: string,
+  signal?: AbortSignal,
 ): Promise<Map<number, { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] }>> {
   const result = new Map<number, { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] }>();
   if (frames.length === 0 || mode === 'fill') return result;
+  if (signal?.aborted) return result;
 
   const cfg = getApiConfig();
   const key = getEffectiveApiKey(apiKey);
@@ -401,7 +407,7 @@ export async function analyzeSmartDrawBatchWithAI(
 
   try {
     const compressed = await Promise.all(
-      frames.map(f => compressImageDataUrl(f.dataUrl, 640, 0.82)),
+      frames.map(f => compressImageDataUrl(f.dataUrl, 768, 0.85)),
     );
     const batch = frames.map((f, i) => ({
       ...f,
@@ -418,23 +424,27 @@ export async function analyzeSmartDrawBatchWithAI(
           batch,
           mode,
           frames.map(f => ({ frameIndex: f.frameIndex, width: f.width, height: f.height })),
+          signal,
         );
       }
     } else {
       const { url, headers } = buildProviderRequest(provider.id, provider.endpoint, key);
       const model = resolveVisionModel(provider.id, cfg.model);
-      batchResult = await callOpenAiVisionBatch(url, model, batch, mode, headers);
+      batchResult = await callOpenAiVisionBatch(url, model, batch, mode, headers, signal);
     }
 
     if (batchResult && batchResult.size > 0) {
       batchResult.forEach((v, k) => result.set(k, v));
-      return result;
     }
   } catch {
-    // fall through to per-frame
+    // fall through to per-frame fallback
   }
 
-  for (const frame of frames) {
+  const missing = frames.filter(f => !result.has(f.frameIndex));
+  if (missing.length === 0) return result;
+
+  await runParallel(missing, 4, async (frame) => {
+    if (signal?.aborted) return;
     try {
       const single = await analyzeSmartDrawWithAI(
         frame.dataUrl, mode, frame.width, frame.height, apiKey,
@@ -443,9 +453,65 @@ export async function analyzeSmartDrawBatchWithAI(
     } catch {
       // skip frame
     }
-  }
+  });
 
   return result;
+}
+
+async function runParallel<T>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) return;
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+}
+
+/** 合并 AI 结果到启发式 tuning（与 prepareSmartDrawImage 相同逻辑） */
+export function mergeAiIntoSmartDrawTuning(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  mode: SmartDrawMode,
+  aiResult?: { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] } | null,
+): SmartDrawPrepareResult {
+  let tuning = analyzeImageHeuristically(ctx, width, height, mode);
+  let aiContours: SmartDrawAIContour[] = [];
+
+  if (aiResult) {
+    tuning = mergeSmartDrawTuning({ ...tuning, ...aiResult.tuning });
+    aiContours = aiResult.contours;
+    if (aiContours.length > 0) {
+      tuning = mergeSmartDrawTuning({
+        ...tuning,
+        preserveFineDetails: true,
+        fourierK: Math.max(tuning.fourierK, 115),
+        targetPointCount: Math.max(tuning.targetPointCount, 500),
+      });
+    }
+  }
+
+  return { tuning, aiContours };
+}
+
+/** 已有 AI 结果时本地修复（无 API，与单图 prepareSmartDrawImage 同精度） */
+export function prepareSmartDrawFromAiResult(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  mode: SmartDrawMode,
+  aiResult?: { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] } | null,
+): SmartDrawPrepareResult {
+  const { tuning, aiContours } = mergeAiIntoSmartDrawTuning(ctx, width, height, mode, aiResult);
+  applyLocalImageRepair(ctx, width, height, tuning);
+  return { tuning, aiContours };
 }
 
 async function callOpenAiVision(
@@ -695,16 +761,9 @@ export async function prepareSmartDrawImage(
     options.onProgress?.('ai_analyze');
     const aiResult = await analyzeSmartDrawWithAI(dataUrl, mode, width, height, options.apiKey);
     if (aiResult) {
-      tuning = mergeSmartDrawTuning({ ...tuning, ...aiResult.tuning });
-      aiContours = aiResult.contours;
-      if (aiContours.length > 0) {
-        tuning = mergeSmartDrawTuning({
-          ...tuning,
-          preserveFineDetails: true,
-          fourierK: Math.max(tuning.fourierK, 115),
-          targetPointCount: Math.max(tuning.targetPointCount, 500),
-        });
-      }
+      const merged = mergeAiIntoSmartDrawTuning(ctx, width, height, mode, aiResult);
+      tuning = merged.tuning;
+      aiContours = merged.aiContours;
     }
   }
 

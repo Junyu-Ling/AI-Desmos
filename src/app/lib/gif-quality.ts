@@ -16,9 +16,12 @@ export type GifQualityProfile = {
   targetFps: number;
   maxKeyframes: number;
   maxDim: number;
-  totalExprBudget: number;
   /** 批量 AI 每批帧数 */
   aiBatchSize: number;
+  /** 同时进行的 AI 批次数 */
+  aiParallelBatches: number;
+  /** 并行本地修复帧数 */
+  localPrepareConcurrency: number;
   /** 并行 Worker 数量 */
   workerCount: number;
   jpegQuality: number;
@@ -31,11 +34,12 @@ export const GIF_QUALITY_PROFILES: Record<GifQualityTier, GifQualityProfile> = {
     sampleIntervalSec: 0.125,
     targetFps: 8,
     maxKeyframes: 400,
-    maxDim: 1024,
-    totalExprBudget: 6800,
+    maxDim: 1280,
     aiBatchSize: 8,
-    workerCount: 4,
-    jpegQuality: 0.88,
+    aiParallelBatches: 3,
+    localPrepareConcurrency: 8,
+    workerCount: 8,
+    jpegQuality: 0.95,
     sceneChangeThreshold: 7,
   },
   cinema: {
@@ -44,10 +48,11 @@ export const GIF_QUALITY_PROFILES: Record<GifQualityTier, GifQualityProfile> = {
     targetFps: 24,
     maxKeyframes: 600,
     maxDim: 1280,
-    totalExprBudget: 9000,
     aiBatchSize: 8,
-    workerCount: 4,
-    jpegQuality: 0.92,
+    aiParallelBatches: 3,
+    localPrepareConcurrency: 8,
+    workerCount: 8,
+    jpegQuality: 0.95,
     sceneChangeThreshold: 4,
   },
 };
