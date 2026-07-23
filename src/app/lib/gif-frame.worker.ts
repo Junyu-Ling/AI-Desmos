@@ -9,6 +9,7 @@ import {
   analyzeImageHeuristically,
   applyLocalImageRepair,
   mergeSmartDrawTuning,
+  prepareSmartDrawFromAiResult,
   type SmartDrawAIContour,
   type SmartDrawMode,
   type SmartDrawTuningParams,
@@ -21,16 +22,20 @@ export type GifFrameWorkerInput = {
   width: number;
   height: number;
   mode: SmartDrawMode;
-  /** 完整 tuning（来自 prepareSmartDrawImage，不截断） */
-  tuning: SmartDrawTuningParams;
-  aiContours: SmartDrawAIContour[];
-  /** 填色用原图像素（1:1 取色，未经修复） */
+  tuning?: SmartDrawTuningParams | Partial<SmartDrawTuningParams>;
+  aiContours?: SmartDrawAIContour[];
+  /** 填色用原图像素（默认同 pixels） */
   fillPixels?: Uint8ClampedArray;
   frameSlot: number;
   timeStartSec: number;
   timeEndSec: number;
   /** 主线程已执行 applyLocalImageRepair */
   alreadyRepaired?: boolean;
+  /** 使用 AI 结果在 Worker 内完成本地修复（主线程不再重复 prepare） */
+  useAiPrepare?: boolean;
+  /** 播放管理器负责可见性，省略 latex 时间限制 */
+  skipFrameRestriction?: boolean;
+  maxFillPolygons?: number;
 };
 
 export type GifFrameWorkerOutput = {
@@ -46,22 +51,50 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Worker canvas unavailable');
 
-    const imageData = new ImageData(msg.pixels, msg.width, msg.height);
+    const imageData = new ImageData(new Uint8ClampedArray(msg.pixels), msg.width, msg.height);
     ctx.putImageData(imageData, 0, 0);
 
-    let tuning = msg.tuning;
-    if (!msg.alreadyRepaired) {
+    let tuning: SmartDrawTuningParams;
+    let aiContours: SmartDrawAIContour[] = msg.aiContours ?? [];
+
+    if (msg.useAiPrepare) {
+      const prepared = prepareSmartDrawFromAiResult(
+        ctx as unknown as CanvasRenderingContext2D,
+        msg.width,
+        msg.height,
+        msg.mode,
+        msg.tuning || aiContours.length
+          ? {
+              tuning: (msg.tuning ?? {}) as Partial<SmartDrawTuningParams>,
+              contours: aiContours,
+            }
+          : null,
+      );
+      tuning = prepared.tuning;
+      aiContours = prepared.aiContours;
+    } else if (!msg.alreadyRepaired) {
       tuning = mergeSmartDrawTuning({
-        ...analyzeImageHeuristically(ctx as unknown as CanvasRenderingContext2D, msg.width, msg.height, msg.mode),
-        ...msg.tuning,
+        ...analyzeImageHeuristically(
+          ctx as unknown as CanvasRenderingContext2D,
+          msg.width,
+          msg.height,
+          msg.mode,
+        ),
+        ...(msg.tuning ?? {}),
       });
-      applyLocalImageRepair(ctx as unknown as CanvasRenderingContext2D, msg.width, msg.height, tuning);
+      applyLocalImageRepair(
+        ctx as unknown as CanvasRenderingContext2D,
+        msg.width,
+        msg.height,
+        tuning,
+      );
+    } else {
+      tuning = mergeSmartDrawTuning(msg.tuning ?? {});
     }
 
-    const fillSource = msg.fillPixels ?? msg.pixels;
     const fillImageData = msg.fillPixels
       ? new ImageData(msg.fillPixels, msg.width, msg.height)
-      : imageData;
+      : new ImageData(new Uint8ClampedArray(msg.pixels), msg.width, msg.height);
 
     const { expressions } = generateFourierExpressionsFromContext(
       ctx as unknown as CanvasRenderingContext2D,
@@ -70,9 +103,10 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
       {
         mode: msg.mode,
         tuning,
-        aiContours: msg.aiContours,
+        aiContours,
         fillImageData,
-        maxFillPolygons: SINGLE_IMAGE_MAX_FILL_POLYGONS,
+        maxFillPolygons: msg.maxFillPolygons ?? SINGLE_IMAGE_MAX_FILL_POLYGONS,
+        skipFrameRestriction: msg.skipFrameRestriction,
         varNamespace: msg.frameSlot,
         frameSlot: msg.frameSlot,
         frameSliderVar: GIF_TIME_SLIDER,

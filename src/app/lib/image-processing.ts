@@ -1331,12 +1331,14 @@ const buildFillPolygonExpressions = (
   polys: FillPolygon[],
   options: Pick<ImageFourierOptions,
     'frameSlot' | 'frameSliderVar' | 'idPrefix' | 'gifFrameCount' | 'gifSmoothSlider'
-    | 'gifTimeBasedSlider' | 'gifTimeStart' | 'gifTimeEnd'
+    | 'gifTimeBasedSlider' | 'gifTimeStart' | 'gifTimeEnd' | 'skipFrameRestriction'
   > = {},
 ): any[] => {
   const expressions: any[] = [];
   const prefix = options.idPrefix ?? '';
+  const skipRestriction = options.skipFrameRestriction ?? false;
   const restrict = (latex: string) => {
+    if (skipRestriction) return latex;
     if (options.frameSlot != null && options.frameSliderVar) {
       return `${latex}${buildFrameVisibilityRestriction(
         options.frameSlot,
@@ -1425,6 +1427,8 @@ export type ImageFourierOptions = {
   gifTimeEnd?: number;
   /** 填色 polygon 数量上限（GIF 多帧时降低） */
   maxFillPolygons?: number;
+  /** 播放管理器控制可见性时，不在 latex 上附加时间限制 */
+  skipFrameRestriction?: boolean;
 };
 
 /**
@@ -1460,9 +1464,11 @@ const generateFourierExpressions = (
   const offsetY = height / 2;
   const idPrefix = options.idPrefix ?? (options.frameSlot ? `gif_f${options.frameSlot}_` : '');
   const frameSliderVar = options.frameSliderVar ?? 'f';
+  const skipRestriction = options.skipFrameRestriction ?? false;
   const restrictPlot = (latex: string) => (
-    options.frameSlot != null
-      ? `${latex}${buildFrameVisibilityRestriction(
+    skipRestriction || options.frameSlot == null
+      ? latex
+      : `${latex}${buildFrameVisibilityRestriction(
         options.frameSlot,
         frameSliderVar,
         options.gifSmoothSlider ?? false,
@@ -1472,7 +1478,6 @@ const generateFourierExpressions = (
           : undefined,
         options.gifTimeBasedSlider,
       )}`
-      : latex
   );
 
   let fillPolys: FillPolygon[] = [];
@@ -1500,6 +1505,7 @@ const generateFourierExpressions = (
       gifTimeBasedSlider: options.gifTimeBasedSlider,
       gifTimeStart: options.gifTimeStart,
       gifTimeEnd: options.gifTimeEnd,
+      skipFrameRestriction: options.skipFrameRestriction,
     });
   }
 
@@ -1847,10 +1853,21 @@ const partitionExpressions = (expressions: any[]) => {
   return { meta, fills, contours };
 };
 
-const yieldFrame = (): Promise<void> =>
+/** 让出主线程，保证 Desmos 滑块与用户输入仍可响应 */
+export const yieldToInteractive = (): Promise<void> =>
   new Promise(resolve => {
-    requestAnimationFrame(() => resolve());
+    requestAnimationFrame(() => {
+      setTimeout(resolve, 0);
+    });
   });
+
+/** 单帧 rAF 让出（高速注入时使用） */
+export const yieldQuick = (): Promise<void> =>
+  new Promise(resolve => {
+    requestAnimationFrame(resolve);
+  });
+
+const yieldFrame = (): Promise<void> => yieldQuick();
 
 export type ProgressiveDrawPhase = 'fill' | 'outline';
 
@@ -1864,7 +1881,7 @@ export type ProgressiveDrawOptions = {
   signal?: AbortSignal;
 };
 
-const DESMOS_EXPR_BATCH = 80;
+const DESMOS_EXPR_BATCH = 120;
 
 const pushExprBatch = (calculator: any, chunk: any[]) => {
   if (!chunk.length) return;
@@ -1914,7 +1931,8 @@ export async function applyFourierExpressionsProgressively(
     onProgress?.(totalSteps, totalSteps, 'outline');
   };
 
-  // 1) 填色：批量写入（3600 条逐条 setExpression 会卡死浏览器）
+  // 1) 填色：大批量写入
+  let fillBatchCount = 0;
   for (let i = 0; i < fills.length; i += DESMOS_EXPR_BATCH) {
     if (signal?.aborted) break;
     const batch = fills.slice(i, i + DESMOS_EXPR_BATCH);
@@ -1922,13 +1940,14 @@ export async function applyFourierExpressionsProgressively(
     nextFill = i + batch.length;
     done = nextFill;
     onProgress?.(done, totalSteps, 'fill');
-    if (i + DESMOS_EXPR_BATCH < fills.length) {
-      await sleep(fillDelayMs, signal);
+    fillBatchCount++;
+    if (fillBatchCount % 2 === 0 && i + DESMOS_EXPR_BATCH < fills.length) {
+      await yieldQuick();
       if (signal?.aborted) break;
     }
   }
 
-  // 2) 轮廓：每组（隐藏辅助式 + 可见曲线）逐组出现
+  // 2) 轮廓：逐组写入
   if (!signal?.aborted) {
     for (let i = 0; i < contourGroups.length; i++) {
       if (signal?.aborted) break;
@@ -1936,8 +1955,8 @@ export async function applyFourierExpressionsProgressively(
       nextContour = i + 1;
       done = fills.length + i + 1;
       onProgress?.(done, totalSteps, 'outline');
-      if (i + 1 < contourGroups.length) {
-        await sleep(contourDelayMs, signal);
+      if ((i + 1) % 4 === 0 && i + 1 < contourGroups.length) {
+        await yieldQuick();
         if (signal?.aborted) break;
       }
     }
@@ -2022,8 +2041,8 @@ export async function applyGifExpressionsToCalculator(
   return { committed: total, total, partial: false };
 }
 
-const GIF_STREAM_FILL_BATCH = 96;
-const GIF_STREAM_CONTOUR_BATCH = 48;
+const GIF_STREAM_FILL_BATCH = 240;
+const GIF_STREAM_CONTOUR_BATCH = 120;
 
 /** 流式注入：写入时间滑块（首次 setBlank） */
 export function initGifStreamCalculator(
@@ -2047,23 +2066,31 @@ export function initGifStreamCalculator(
 export async function appendGifFrameToCalculator(
   calculator: any,
   frameExpressions: any[],
+  options?: { deferVisibility?: boolean },
 ): Promise<number> {
   if (!calculator || frameExpressions.length === 0) return 0;
+
+  const deferVisibility = options?.deferVisibility ?? false;
+  const prepareForStream = (expr: any) => {
+    const prepared = prepareFourierExpression(expr);
+    if (!deferVisibility || isSliderExpression(prepared)) return prepared;
+    return { ...prepared, hidden: true };
+  };
 
   const { fills, contours } = partitionExpressions(frameExpressions);
   let added = 0;
 
   for (let i = 0; i < fills.length; i += GIF_STREAM_FILL_BATCH) {
-    const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH).map(prepareFourierExpression);
+    const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH).map(prepareForStream);
     pushExprBatch(calculator, batch);
     added += batch.length;
-    await yieldFrame();
+    await yieldQuick();
   }
   for (let i = 0; i < contours.length; i += GIF_STREAM_CONTOUR_BATCH) {
-    const batch = contours.slice(i, i + GIF_STREAM_CONTOUR_BATCH).map(prepareFourierExpression);
+    const batch = contours.slice(i, i + GIF_STREAM_CONTOUR_BATCH).map(prepareForStream);
     pushExprBatch(calculator, batch);
     added += batch.length;
-    await yieldFrame();
+    await yieldQuick();
   }
   return added;
 }

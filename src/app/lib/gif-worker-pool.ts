@@ -9,6 +9,9 @@ type PendingTask = {
   reject: (err: Error) => void;
 };
 
+const isAbortError = (error: unknown) =>
+  error instanceof DOMException && error.name === 'AbortError';
+
 /** 从第 0 帧起连续完成的结果数量 */
 export function countContinuousFrameResults(results: any[][]): number {
   let n = 0;
@@ -77,10 +80,14 @@ export class GifWorkerPool {
     this.activeJobs.set(worker, next);
     const payload = next.input;
     const transferables: ArrayBuffer[] = [payload.pixels.buffer];
-    if (payload.fillPixels) {
+    if (payload.fillPixels && payload.fillPixels.buffer !== payload.pixels.buffer) {
       transferables.push(payload.fillPixels.buffer);
     }
     worker.postMessage(payload, transferables);
+  }
+
+  resetAbort(): void {
+    this.aborted = false;
   }
 
   abortPending(): void {
@@ -119,7 +126,10 @@ export class GifWorkerPool {
   ): Promise<any[][]> {
     if (inputs.length === 0) return [];
 
+    this.resetAbort();
+
     const results: any[][] = new Array(inputs.length);
+    const failures: Array<{ index: number; error: Error }> = [];
     const notify = () => {
       onProgress?.(countContinuousFrameResults(results), inputs.length);
     };
@@ -134,11 +144,20 @@ export class GifWorkerPool {
     const jobs = inputs.map((input, i) =>
       this.run(input)
         .then(async exprs => {
+          if (!exprs || exprs.length === 0) {
+            throw new Error('Worker returned no expressions');
+          }
           results[i] = exprs;
           notify();
           if (onFrameReady) await onFrameReady(i, exprs);
         })
-        .catch(() => { /* 队列取消或 Worker 错误 */ }),
+        .catch(err => {
+          if (isAbortError(err)) return;
+          failures.push({
+            index: i,
+            error: err instanceof Error ? err : new Error(String(err)),
+          });
+        }),
     );
 
     try {
@@ -154,6 +173,13 @@ export class GifWorkerPool {
       }
     } finally {
       signal?.removeEventListener('abort', onAbort);
+    }
+
+    if (failures.length > 0 && typeof console !== 'undefined') {
+      console.warn(
+        `[GIF] ${failures.length} worker frame(s) failed`,
+        failures.map(f => ({ index: f.index, message: f.error.message })),
+      );
     }
 
     return results;

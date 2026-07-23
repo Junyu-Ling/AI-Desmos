@@ -3,6 +3,7 @@
  * 高保真模式：按时间轴采样（约每秒一帧）+ 场景变化检测
  */
 import { parseGIF, decompressFrames } from 'gifuct-js';
+import { yieldToInteractive } from './image-processing';
 
 export type DecodedGifFrame = {
   imageData: ImageData;
@@ -106,14 +107,7 @@ const thumbDiff = (a: Uint8Array, b: Uint8Array): number => {
   return sum / a.length;
 };
 
-const decodeYield = (): Promise<void> =>
-  new Promise(resolve => {
-    if (typeof requestIdleCallback !== 'undefined') {
-      requestIdleCallback(() => resolve(), { timeout: 16 });
-    } else {
-      setTimeout(resolve, 0);
-    }
-  });
+const decodeYield = (): Promise<void> => yieldToInteractive();
 
 /** 在单调递增的时间轴上找最近帧（O(log n)） */
 const findNearestFrameIndex = (frameTimesSec: number[], sec: number): number => {
@@ -306,7 +300,7 @@ export async function decodeGifWithTimeline(
       previous = copyImageData(composite);
     }
 
-    if (index > 0 && index % 24 === 0) {
+    if (index > 0 && index % 32 === 0) {
       await decodeYield();
     }
   }
@@ -363,7 +357,7 @@ export async function decodeGifWithTimeline(
       previous = copyImageData(composite);
     }
 
-    if (index > 0 && index % 24 === 0) {
+    if (index > 0 && index % 32 === 0) {
       await decodeYield();
     }
   }

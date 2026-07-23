@@ -63,7 +63,16 @@ import {
 
 // 图像处理：图片/Emoji → 傅里叶变换 → Desmos 表达式
 import { processImageToFourier, processEmojiToFourier, applyFourierExpressionsProgressively, type ProgressiveDrawPhase, type SmartDrawMode } from '../lib/image-processing';
-import { processGifToDesmosAnimation, applyGifExpressionsToCalculator, type GifQualityTier } from '../lib/gif-animation';
+import { processGifToDesmosAnimation, applyGifExpressionsToCalculator, detachGifPlayback, type GifQualityTier } from '../lib/gif-animation';
+import {
+  clearWorkspace,
+  createDebouncedWorkspaceSaver,
+  loadWorkspace,
+} from '../lib/desmos-persistence';
+import {
+  getActivePlaybackSnapshot,
+  restoreGifPlaybackFromSnapshot,
+} from '../lib/gif-playback';
 
 // LaTeX 数学公式渲染库
 // 把 $f(x)=x^2$ 这样的字符串渲染成美观的数学公式
@@ -193,6 +202,14 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
    * 这是 React 中处理"异步中使用最新 prop"的标准技巧。
    */
   const calculatorRef = useRef(calculator);
+  const workspaceRestoredRef = useRef(false);
+  const workspaceSaverRef = useRef(createDebouncedWorkspaceSaver());
+
+  const flushWorkspace = () => {
+    const calc = calculatorRef.current;
+    if (!calc) return;
+    workspaceSaverRef.current.flush(calc, getActivePlaybackSnapshot());
+  };
 
   /**
    * isComposingRef — 追踪中文输入法的组合状态
@@ -215,6 +232,55 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
    */
   useEffect(() => {
     calculatorRef.current = calculator;
+  }, [calculator]);
+
+  /** 画板 + GIF 播放状态持久化：刷新恢复，变更自动保存，仅「清空画板」时清除 */
+  useEffect(() => {
+    if (!calculator) return;
+
+    const saver = workspaceSaverRef.current;
+
+    if (!workspaceRestoredRef.current) {
+      workspaceRestoredRef.current = true;
+      const workspace = loadWorkspace();
+      if (workspace?.calculatorState) {
+        try {
+          calculator.setState(workspace.calculatorState);
+          requestAnimationFrame(() => {
+            if (workspace.gifPlayback?.length) {
+              restoreGifPlaybackFromSnapshot(calculator, workspace.gifPlayback);
+            }
+          });
+        } catch (error) {
+          console.warn('[workspace] restore failed', error);
+        }
+      }
+    }
+
+    const scheduleSave = () => {
+      saver.schedule(calculator, getActivePlaybackSnapshot());
+    };
+
+    if (typeof calculator.observeEvent === 'function') {
+      calculator.observeEvent('change', scheduleSave);
+    }
+
+    const onPageHide = () => flushWorkspace();
+    window.addEventListener('beforeunload', onPageHide);
+    window.addEventListener('pagehide', onPageHide);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') flushWorkspace();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      saver.cancel();
+      calculator.unobserveEvent?.('change', scheduleSave);
+      window.removeEventListener('beforeunload', onPageHide);
+      window.removeEventListener('pagehide', onPageHide);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      flushWorkspace();
+    };
   }, [calculator]);
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -251,7 +317,15 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
               }
             : rest;
           const createdAt = normalized.createdAt ?? parseMessageTimestamp(normalized.id);
-          return createdAt != null ? { ...normalized, createdAt } : normalized;
+          const withoutStaleProgress = normalized.drawingProgressPhase
+            ? {
+                ...normalized,
+                drawingProgressPhase: undefined,
+                drawingProgressCurrent: undefined,
+                drawingProgressTotal: undefined,
+              }
+            : normalized;
+          return createdAt != null ? { ...withoutStaleProgress, createdAt } : withoutStaleProgress;
         });
       }
     } catch (e) {
@@ -291,6 +365,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
 
   const beginTask = () => {
     taskAbortRef.current?.abort();
+    detachGifPlayback();
     const controller = new AbortController();
     taskAbortRef.current = controller;
     return controller;
@@ -840,6 +915,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
    * 调用 Desmos API 的 setBlank() 清空画板，并在聊天中添加系统通知消息。
    */
   const handleClearCanvas = () => {
+    detachGifPlayback();
+    clearWorkspace();
     if (calculatorRef.current) {
       calculatorRef.current.setBlank(); // 清空画板（删除所有表达式）
 
@@ -1261,6 +1338,47 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
         drawingProgressPhase: 'processing',
       }]);
 
+      let gifProgressRaf = 0;
+      let pendingGifProgress: {
+        current: number;
+        total: number;
+        phase: 'decode' | 'frame' | 'ai' | 'worker' | 'inject';
+      } | null = null;
+
+      const flushGifProgress = () => {
+        if (!pendingGifProgress) return;
+        const { current, total, phase } = pendingGifProgress;
+        pendingGifProgress = null;
+        const key = phase === 'decode'
+          ? 'gif_drawing_processing'
+          : phase === 'inject'
+            ? 'gif_drawing_inject'
+            : phase === 'ai'
+              ? 'gif_drawing_ai'
+              : phase === 'worker'
+                ? 'gif_drawing_worker'
+                : 'gif_drawing_frame';
+        setMessages(prev => prev.map(m =>
+          m.id === progressMsgId
+            ? {
+                ...m,
+                content: t(key, {
+                  current: String(current),
+                  total: String(total),
+                }),
+                translationKey: key,
+                translationParams: {
+                  current: String(current),
+                  total: String(total),
+                },
+                drawingProgressPhase: 'processing',
+                drawingProgressCurrent: current,
+                drawingProgressTotal: total,
+              }
+            : m,
+        ));
+      };
+
       const result = await processGifToDesmosAnimation(file, {
         mode,
         quality,
@@ -1270,36 +1388,15 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
         calculator: calculatorRef.current ?? undefined,
         streamToCalculator: true,
         onProgress: (current, total, phase) => {
-          const key = phase === 'decode'
-            ? 'gif_drawing_processing'
-            : phase === 'inject'
-              ? 'gif_drawing_inject'
-              : phase === 'ai'
-                ? 'gif_drawing_ai'
-                : phase === 'worker'
-                  ? 'gif_drawing_worker'
-                  : 'gif_drawing_frame';
-          setMessages(prev => prev.map(m =>
-            m.id === progressMsgId
-              ? {
-                  ...m,
-                  content: t(key, {
-                    current: String(current),
-                    total: String(total),
-                  }),
-                  translationKey: key,
-                  translationParams: {
-                    current: String(current),
-                    total: String(total),
-                  },
-                  drawingProgressPhase: 'processing',
-                  drawingProgressCurrent: current,
-                  drawingProgressTotal: total,
-                }
-              : m,
-          ));
+          pendingGifProgress = { current, total, phase };
+          if (gifProgressRaf) return;
+          gifProgressRaf = requestAnimationFrame(() => {
+            gifProgressRaf = 0;
+            flushGifProgress();
+          });
         },
       });
+      flushGifProgress();
 
       const streamed = Boolean(result.streamed);
       let injectPartial = false;
@@ -1383,9 +1480,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
         content: 'GIF processing failed',
         translationKey: 'gif_process_fail',
       }]);
+      console.error('[GIF] processing failed:', error);
     } finally {
       endTask();
       setIsLoading(false);
+      flushWorkspace();
     }
   };
 
@@ -1485,6 +1584,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     } finally {
         endTask();
         setIsLoading(false);
+        flushWorkspace();
     }
   };
 

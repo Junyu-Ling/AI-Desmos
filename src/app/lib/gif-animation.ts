@@ -1,21 +1,24 @@
 /**
  * GIF → Desmos 时间轴动画
- * - 每帧与单图相同精度（3600 填色 / 1280px / 完整 AI tuning）
- * - 大幅提速：批量并行 AI + 并行本地修复 + Worker 全并行
- * - 终止任务时交付已完成帧
+ * - 高单帧精度 + 单帧可见播放（GifPlaybackManager）
+ * - 提速：分块流水线重叠缩放、并行 Worker/AI、跳过无用 JPEG
+ * - 防卡死：分块释放内存、频繁 yield
  */
 
 import {
   decodeGifWithTimeline,
   scaleGifFrame,
+  type DecodedGifKeyframe,
+  type DecodedGifTimeline,
 } from './gif-decode';
 import {
   appendGifFrameToCalculator,
   generateFourierExpressionsFromContext,
   initGifStreamCalculator,
   SINGLE_IMAGE_MAX_DIM,
-  SINGLE_IMAGE_MAX_FILL_POLYGONS,
   updateGifStreamDuration,
+  yieldQuick,
+  yieldToInteractive,
 } from './image-processing';
 import {
   analyzeSmartDrawBatchWithAI,
@@ -28,25 +31,55 @@ import {
   getGifQualityProfile,
   GIF_TIME_SLIDER,
   GIF_SLIDER_STEP,
+  resolveGifWorkerCount,
+  tuneGifProfileForAsset,
   type GifQualityTier,
 } from './gif-quality';
 import { countContinuousFrameResults, createGifWorkerPool } from './gif-worker-pool';
 import type { GifFrameWorkerInput } from './gif-frame.worker';
+import {
+  attachGifPlayback,
+  classifyGifFrameExpressionIds,
+  detachGifPlayback,
+  GifPlaybackManager,
+} from './gif-playback';
+import type { GifQualityProfile } from './gif-quality';
 
 export { GIF_TIME_SLIDER, GIF_SLIDER_STEP };
 export type { GifQualityTier };
 
-const yieldToMain = (): Promise<void> =>
-  new Promise(resolve => {
-    if (typeof requestIdleCallback !== 'undefined') {
-      requestIdleCallback(() => resolve(), { timeout: 16 });
-    } else {
-      setTimeout(resolve, 0);
-    }
-  });
+const EMPTY_KEYFRAME_IMAGE = new ImageData(new Uint8ClampedArray(4), 1, 1);
+
+const releaseScaledFrame = (sf: ScaledKeyframe) => {
+  sf.dataUrl = '';
+  sf.pixels = new Uint8ClampedArray(0);
+};
+
+const releaseTimelineKeyframe = (kf: DecodedGifKeyframe) => {
+  kf.imageData = EMPTY_KEYFRAME_IMAGE;
+};
 
 const isAbortError = (error: unknown) =>
   error instanceof DOMException && error.name === 'AbortError';
+
+const capGifTuning = (
+  aiResult: { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] } | undefined,
+  profile: GifQualityProfile,
+): { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] } | undefined => {
+  const base = aiResult?.tuning ?? {};
+  return {
+    tuning: {
+      ...base,
+      maxContours: Math.min(base.maxContours ?? profile.maxContours, profile.maxContours),
+      fourierK: Math.min(base.fourierK ?? profile.fourierKCap, profile.fourierKCap),
+      targetPointCount: Math.min(
+        base.targetPointCount ?? profile.targetPointCountCap,
+        profile.targetPointCountCap,
+      ),
+    },
+    contours: aiResult?.contours ?? [],
+  };
+};
 
 async function runParallel<T>(
   items: T[],
@@ -74,7 +107,6 @@ export type ProcessGifResult = {
   durationSec: number;
   partial: boolean;
   explanation: string;
-  /** 已流式写入画板，无需再次 bulk inject */
   streamed?: boolean;
 };
 
@@ -138,12 +170,6 @@ type ScaledKeyframe = {
   dataUrl: string;
 };
 
-type PreparedFrame = {
-  tuning: SmartDrawTuningParams;
-  aiContours: SmartDrawAIContour[];
-  repairedPixels: Uint8ClampedArray;
-};
-
 const buildScaledKeyframe = (
   keyframe: { imageData: ImageData; timeStartSec: number; timeEndSec: number },
   fi: number,
@@ -151,13 +177,17 @@ const buildScaledKeyframe = (
   gifH: number,
   maxDim: number,
   jpegQuality: number,
+  needDataUrl: boolean,
 ): ScaledKeyframe => {
   const scaled = scaleGifFrame(keyframe.imageData, gifW, gifH, maxDim);
-  const canvas = document.createElement('canvas');
-  canvas.width = scaled.width;
-  canvas.height = scaled.height;
-  const ctx = canvas.getContext('2d')!;
-  ctx.putImageData(scaled.imageData, 0, 0);
+  let dataUrl = '';
+  if (needDataUrl) {
+    const canvas = document.createElement('canvas');
+    canvas.width = scaled.width;
+    canvas.height = scaled.height;
+    canvas.getContext('2d')!.putImageData(scaled.imageData, 0, 0);
+    dataUrl = canvas.toDataURL('image/jpeg', jpegQuality);
+  }
 
   return {
     fi,
@@ -166,37 +196,53 @@ const buildScaledKeyframe = (
     pixels: new Uint8ClampedArray(scaled.imageData.data),
     timeStartSec: keyframe.timeStartSec,
     timeEndSec: keyframe.timeEndSec,
-    dataUrl: canvas.toDataURL('image/jpeg', jpegQuality),
+    dataUrl,
   };
 };
 
-const prepareFrameLocal = (
-  sf: ScaledKeyframe,
-  mode: SmartDrawMode,
-  aiResult?: { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] },
-): PreparedFrame => {
-  const canvas = document.createElement('canvas');
-  canvas.width = sf.width;
-  canvas.height = sf.height;
-  const ctx = canvas.getContext('2d')!;
-  ctx.putImageData(new ImageData(sf.pixels, sf.width, sf.height), 0, 0);
+const scaleChunkParallel = async (
+  timeline: DecodedGifTimeline,
+  chunkStart: number,
+  chunkEnd: number,
+  maxDim: number,
+  jpegQuality: number,
+  needDataUrl: boolean,
+  concurrency: number,
+  signal?: AbortSignal,
+): Promise<ScaledKeyframe[]> => {
+  const frameIndices = Array.from(
+    { length: chunkEnd - chunkStart },
+    (_, i) => chunkStart + i,
+  );
+  const scaledChunk: ScaledKeyframe[] = new Array(frameIndices.length);
 
-  const { tuning, aiContours } = prepareSmartDrawFromAiResult(
-    ctx, sf.width, sf.height, mode, aiResult ?? null,
+  await runParallel(
+    frameIndices,
+    concurrency,
+    async (fi, localIdx) => {
+      if (signal?.aborted) return;
+      scaledChunk[localIdx] = buildScaledKeyframe(
+        timeline.keyframes[fi],
+        fi,
+        timeline.width,
+        timeline.height,
+        maxDim,
+        jpegQuality,
+        needDataUrl,
+      );
+      if (localIdx % 3 === 2) await yieldQuick();
+    },
+    () => Boolean(signal?.aborted),
   );
 
-  return {
-    tuning,
-    aiContours,
-    repairedPixels: new Uint8ClampedArray(ctx.getImageData(0, 0, sf.width, sf.height).data),
-  };
+  return scaledChunk;
 };
 
-/** 多批 AI 并行请求（8 帧/批 × 3 批同时进行） */
+/** 多批 AI 并行请求 */
 const fetchBatchAiParallel = async (
   scaledFrames: ScaledKeyframe[],
   mode: SmartDrawMode,
-  profile: ReturnType<typeof getGifQualityProfile>,
+  profile: GifQualityProfile,
   enableAi: boolean,
   apiKey: string | undefined,
   signal: AbortSignal | undefined,
@@ -233,7 +279,6 @@ const fetchBatchAiParallel = async (
         batchResult.forEach((v, k) => aiMap.set(k, v));
         aiDone += batch.length;
         onProgress(Math.min(aiDone, total), total);
-        await yieldToMain();
       } catch (err) {
         if (signal?.aborted || isAbortError(err)) return;
         throw err;
@@ -250,7 +295,7 @@ const buildGifResult = (
   scaledFrames: ScaledKeyframe[],
   frameExpressions: any[][],
   completedFrames: number,
-  profile: ReturnType<typeof getGifQualityProfile>,
+  profile: GifQualityProfile,
   partial: boolean,
   streamed = false,
 ): ProcessGifResult => {
@@ -289,7 +334,7 @@ const buildGifResult = (
     streamed,
     explanation: partial
       ? `GIF ${tierLabel}部分完成（${completed}/${totalFrames} 帧，${durationLabel}s）。滑块 s 可播放已完成部分。`
-      : `GIF ${tierLabel}（${completed} 帧，${durationLabel}s，${fpsLabel}）。每帧与单图相同精度；滑块 s 控制播放。`,
+      : `GIF ${tierLabel}（${completed} 帧，${durationLabel}s，${fpsLabel}）。单帧高精度；滑块 s 控制播放。`,
   };
 };
 
@@ -299,7 +344,6 @@ export type ProcessGifOptions = {
   enableAiRepair?: boolean;
   quality?: GifQualityTier;
   signal?: AbortSignal;
-  /** 提供则 Worker 完成一帧立刻流式写入（默认 true） */
   calculator?: any;
   streamToCalculator?: boolean;
   onProgress?: (
@@ -315,233 +359,302 @@ export async function processGifToDesmosAnimation(
 ): Promise<ProcessGifResult> {
   const mode = options.mode ?? 'both';
   const enableAi = options.enableAiRepair !== false;
-  const profile = getGifQualityProfile(options.quality ?? 'standard');
-  const maxDim = Math.max(profile.maxDim, SINGLE_IMAGE_MAX_DIM);
+  const baseProfile = getGifQualityProfile(options.quality ?? 'standard');
+  const useStreaming = Boolean(
+    options.calculator && options.streamToCalculator !== false,
+  );
+  const playbackManager = useStreaming ? new GifPlaybackManager() : null;
+  let playbackAttached = false;
 
   options.onProgress?.(0, 1, 'decode');
-  await yieldToMain();
   if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
   const timeline = await decodeGifWithTimeline(file, {
-    minIntervalSec: profile.sampleIntervalSec,
-    targetFps: profile.targetFps,
-    maxKeyframes: profile.maxKeyframes,
-    sceneChangeThreshold: profile.sceneChangeThreshold,
+    minIntervalSec: baseProfile.sampleIntervalSec,
+    targetFps: baseProfile.targetFps,
+    maxKeyframes: baseProfile.maxKeyframes,
+    sceneChangeThreshold: baseProfile.sceneChangeThreshold,
   });
 
   const frameCount = timeline.keyframes.length;
   if (frameCount === 0) throw new Error('GIF has no frames');
 
-  const scaledFrames: ScaledKeyframe[] = [];
-  for (let fi = 0; fi < timeline.keyframes.length; fi++) {
-    scaledFrames.push(buildScaledKeyframe(
-      timeline.keyframes[fi],
-      fi,
-      timeline.width,
-      timeline.height,
-      maxDim,
-      profile.jpegQuality,
-    ));
-    if (fi > 0 && fi % 16 === 0) {
-      await yieldToMain();
-      if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    }
-  }
+  const profile = tuneGifProfileForAsset(baseProfile, file, frameCount);
+  const maxDim = Math.min(profile.maxDim, SINGLE_IMAGE_MAX_DIM);
+  const chunkSize = profile.pipelineChunkSize;
+  const needDataUrl = enableAi && mode !== 'fill';
+  const workerCount = resolveGifWorkerCount(profile);
 
-  const aiMap = await fetchBatchAiParallel(
-    scaledFrames,
-    mode,
-    profile,
-    enableAi,
-    options.apiKey,
-    options.signal,
-    (done, total) => options.onProgress?.(done, total, 'ai'),
-  );
-
-  // AI 完成后释放 JPEG dataUrl，降低峰值内存
-  for (const sf of scaledFrames) {
-    sf.dataUrl = '';
-  }
-
-  const preparedFrames: PreparedFrame[] = new Array(frameCount);
-
-  await runParallel(
-    scaledFrames.map((_, i) => i),
-    profile.localPrepareConcurrency,
-    async (fi) => {
-      if (options.signal?.aborted) return;
-      preparedFrames[fi] = prepareFrameLocal(
-        scaledFrames[fi],
-        mode,
-        aiMap.get(scaledFrames[fi].fi),
-      );
-    },
-    () => Boolean(options.signal?.aborted),
-  );
-
-  // 终止时至少保证第 0 帧可交付（本地修复不依赖 AI）
-  if (!preparedFrames[0] && scaledFrames.length > 0) {
-    preparedFrames[0] = prepareFrameLocal(
-      scaledFrames[0],
-      mode,
-      aiMap.get(scaledFrames[0].fi),
-    );
-  }
-
-  let prepareDone = 0;
-  for (let i = 0; i < frameCount; i++) {
-    if (!preparedFrames[i]) break;
-    prepareDone = i + 1;
-  }
-
-  if (prepareDone === 0) {
-    throw new DOMException('Aborted', 'AbortError');
-  }
-
-  options.onProgress?.(0, prepareDone, 'worker');
-  await yieldToMain();
-
-  const useStreaming = Boolean(
-    options.calculator && options.streamToCalculator !== false,
-  );
   let streamInitialized = false;
-  let framesInjected = 0;
+  if (useStreaming) {
+    initGifStreamCalculator(
+      options.calculator,
+      timeline.durationSec,
+      GIF_TIME_SLIDER,
+      GIF_SLIDER_STEP,
+    );
+    streamInitialized = true;
+  }
+
+  const maybeAttachPlayback = () => {
+    if (
+      playbackAttached
+      || !playbackManager
+      || !options.calculator
+      || playbackManager.getFrameCount() === 0
+    ) return;
+    attachGifPlayback(options.calculator, playbackManager, GIF_TIME_SLIDER);
+    playbackAttached = true;
+  };
+
+  const buildWorkerInput = (
+    sf: ScaledKeyframe,
+    aiResult?: { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] },
+  ): GifFrameWorkerInput => {
+    const capped = capGifTuning(aiResult, profile);
+    return {
+      taskId: `f${sf.fi}`,
+      pixels: new Uint8ClampedArray(sf.pixels),
+      width: sf.width,
+      height: sf.height,
+      mode,
+      tuning: capped?.tuning,
+      aiContours: capped?.contours ?? [],
+      frameSlot: sf.fi + 1,
+      timeStartSec: sf.timeStartSec,
+      timeEndSec: sf.timeEndSec,
+      useAiPrepare: true,
+      skipFrameRestriction: useStreaming,
+      maxFillPolygons: profile.maxFillPolygons,
+    };
+  };
+
+  const generateFrameOnMainThread = (
+    sf: ScaledKeyframe,
+    aiResult?: { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] },
+  ): any[] => {
+    const capped = capGifTuning(aiResult, profile);
+    const canvas = document.createElement('canvas');
+    canvas.width = sf.width;
+    canvas.height = sf.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Frame canvas unavailable');
+
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(sf.pixels), sf.width, sf.height), 0, 0);
+    const fillImageData = new ImageData(new Uint8ClampedArray(sf.pixels), sf.width, sf.height);
+    const prepared = prepareSmartDrawFromAiResult(
+      ctx,
+      sf.width,
+      sf.height,
+      mode,
+      capped ?? null,
+    );
+    const frameSlot = sf.fi + 1;
+    const { expressions } = generateFourierExpressionsFromContext(
+      ctx,
+      sf.width,
+      sf.height,
+      {
+        mode,
+        tuning: prepared.tuning,
+        aiContours: prepared.aiContours,
+        fillImageData,
+        maxFillPolygons: profile.maxFillPolygons,
+        skipFrameRestriction: useStreaming,
+        varNamespace: frameSlot,
+        frameSlot,
+        frameSliderVar: GIF_TIME_SLIDER,
+        gifTimeBasedSlider: true,
+        gifTimeStart: sf.timeStartSec,
+        gifTimeEnd: sf.timeEndSec,
+        idPrefix: `gif_f${frameSlot}_`,
+      },
+    );
+    return expressions;
+  };
+
+  const registerStreamedFrame = (sf: ScaledKeyframe, expressions: any[]) => {
+    if (!playbackManager || expressions.length === 0) return;
+    playbackManager.registerFrame(
+      sf.timeStartSec,
+      sf.timeEndSec,
+      classifyGifFrameExpressionIds(expressions),
+    );
+    maybeAttachPlayback();
+  };
 
   const frameStream = useStreaming
     ? new OrderedFrameStream(async (fi, exprs) => {
-      if (!streamInitialized) {
-        initGifStreamCalculator(
-          options.calculator,
-          timeline.durationSec,
-          GIF_TIME_SLIDER,
-          GIF_SLIDER_STEP,
-        );
-        streamInitialized = true;
+      const kf = timeline.keyframes[fi];
+      await appendGifFrameToCalculator(options.calculator, exprs, { deferVisibility: true });
+      if (kf) {
+        registerStreamedFrame({
+          fi,
+          width: timeline.width,
+          height: timeline.height,
+          pixels: new Uint8ClampedArray(0),
+          timeStartSec: kf.timeStartSec,
+          timeEndSec: kf.timeEndSec,
+          dataUrl: '',
+        }, exprs);
       }
-      await appendGifFrameToCalculator(options.calculator, exprs);
-      framesInjected++;
-      preparedFrames[fi] = undefined as unknown as PreparedFrame;
-      scaledFrames[fi].pixels = new Uint8ClampedArray(0);
-      options.onProgress?.(framesInjected, prepareDone, 'inject');
+      options.onProgress?.(fi + 1, frameCount, 'inject');
+      await yieldQuick();
     })
     : null;
 
-  const pool = createGifWorkerPool(profile.workerCount);
-  const frameExpressions: any[][] = useStreaming ? [] : new Array(prepareDone);
+  const pool = createGifWorkerPool(workerCount);
+  const frameExpressions: any[][] = useStreaming ? [] : [];
   let exprCompleted = 0;
+  let workerDone = 0;
 
-  const releaseFrameMemory = (fi: number) => {
-    preparedFrames[fi] = undefined as unknown as PreparedFrame;
-    if (scaledFrames[fi]) scaledFrames[fi].pixels = new Uint8ClampedArray(0);
-  };
+  const scaleRange = (start: number, end: number) =>
+    scaleChunkParallel(
+      timeline,
+      start,
+      end,
+      maxDim,
+      profile.jpegQuality,
+      needDataUrl,
+      profile.scaleConcurrency,
+      options.signal,
+    );
 
-  if (pool) {
-    const workerInputs: GifFrameWorkerInput[] = [];
-    for (let fi = 0; fi < prepareDone; fi++) {
-      if (!preparedFrames[fi]) break;
-      const sf = scaledFrames[fi];
-      workerInputs.push({
-        taskId: `f${sf.fi}`,
-        pixels: preparedFrames[fi].repairedPixels,
-        fillPixels: sf.pixels,
-        width: sf.width,
-        height: sf.height,
+  let pendingScale: Promise<ScaledKeyframe[]> | null = scaleRange(
+    0,
+    Math.min(chunkSize, frameCount),
+  );
+
+  try {
+    for (let chunkStart = 0; chunkStart < frameCount; chunkStart += chunkSize) {
+      if (options.signal?.aborted) break;
+
+      const chunkEnd = Math.min(chunkStart + chunkSize, frameCount);
+      const scaledChunk = await pendingScale!;
+      pendingScale = chunkEnd < frameCount
+        ? scaleRange(chunkEnd, Math.min(chunkEnd + chunkSize, frameCount))
+        : null;
+
+      await yieldToInteractive();
+
+      const aiMap = await fetchBatchAiParallel(
+        scaledChunk,
         mode,
-        tuning: preparedFrames[fi].tuning,
-        aiContours: preparedFrames[fi].aiContours,
-        frameSlot: sf.fi + 1,
-        timeStartSec: sf.timeStartSec,
-        timeEndSec: sf.timeEndSec,
-        alreadyRepaired: true,
-      });
-    }
-
-    try {
-      const results = await pool.runUntilAbort(
-        workerInputs,
+        profile,
+        enableAi,
+        options.apiKey,
         options.signal,
-        (done, total) => options.onProgress?.(done, total, 'worker'),
-        async (index, exprs) => {
-          if (frameStream) {
-            frameStream.push(index, exprs);
-          } else {
-            frameExpressions[index] = exprs;
-          }
-        },
+        (done) => options.onProgress?.(chunkStart + done, frameCount, 'ai'),
       );
-      if (frameStream) {
-        await frameStream.drain();
-        exprCompleted = frameStream.continuousDone;
-      } else {
-        exprCompleted = countContinuousFrameResults(results);
-        for (let i = 0; i < exprCompleted; i++) {
-          frameExpressions[i] = results[i];
-        }
+
+      for (const sf of scaledChunk) {
+        sf.dataUrl = '';
       }
-    } finally {
-      pool.terminate();
-    }
-  } else {
-    await runParallel(
-      Array.from({ length: prepareDone }, (_, i) => i),
-      profile.localPrepareConcurrency,
-      async (fi) => {
-        if (options.signal?.aborted) return;
-        const sf = scaledFrames[fi];
-        const canvas = document.createElement('canvas');
-        canvas.width = sf.width;
-        canvas.height = sf.height;
-        const ctx = canvas.getContext('2d')!;
-        ctx.putImageData(new ImageData(preparedFrames[fi].repairedPixels, sf.width, sf.height), 0, 0);
-        const fillImageData = new ImageData(new Uint8ClampedArray(sf.pixels), sf.width, sf.height);
-        const frameSlot = sf.fi + 1;
-        const { expressions } = generateFourierExpressionsFromContext(
-          ctx, sf.width, sf.height,
-          {
-            mode,
-            tuning: preparedFrames[fi].tuning,
-            aiContours: preparedFrames[fi].aiContours,
-            fillImageData,
-            maxFillPolygons: SINGLE_IMAGE_MAX_FILL_POLYGONS,
-            varNamespace: frameSlot,
-            frameSlot,
-            frameSliderVar: GIF_TIME_SLIDER,
-            gifTimeBasedSlider: true,
-            gifTimeStart: sf.timeStartSec,
-            gifTimeEnd: sf.timeEndSec,
-            idPrefix: `gif_f${frameSlot}_`,
+
+      if (pool) {
+        const workerInputs = scaledChunk.map(sf =>
+          buildWorkerInput(sf, aiMap.get(sf.fi)),
+        );
+
+        const workerResults = await pool.runUntilAbort(
+          workerInputs,
+          options.signal,
+          (done) => {
+            workerDone = chunkStart + done;
+            options.onProgress?.(workerDone, frameCount, 'worker');
+          },
+          async (index, exprs) => {
+            const globalIndex = chunkStart + index;
+            if (frameStream) {
+              frameStream.push(globalIndex, exprs);
+            } else {
+              frameExpressions[globalIndex] = exprs;
+            }
           },
         );
-        if (frameStream) {
-          frameStream.push(fi, expressions);
-        } else {
-          frameExpressions[fi] = expressions;
+
+        for (let localIdx = 0; localIdx < scaledChunk.length; localIdx++) {
+          if (options.signal?.aborted) break;
+          const exprs = workerResults[localIdx];
+          if (exprs && exprs.length > 0) continue;
+
+          const sf = scaledChunk[localIdx];
+          const globalIndex = chunkStart + localIdx;
+          try {
+            const expressions = generateFrameOnMainThread(sf, aiMap.get(sf.fi));
+            if (expressions.length === 0) continue;
+            workerResults[localIdx] = expressions;
+            if (frameStream) {
+              frameStream.push(globalIndex, expressions);
+            } else {
+              frameExpressions[globalIndex] = expressions;
+            }
+            workerDone = Math.max(workerDone, globalIndex + 1);
+            options.onProgress?.(workerDone, frameCount, 'worker');
+            await yieldQuick();
+          } catch (err) {
+            if (!isAbortError(err)) {
+              console.warn(`[GIF] main-thread fallback failed for frame ${globalIndex}`, err);
+            }
+            break;
+          }
         }
-        if (!frameStream) {
-          exprCompleted = countContinuousFrameResults(frameExpressions);
-        }
-        options.onProgress?.(
-          frameStream ? fi + 1 : exprCompleted,
-          prepareDone,
-          frameStream ? 'inject' : 'frame',
+      } else {
+        await runParallel(
+          scaledChunk.map((_, i) => i),
+          profile.localPrepareConcurrency,
+          async (localIdx) => {
+            if (options.signal?.aborted) return;
+            const sf = scaledChunk[localIdx];
+            const globalIndex = chunkStart + localIdx;
+            const expressions = generateFrameOnMainThread(sf, aiMap.get(sf.fi));
+            if (frameStream) {
+              frameStream.push(globalIndex, expressions);
+            } else {
+              frameExpressions[globalIndex] = expressions;
+            }
+            workerDone = Math.max(workerDone, globalIndex + 1);
+            options.onProgress?.(workerDone, frameCount, 'worker');
+            await yieldQuick();
+          },
+          () => Boolean(options.signal?.aborted),
         );
-        releaseFrameMemory(fi);
-      },
-      () => Boolean(options.signal?.aborted),
-    );
+      }
+
+      for (let fi = chunkStart; fi < chunkEnd; fi++) {
+        releaseTimelineKeyframe(timeline.keyframes[fi]);
+      }
+      for (const sf of scaledChunk) {
+        releaseScaledFrame(sf);
+      }
+      await yieldToInteractive();
+    }
+
     if (frameStream) {
       await frameStream.drain();
       exprCompleted = frameStream.continuousDone;
     } else {
       exprCompleted = countContinuousFrameResults(frameExpressions);
     }
+  } finally {
+    pool?.terminate();
+  }
+
+  if (exprCompleted === 0 && workerDone > 0) {
+    exprCompleted = workerDone;
+  }
+  if (exprCompleted === 0) {
+    if (options.signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    throw new Error('GIF frame generation produced no output');
   }
 
   const partial = Boolean(options.signal?.aborted) || exprCompleted < frameCount;
 
   if (useStreaming && streamInitialized) {
     const finalDuration = partial && exprCompleted > 0
-      ? scaledFrames[exprCompleted - 1].timeEndSec
+      ? timeline.keyframes[Math.min(exprCompleted - 1, frameCount - 1)].timeEndSec
       : timeline.durationSec;
     updateGifStreamDuration(
       options.calculator,
@@ -551,9 +664,23 @@ export async function processGifToDesmosAnimation(
     );
   }
 
+  if (useStreaming && streamInitialized && playbackManager && options.calculator && !playbackAttached) {
+    attachGifPlayback(options.calculator, playbackManager, GIF_TIME_SLIDER);
+  }
+
+  const scaledStub: ScaledKeyframe[] = timeline.keyframes.map((kf, fi) => ({
+    fi,
+    width: timeline.width,
+    height: timeline.height,
+    pixels: new Uint8ClampedArray(0),
+    timeStartSec: kf.timeStartSec,
+    timeEndSec: kf.timeEndSec,
+    dataUrl: '',
+  }));
+
   return buildGifResult(
     timeline,
-    scaledFrames,
+    scaledStub,
     frameExpressions,
     exprCompleted,
     profile,
@@ -563,6 +690,7 @@ export async function processGifToDesmosAnimation(
 }
 
 export { applyGifExpressionsToCalculator } from './image-processing';
+export { detachGifPlayback } from './gif-playback';
 
 /** @deprecated */
 export const GIF_FRAME_SLIDER = 'f';
