@@ -12,10 +12,10 @@ import {
   type DecodedGifTimeline,
 } from './gif-decode';
 import {
-  appendGifFrameToCalculator,
   generateFourierExpressionsFromContext,
   initGifStreamCalculator,
   SINGLE_IMAGE_MAX_DIM,
+  SINGLE_IMAGE_MAX_FILL_POLYGONS,
   updateGifStreamDuration,
   yieldQuick,
   yieldToInteractive,
@@ -38,11 +38,11 @@ import {
 import { countContinuousFrameResults, createGifWorkerPool } from './gif-worker-pool';
 import type { GifFrameWorkerInput } from './gif-frame.worker';
 import {
-  attachGifPlayback,
-  classifyGifFrameExpressionIds,
+  attachGifWindowedPlayback,
   detachGifPlayback,
-  GifPlaybackManager,
+  GifWindowedPlaybackManager,
 } from './gif-playback';
+import { GifFrameArchive } from './gif-frame-archive';
 import type { GifQualityProfile } from './gif-quality';
 
 export { GIF_TIME_SLIDER, GIF_SLIDER_STEP };
@@ -62,22 +62,22 @@ const releaseTimelineKeyframe = (kf: DecodedGifKeyframe) => {
 const isAbortError = (error: unknown) =>
   error instanceof DOMException && error.name === 'AbortError';
 
-const capGifTuning = (
+/** 合并 AI tuning：只补默认值，不压低 AI/启发式给出的上限 */
+const mergeGifTuning = (
   aiResult: { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] } | undefined,
   profile: GifQualityProfile,
 ): { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] } | undefined => {
-  const base = aiResult?.tuning ?? {};
+  const defaults: Partial<SmartDrawTuningParams> = {
+    maxContours: profile.maxContours,
+    fourierK: profile.fourierKCap,
+    targetPointCount: profile.targetPointCountCap,
+  };
+  if (!aiResult) {
+    return { tuning: defaults, contours: [] };
+  }
   return {
-    tuning: {
-      ...base,
-      maxContours: Math.min(base.maxContours ?? profile.maxContours, profile.maxContours),
-      fourierK: Math.min(base.fourierK ?? profile.fourierKCap, profile.fourierKCap),
-      targetPointCount: Math.min(
-        base.targetPointCount ?? profile.targetPointCountCap,
-        profile.targetPointCountCap,
-      ),
-    },
-    contours: aiResult?.contours ?? [],
+    tuning: { ...defaults, ...aiResult.tuning },
+    contours: aiResult.contours,
   };
 };
 
@@ -230,7 +230,7 @@ const scaleChunkParallel = async (
         jpegQuality,
         needDataUrl,
       );
-      if (localIdx % 3 === 2) await yieldQuick();
+      if (localIdx % 4 === 3) await yieldQuick();
     },
     () => Boolean(signal?.aborted),
   );
@@ -334,7 +334,7 @@ const buildGifResult = (
     streamed,
     explanation: partial
       ? `GIF ${tierLabel}部分完成（${completed}/${totalFrames} 帧，${durationLabel}s）。滑块 s 可播放已完成部分。`
-      : `GIF ${tierLabel}（${completed} 帧，${durationLabel}s，${fpsLabel}）。单帧高精度；滑块 s 控制播放。`,
+      : `GIF ${tierLabel}（${completed} 帧，${durationLabel}s，${fpsLabel}）。每帧与单图相同精度（3600 填色 / 1280px）；滑块 s 控制播放。`,
   };
 };
 
@@ -363,8 +363,8 @@ export async function processGifToDesmosAnimation(
   const useStreaming = Boolean(
     options.calculator && options.streamToCalculator !== false,
   );
-  const playbackManager = useStreaming ? new GifPlaybackManager() : null;
-  let playbackAttached = false;
+  const playbackManager = useStreaming ? new GifWindowedPlaybackManager(new GifFrameArchive()) : null;
+  const frameArchive = playbackManager?.getArchive() ?? null;
 
   options.onProgress?.(0, 1, 'decode');
   if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -396,22 +396,19 @@ export async function processGifToDesmosAnimation(
     streamInitialized = true;
   }
 
-  const maybeAttachPlayback = () => {
-    if (
-      playbackAttached
-      || !playbackManager
-      || !options.calculator
-      || playbackManager.getFrameCount() === 0
-    ) return;
-    attachGifPlayback(options.calculator, playbackManager, GIF_TIME_SLIDER);
-    playbackAttached = true;
+  let generationPlaybackReady = false;
+
+  const ensureGenerationPlayback = () => {
+    if (!playbackManager || !options.calculator || generationPlaybackReady) return;
+    playbackManager.attachForGeneration(options.calculator, GIF_TIME_SLIDER);
+    generationPlaybackReady = true;
   };
 
   const buildWorkerInput = (
     sf: ScaledKeyframe,
     aiResult?: { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] },
   ): GifFrameWorkerInput => {
-    const capped = capGifTuning(aiResult, profile);
+    const capped = mergeGifTuning(aiResult, profile);
     return {
       taskId: `f${sf.fi}`,
       pixels: new Uint8ClampedArray(sf.pixels),
@@ -425,7 +422,7 @@ export async function processGifToDesmosAnimation(
       timeEndSec: sf.timeEndSec,
       useAiPrepare: true,
       skipFrameRestriction: useStreaming,
-      maxFillPolygons: profile.maxFillPolygons,
+      maxFillPolygons: SINGLE_IMAGE_MAX_FILL_POLYGONS,
     };
   };
 
@@ -433,7 +430,7 @@ export async function processGifToDesmosAnimation(
     sf: ScaledKeyframe,
     aiResult?: { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] },
   ): any[] => {
-    const capped = capGifTuning(aiResult, profile);
+    const capped = mergeGifTuning(aiResult, profile);
     const canvas = document.createElement('canvas');
     canvas.width = sf.width;
     canvas.height = sf.height;
@@ -459,7 +456,7 @@ export async function processGifToDesmosAnimation(
         tuning: prepared.tuning,
         aiContours: prepared.aiContours,
         fillImageData,
-        maxFillPolygons: profile.maxFillPolygons,
+        maxFillPolygons: SINGLE_IMAGE_MAX_FILL_POLYGONS,
         skipFrameRestriction: useStreaming,
         varNamespace: frameSlot,
         frameSlot,
@@ -473,33 +470,20 @@ export async function processGifToDesmosAnimation(
     return expressions;
   };
 
-  const registerStreamedFrame = (sf: ScaledKeyframe, expressions: any[]) => {
-    if (!playbackManager || expressions.length === 0) return;
-    playbackManager.registerFrame(
-      sf.timeStartSec,
-      sf.timeEndSec,
-      classifyGifFrameExpressionIds(expressions),
-    );
-    maybeAttachPlayback();
+  const archiveFrame = (fi: number, expressions: any[]) => {
+    if (!frameArchive || expressions.length === 0) return;
+    const kf = timeline.keyframes[fi];
+    if (!kf) return;
+    frameArchive.add(fi, kf.timeStartSec, kf.timeEndSec, expressions);
+    ensureGenerationPlayback();
+    playbackManager?.onFrameArchived(fi);
   };
 
   const frameStream = useStreaming
     ? new OrderedFrameStream(async (fi, exprs) => {
-      const kf = timeline.keyframes[fi];
-      await appendGifFrameToCalculator(options.calculator, exprs, { deferVisibility: true });
-      if (kf) {
-        registerStreamedFrame({
-          fi,
-          width: timeline.width,
-          height: timeline.height,
-          pixels: new Uint8ClampedArray(0),
-          timeStartSec: kf.timeStartSec,
-          timeEndSec: kf.timeEndSec,
-          dataUrl: '',
-        }, exprs);
-      }
+      archiveFrame(fi, exprs);
       options.onProgress?.(fi + 1, frameCount, 'inject');
-      await yieldQuick();
+      if ((fi + 1) % 3 === 0) await yieldQuick();
     })
     : null;
 
@@ -664,8 +648,8 @@ export async function processGifToDesmosAnimation(
     );
   }
 
-  if (useStreaming && streamInitialized && playbackManager && options.calculator && !playbackAttached) {
-    attachGifPlayback(options.calculator, playbackManager, GIF_TIME_SLIDER);
+  if (useStreaming && streamInitialized && playbackManager && options.calculator) {
+    attachGifWindowedPlayback(options.calculator, playbackManager, GIF_TIME_SLIDER, 0);
   }
 
   const scaledStub: ScaledKeyframe[] = timeline.keyframes.map((kf, fi) => ({

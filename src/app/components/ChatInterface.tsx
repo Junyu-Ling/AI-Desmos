@@ -62,17 +62,13 @@ import {
 } from '../lib/deepseek';
 
 // 图像处理：图片/Emoji → 傅里叶变换 → Desmos 表达式
-import { processImageToFourier, processEmojiToFourier, applyFourierExpressionsProgressively, type ProgressiveDrawPhase, type SmartDrawMode } from '../lib/image-processing';
+import { processImageToFourier, processEmojiToFourier, applyFourierExpressionsProgressively, type SmartDrawMode } from '../lib/image-processing';
 import { processGifToDesmosAnimation, applyGifExpressionsToCalculator, detachGifPlayback, type GifQualityTier } from '../lib/gif-animation';
 import {
-  clearWorkspace,
+  clearWorkspaceAsync,
   createDebouncedWorkspaceSaver,
-  loadWorkspace,
+  restoreWorkspace,
 } from '../lib/desmos-persistence';
-import {
-  getActivePlaybackSnapshot,
-  restoreGifPlaybackFromSnapshot,
-} from '../lib/gif-playback';
 
 // LaTeX 数学公式渲染库
 // 把 $f(x)=x^2$ 这样的字符串渲染成美观的数学公式
@@ -208,7 +204,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
   const flushWorkspace = () => {
     const calc = calculatorRef.current;
     if (!calc) return;
-    workspaceSaverRef.current.flush(calc, getActivePlaybackSnapshot());
+    workspaceSaverRef.current.flush(calc);
   };
 
   /**
@@ -242,23 +238,13 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
 
     if (!workspaceRestoredRef.current) {
       workspaceRestoredRef.current = true;
-      const workspace = loadWorkspace();
-      if (workspace?.calculatorState) {
-        try {
-          calculator.setState(workspace.calculatorState);
-          requestAnimationFrame(() => {
-            if (workspace.gifPlayback?.length) {
-              restoreGifPlaybackFromSnapshot(calculator, workspace.gifPlayback);
-            }
-          });
-        } catch (error) {
-          console.warn('[workspace] restore failed', error);
-        }
-      }
+      void restoreWorkspace(calculator).catch(error => {
+        console.warn('[workspace] restore failed', error);
+      });
     }
 
     const scheduleSave = () => {
-      saver.schedule(calculator, getActivePlaybackSnapshot());
+      saver.schedule(calculator);
     };
 
     if (typeof calculator.observeEvent === 'function') {
@@ -840,74 +826,32 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     const calc = calculatorRef.current;
     if (!calc || expressions.length === 0) return;
 
-    const outlinePlotCount = expressions.filter(e =>
-      /^(dft_plot_|hd_plot_)/.test(String(e.id || '')),
-    ).length;
-    const fillCount = expressions.filter(e =>
-      String(e.id || '').startsWith('fill_poly_'),
-    ).length;
-
-    let progressRaf = 0;
-    let pendingProgress: { done: number; total: number; phase: ProgressiveDrawPhase } | null = null;
-
-    const flushProgress = () => {
-      if (!pendingProgress) return;
-      const { done, total, phase } = pendingProgress;
-      pendingProgress = null;
-      setMessages(prev => prev.map(m => {
-        if (m.id !== progressMsgId) return m;
-        if (phase === 'fill') {
-          const fillDone = Math.min(fillCount, done);
-          const fillTotal = Math.max(1, fillCount);
-          return {
-            ...m,
-            drawingProgressPhase: 'fill',
-            drawingProgressCurrent: fillDone,
-            drawingProgressTotal: fillTotal,
-            content: t('drawing_progress_fill', {
-              current: String(fillDone),
-              total: String(fillTotal),
-            }),
-            translationKey: 'drawing_progress_fill',
-            translationParams: {
-              current: String(fillDone),
-              total: String(fillTotal),
-            },
-          };
-        }
-        const outlineDone = Math.min(outlinePlotCount, Math.max(0, done - fillCount));
-        const outlineTotal = Math.max(1, outlinePlotCount);
-        return {
-          ...m,
-          drawingProgressPhase: 'outline',
-          drawingProgressCurrent: outlineDone,
-          drawingProgressTotal: outlineTotal,
-          content: t('drawing_progress_outline', {
-            current: String(outlineDone),
-            total: String(outlineTotal),
-          }),
-          translationKey: 'drawing_progress_outline',
-          translationParams: {
-            current: String(outlineDone),
-            total: String(outlineTotal),
-          },
-        };
-      }));
-    };
-
     await applyFourierExpressionsProgressively(calc, expressions, {
       signal,
-      onProgress: (done, total, phase: ProgressiveDrawPhase) => {
+      onProgress: (step, totalSteps, phase, phaseDone, phaseTotal) => {
         if (signal?.aborted) return;
-        pendingProgress = { done, total, phase };
-        if (progressRaf) return;
-        progressRaf = requestAnimationFrame(() => {
-          progressRaf = 0;
-          flushProgress();
-        });
+        const labelKey =
+          phase === 'fill'
+            ? 'drawing_progress_fill'
+            : phase === 'inject'
+              ? 'drawing_progress_inject'
+              : 'drawing_progress_outline';
+        const labelCurrent = String(phaseDone ?? step);
+        const labelTotal = String(phaseTotal ?? totalSteps);
+        setMessages(prev => prev.map(m => {
+          if (m.id !== progressMsgId) return m;
+          return {
+            ...m,
+            drawingProgressPhase: phase === 'inject' ? 'processing' : phase,
+            drawingProgressCurrent: step,
+            drawingProgressTotal: totalSteps,
+            content: t(labelKey, { current: labelCurrent, total: labelTotal }),
+            translationKey: labelKey,
+            translationParams: { current: labelCurrent, total: labelTotal },
+          };
+        }));
       },
     });
-    if (pendingProgress) flushProgress();
   };
 
   /**
@@ -916,7 +860,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
    */
   const handleClearCanvas = () => {
     detachGifPlayback();
-    clearWorkspace();
+    void clearWorkspaceAsync();
     if (calculatorRef.current) {
       calculatorRef.current.setBlank(); // 清空画板（删除所有表达式）
 

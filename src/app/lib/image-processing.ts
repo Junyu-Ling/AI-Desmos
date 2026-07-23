@@ -233,12 +233,13 @@ const isCanvasBackground = (r: number, g: number, b: number): boolean => {
 };
 
 /**
- * 轮廓+填色模式下，近纯黑/深灰区域由黑色勾线负责，跳过填色避免与线稿重复。
+ * 轮廓+填色模式：跳过纯正黑色格（已由黑色勾线呈现，避免重复填色）。
+ * 容差仅覆盖 JPEG/抗锯齿造成的极窄灰阶，不误伤深蓝等深色块。
  */
 const isOutlineBlackFillRgb = (r: number, g: number, b: number): boolean => {
-  const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-  const spread = Math.max(r, g, b) - Math.min(r, g, b);
-  return lum <= 45 && spread <= 28;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  return max <= 24 && max - min <= 10;
 };
 
 const isOutlineBlackFillHex = (color: string): boolean => {
@@ -1651,10 +1652,7 @@ const generateFourierExpressions = (
   const maxContours = tuning?.maxContours ?? 50;
   finalContours = finalContours.slice(0, maxContours);
 
-  // ── 色块 + 轮廓：动画先勾线再填色；表达式列表中轮廓在前（最终层级仍保持线条置顶）──
   const contourExpressions: any[] = [];
-
-  // ── 生成 Desmos 轮廓表达式 ────────────────────────────────────────────────
 
   finalContours.forEach((rawPoints, idx) => {
     const m = meta[rawContours.indexOf(rawPoints)];
@@ -1737,6 +1735,7 @@ const generateFourierExpressions = (
     );
   });
 
+  // both：列表顺序填色→轮廓（层叠线条置顶）；渐进动画先勾线再填色见 applyFourierExpressionsProgressively
   const expressions = includeFill
     ? [...fillExpressions, ...contourExpressions]
     : contourExpressions;
@@ -1869,7 +1868,7 @@ export const yieldQuick = (): Promise<void> =>
 
 const yieldFrame = (): Promise<void> => yieldQuick();
 
-export type ProgressiveDrawPhase = 'fill' | 'outline';
+export type ProgressiveDrawPhase = 'fill' | 'outline' | 'inject';
 
 export type ProgressiveDrawOptions = {
   clearFirst?: boolean;
@@ -1877,11 +1876,18 @@ export type ProgressiveDrawOptions = {
   contourDelayMs?: number;
   /** 每个填色 polygon 之间的间隔（毫秒） */
   fillDelayMs?: number;
-  onProgress?: (done: number, total: number, phase: ProgressiveDrawPhase) => void;
+  onProgress?: (
+    step: number,
+    totalSteps: number,
+    phase: ProgressiveDrawPhase,
+    phaseDone?: number,
+    phaseTotal?: number,
+  ) => void;
   signal?: AbortSignal;
 };
 
-const DESMOS_EXPR_BATCH = 120;
+/** 小批量快速注入：进度更新更密、主线程不易卡死 */
+const DESMOS_EXPR_BATCH = 20;
 
 const pushExprBatch = (calculator: any, chunk: any[]) => {
   if (!chunk.length) return;
@@ -1892,7 +1898,7 @@ const pushExprBatch = (calculator: any, chunk: any[]) => {
   chunk.forEach(expr => calculator.setExpression(expr));
 };
 
-/** 先批量填色，再逐组勾勒轮廓（填色在前则轮廓自然置顶，无需 reorder） */
+/** both 模式渐进注入：先勾线再填色；填色预载 hidden，避免盖住轮廓 */
 export async function applyFourierExpressionsProgressively(
   calculator: any,
   expressions: any[],
@@ -1902,8 +1908,6 @@ export async function applyFourierExpressionsProgressively(
 
   const {
     clearFirst = true,
-    contourDelayMs = 1,
-    fillDelayMs = 0,
     onProgress,
     signal,
   } = options;
@@ -1914,51 +1918,88 @@ export async function applyFourierExpressionsProgressively(
   const fills = rawFills.map(prepareFourierExpression);
   const contours = rawContours.map(prepareFourierExpression);
   const contourGroups = groupContourExpressions(contours);
-  const totalSteps = fills.length + contourGroups.length;
-  let done = 0;
-  let nextFill = 0;
-  let nextContour = 0;
+  const bothMode = fills.length > 0 && contourGroups.length > 0;
+  const fillBatchCount = fills.length > 0 ? Math.ceil(fills.length / DESMOS_EXPR_BATCH) : 0;
+  const outlineStepCount = contourGroups.length;
+  const totalSteps = bothMode
+    ? fillBatchCount + outlineStepCount + fillBatchCount
+    : outlineStepCount + fillBatchCount;
 
-  const flushRemaining = () => {
-    if (nextFill < fills.length) {
-      pushExprBatch(calculator, fills.slice(nextFill));
-      nextFill = fills.length;
-    }
-    for (let i = nextContour; i < contourGroups.length; i++) {
-      pushExprBatch(calculator, contourGroups[i]);
-    }
-    nextContour = contourGroups.length;
-    onProgress?.(totalSteps, totalSteps, 'outline');
+  let step = 0;
+  const bump = (phase: ProgressiveDrawPhase, phaseDone: number, phaseTotal: number) => {
+    step += 1;
+    onProgress?.(step, totalSteps, phase, phaseDone, phaseTotal);
   };
 
-  // 1) 填色：大批量写入
-  let fillBatchCount = 0;
-  for (let i = 0; i < fills.length; i += DESMOS_EXPR_BATCH) {
-    if (signal?.aborted) break;
-    const batch = fills.slice(i, i + DESMOS_EXPR_BATCH);
-    pushExprBatch(calculator, batch);
-    nextFill = i + batch.length;
-    done = nextFill;
-    onProgress?.(done, totalSteps, 'fill');
-    fillBatchCount++;
-    if (fillBatchCount % 2 === 0 && i + DESMOS_EXPR_BATCH < fills.length) {
-      await yieldQuick();
-      if (signal?.aborted) break;
+  const flushRemaining = () => {
+    if (bothMode) {
+      for (let i = 0; i < fills.length; i += DESMOS_EXPR_BATCH) {
+        pushExprBatch(calculator, fills.slice(i, i + DESMOS_EXPR_BATCH).map(e => ({ ...e, hidden: false })));
+      }
+      for (let i = 0; i < contourGroups.length; i++) {
+        pushExprBatch(calculator, contourGroups[i]);
+      }
+      onProgress?.(totalSteps, totalSteps, 'fill', fills.length, fills.length);
+      return;
     }
-  }
+    for (let i = 0; i < contourGroups.length; i++) {
+      pushExprBatch(calculator, contourGroups[i]);
+    }
+    for (let i = 0; i < fills.length; i += DESMOS_EXPR_BATCH) {
+      pushExprBatch(calculator, fills.slice(i, i + DESMOS_EXPR_BATCH));
+    }
+    if (totalSteps > 0) {
+      onProgress?.(totalSteps, totalSteps, fills.length > 0 ? 'fill' : 'outline', totalSteps, totalSteps);
+    }
+  };
 
-  // 2) 轮廓：逐组写入
-  if (!signal?.aborted) {
+  if (bothMode) {
+    // 1) 填色预写入（隐藏，占底层）— 小批快速上传并持续更新进度
+    for (let i = 0; i < fills.length; i += DESMOS_EXPR_BATCH) {
+      if (signal?.aborted) break;
+      const batch = fills.slice(i, i + DESMOS_EXPR_BATCH).map(e => ({ ...e, hidden: true }));
+      pushExprBatch(calculator, batch);
+      bump('inject', Math.min(i + batch.length, fills.length), fills.length);
+      await yieldQuick();
+    }
+
+    // 2) 轮廓先显现（勾线）
+    if (!signal?.aborted) {
+      for (let i = 0; i < contourGroups.length; i++) {
+        if (signal?.aborted) break;
+        pushExprBatch(calculator, contourGroups[i]);
+        bump('outline', i + 1, outlineStepCount);
+        await yieldQuick();
+      }
+    }
+
+    // 3) 填色显现
+    if (!signal?.aborted) {
+      for (let i = 0; i < fills.length; i += DESMOS_EXPR_BATCH) {
+        if (signal?.aborted) break;
+        const batch = fills.slice(i, i + DESMOS_EXPR_BATCH).map(e => ({ id: e.id, hidden: false }));
+        if (typeof calculator.setExpressions === 'function') {
+          calculator.setExpressions(batch);
+        } else {
+          batch.forEach(expr => calculator.setExpression(expr));
+        }
+        bump('fill', Math.min(i + batch.length, fills.length), fills.length);
+        await yieldQuick();
+      }
+    }
+  } else {
+    // 仅轮廓或仅填色
     for (let i = 0; i < contourGroups.length; i++) {
       if (signal?.aborted) break;
       pushExprBatch(calculator, contourGroups[i]);
-      nextContour = i + 1;
-      done = fills.length + i + 1;
-      onProgress?.(done, totalSteps, 'outline');
-      if ((i + 1) % 4 === 0 && i + 1 < contourGroups.length) {
-        await yieldQuick();
-        if (signal?.aborted) break;
-      }
+      bump('outline', i + 1, outlineStepCount || totalSteps);
+      await yieldQuick();
+    }
+    for (let i = 0; i < fills.length; i += DESMOS_EXPR_BATCH) {
+      if (signal?.aborted) break;
+      pushExprBatch(calculator, fills.slice(i, i + DESMOS_EXPR_BATCH));
+      bump('fill', Math.min(i + DESMOS_EXPR_BATCH, fills.length), fills.length);
+      await yieldQuick();
     }
   }
 
@@ -2000,8 +2041,8 @@ export async function applyGifExpressionsToCalculator(
     return { committed: 0, total: 0, partial: false };
   }
 
-  const GIF_FILL_BATCH = 96;
-  const GIF_CONTOUR_BATCH = 48;
+  const GIF_FILL_BATCH = 32;
+  const GIF_CONTOUR_BATCH = 16;
   const total = expressions.length;
 
   calculator.setBlank();
@@ -2041,8 +2082,8 @@ export async function applyGifExpressionsToCalculator(
   return { committed: total, total, partial: false };
 }
 
-const GIF_STREAM_FILL_BATCH = 240;
-const GIF_STREAM_CONTOUR_BATCH = 120;
+const GIF_STREAM_FILL_BATCH = 32;
+const GIF_STREAM_CONTOUR_BATCH = 16;
 
 /** 流式注入：写入时间滑块（首次 setBlank） */
 export function initGifStreamCalculator(
@@ -2062,35 +2103,67 @@ export function initGifStreamCalculator(
   })]);
 }
 
-/** 流式注入：追加单帧表达式（填色→轮廓） */
+/** 流式/批量注入单帧：both 时填色在前（层叠置顶线条）；可选 outlineFirst 动画 */
 export async function appendGifFrameToCalculator(
   calculator: any,
   frameExpressions: any[],
-  options?: { deferVisibility?: boolean },
+  options?: { deferVisibility?: boolean; fastInject?: boolean; outlineFirst?: boolean },
 ): Promise<number> {
   if (!calculator || frameExpressions.length === 0) return 0;
 
   const deferVisibility = options?.deferVisibility ?? false;
-  const prepareForStream = (expr: any) => {
+  const fastInject = options?.fastInject ?? false;
+  const outlineFirst = options?.outlineFirst ?? false;
+  const prepareForStream = (expr: any, hidden = deferVisibility) => {
     const prepared = prepareFourierExpression(expr);
-    if (!deferVisibility || isSliderExpression(prepared)) return prepared;
+    if (isSliderExpression(prepared)) return prepared;
+    if (!hidden) return prepared;
     return { ...prepared, hidden: true };
   };
 
   const { fills, contours } = partitionExpressions(frameExpressions);
   let added = 0;
+  const bothMode = outlineFirst && !deferVisibility && fills.length > 0 && contours.length > 0;
+  const contourGroups = bothMode ? groupContourExpressions(contours.map(prepareFourierExpression)) : [];
+
+  if (bothMode) {
+    for (let i = 0; i < fills.length; i += GIF_STREAM_FILL_BATCH) {
+      const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH).map(e => prepareForStream(e, true));
+      pushExprBatch(calculator, batch);
+      added += batch.length;
+      if (!fastInject) await yieldQuick();
+    }
+    for (let i = 0; i < contourGroups.length; i += 1) {
+      pushExprBatch(calculator, contourGroups[i]);
+      added += contourGroups[i].length;
+      if (!fastInject) await yieldQuick();
+    }
+    for (let i = 0; i < fills.length; i += GIF_STREAM_FILL_BATCH) {
+      const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH).map(e => ({
+        id: prepareFourierExpression(e).id,
+        hidden: false,
+      }));
+      if (typeof calculator.setExpressions === 'function') {
+        calculator.setExpressions(batch);
+      } else {
+        batch.forEach(expr => calculator.setExpression(expr));
+      }
+      if (!fastInject) await yieldQuick();
+    }
+    return added;
+  }
 
   for (let i = 0; i < fills.length; i += GIF_STREAM_FILL_BATCH) {
-    const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH).map(prepareForStream);
+    const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH).map(e => prepareForStream(e));
     pushExprBatch(calculator, batch);
     added += batch.length;
-    await yieldQuick();
+    if (!fastInject) await yieldQuick();
   }
   for (let i = 0; i < contours.length; i += GIF_STREAM_CONTOUR_BATCH) {
-    const batch = contours.slice(i, i + GIF_STREAM_CONTOUR_BATCH).map(prepareForStream);
+    const batch = contours.slice(i, i + GIF_STREAM_CONTOUR_BATCH).map(e => prepareForStream(e));
     pushExprBatch(calculator, batch);
     added += batch.length;
-    await yieldQuick();
+    if (!fastInject) await yieldQuick();
   }
   return added;
 }

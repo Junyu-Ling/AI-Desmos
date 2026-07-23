@@ -1,11 +1,18 @@
 /**
  * GIF 动画质量档位：标准 / 电影级（高采样）
- * 播放时由 GifPlaybackManager 单帧可见；此处恢复较高单帧精度。
+ * 每帧与单图相同精度（3600 填色 / 1280px）；流畅播放靠窗口化注入，不降级画质。
  */
 
 /** 秒级时间滑块；勿用 t（与参数曲线参数 t 冲突） */
 export const GIF_TIME_SLIDER = 's';
 export const GIF_SLIDER_STEP = '0.01';
+
+/** 与单图一致的单帧精度基准（勿下调） */
+export const GIF_SINGLE_FRAME_MAX_DIM = 1280;
+export const GIF_SINGLE_FRAME_MAX_FILL = 3600;
+export const GIF_SINGLE_FRAME_MAX_CONTOURS = 55;
+export const GIF_SINGLE_FRAME_FOURIER_K = 110;
+export const GIF_SINGLE_FRAME_TARGET_POINTS = 480;
 
 export type GifQualityTier = 'standard' | 'cinema';
 
@@ -47,38 +54,38 @@ export const GIF_QUALITY_PROFILES: Record<GifQualityTier, GifQualityProfile> = {
     sampleIntervalSec: 0.125,
     targetFps: 8,
     maxKeyframes: 150,
-    maxDim: 1152,
+    maxDim: GIF_SINGLE_FRAME_MAX_DIM,
     aiBatchSize: 16,
     aiParallelBatches: 8,
     localPrepareConcurrency: 6,
     workerCount: 8,
-    scaleConcurrency: 6,
-    jpegQuality: 0.88,
+    scaleConcurrency: 8,
+    jpegQuality: 0.92,
     sceneChangeThreshold: 7,
     pipelineChunkSize: 16,
-    maxFillPolygons: 1200,
-    maxContours: 28,
-    fourierKCap: 85,
-    targetPointCountCap: 400,
+    maxFillPolygons: GIF_SINGLE_FRAME_MAX_FILL,
+    maxContours: GIF_SINGLE_FRAME_MAX_CONTOURS,
+    fourierKCap: GIF_SINGLE_FRAME_FOURIER_K,
+    targetPointCountCap: GIF_SINGLE_FRAME_TARGET_POINTS,
   },
   cinema: {
     tier: 'cinema',
     sampleIntervalSec: 0.04,
     targetFps: 24,
     maxKeyframes: 220,
-    maxDim: 1152,
+    maxDim: GIF_SINGLE_FRAME_MAX_DIM,
     aiBatchSize: 16,
     aiParallelBatches: 8,
     localPrepareConcurrency: 6,
     workerCount: 8,
-    scaleConcurrency: 6,
-    jpegQuality: 0.88,
+    scaleConcurrency: 8,
+    jpegQuality: 0.92,
     sceneChangeThreshold: 4,
     pipelineChunkSize: 12,
-    maxFillPolygons: 900,
-    maxContours: 24,
-    fourierKCap: 72,
-    targetPointCountCap: 340,
+    maxFillPolygons: GIF_SINGLE_FRAME_MAX_FILL,
+    maxContours: GIF_SINGLE_FRAME_MAX_CONTOURS,
+    fourierKCap: GIF_SINGLE_FRAME_FOURIER_K,
+    targetPointCountCap: GIF_SINGLE_FRAME_TARGET_POINTS,
   },
 };
 
@@ -104,5 +111,5 @@ export function tuneGifProfileForAsset(
 export function resolveGifWorkerCount(profile: GifQualityProfile): number {
   const hw = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : 0;
   const cores = hw && hw > 0 ? hw : 8;
-  return Math.max(profile.workerCount, Math.min(10, cores));
+  return Math.max(profile.workerCount, Math.min(12, cores));
 }
