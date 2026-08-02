@@ -420,8 +420,8 @@ export async function processGifToDesmosAnimation(
       frameSlot: sf.fi + 1,
       timeStartSec: sf.timeStartSec,
       timeEndSec: sf.timeEndSec,
+      gifIsLastFrame: sf.fi === frameCount - 1,
       useAiPrepare: true,
-      skipFrameRestriction: useStreaming,
       maxFillPolygons: SINGLE_IMAGE_MAX_FILL_POLYGONS,
     };
   };
@@ -457,13 +457,13 @@ export async function processGifToDesmosAnimation(
         aiContours: prepared.aiContours,
         fillImageData,
         maxFillPolygons: SINGLE_IMAGE_MAX_FILL_POLYGONS,
-        skipFrameRestriction: useStreaming,
         varNamespace: frameSlot,
         frameSlot,
         frameSliderVar: GIF_TIME_SLIDER,
         gifTimeBasedSlider: true,
         gifTimeStart: sf.timeStartSec,
         gifTimeEnd: sf.timeEndSec,
+        gifIsLastFrame: sf.fi === frameCount - 1,
         idPrefix: `gif_f${frameSlot}_`,
       },
     );

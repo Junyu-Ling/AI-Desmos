@@ -29,6 +29,7 @@ export type GifFrameWorkerInput = {
   frameSlot: number;
   timeStartSec: number;
   timeEndSec: number;
+  gifIsLastFrame?: boolean;
   /** 主线程已执行 applyLocalImageRepair */
   alreadyRepaired?: boolean;
   /** 使用 AI 结果在 Worker 内完成本地修复（主线程不再重复 prepare） */
@@ -106,13 +107,13 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
         aiContours,
         fillImageData,
         maxFillPolygons: msg.maxFillPolygons ?? SINGLE_IMAGE_MAX_FILL_POLYGONS,
-        skipFrameRestriction: msg.skipFrameRestriction,
         varNamespace: msg.frameSlot,
         frameSlot: msg.frameSlot,
         frameSliderVar: GIF_TIME_SLIDER,
         gifTimeBasedSlider: true,
         gifTimeStart: msg.timeStartSec,
         gifTimeEnd: msg.timeEndSec,
+        gifIsLastFrame: msg.gifIsLastFrame,
         idPrefix: `gif_f${msg.frameSlot}_`,
       },
     );

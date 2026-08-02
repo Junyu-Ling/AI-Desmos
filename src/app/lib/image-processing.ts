@@ -1312,11 +1312,13 @@ const buildFrameVisibilityRestriction = (
   frameCount?: number,
   timeRange?: { start: number; end: number },
   timeBased?: boolean,
+  timeEndInclusive?: boolean,
 ): string => {
   if (timeBased && timeRange) {
     const start = formatDesmosTime(timeRange.start);
     const end = formatDesmosTime(timeRange.end);
-    return `\\left\\{${start}\\le ${sliderVar}<${end}\\right\\}`;
+    const upperOp = timeEndInclusive ? '\\le' : '<';
+    return `\\left\\{${start}\\le ${sliderVar}${upperOp}${end}\\right\\}`;
   }
   if (!smooth) {
     return `\\left\\{${sliderVar}=${frameSlot}\\right\\}`;
@@ -1332,7 +1334,7 @@ const buildFillPolygonExpressions = (
   polys: FillPolygon[],
   options: Pick<ImageFourierOptions,
     'frameSlot' | 'frameSliderVar' | 'idPrefix' | 'gifFrameCount' | 'gifSmoothSlider'
-    | 'gifTimeBasedSlider' | 'gifTimeStart' | 'gifTimeEnd' | 'skipFrameRestriction'
+    | 'gifTimeBasedSlider' | 'gifTimeStart' | 'gifTimeEnd' | 'skipFrameRestriction' | 'gifIsLastFrame'
   > = {},
 ): any[] => {
   const expressions: any[] = [];
@@ -1350,6 +1352,7 @@ const buildFillPolygonExpressions = (
           ? { start: options.gifTimeStart, end: options.gifTimeEnd }
           : undefined,
         options.gifTimeBasedSlider,
+        options.gifIsLastFrame,
       )}`;
     }
     return latex;
@@ -1426,6 +1429,8 @@ export type ImageFourierOptions = {
   gifTimeBasedSlider?: boolean;
   gifTimeStart?: number;
   gifTimeEnd?: number;
+  /** 时间轴末帧：上界用 ≤，避免滑块到 duration 时末帧消失 */
+  gifIsLastFrame?: boolean;
   /** 填色 polygon 数量上限（GIF 多帧时降低） */
   maxFillPolygons?: number;
   /** 播放管理器控制可见性时，不在 latex 上附加时间限制 */
@@ -1481,6 +1486,7 @@ const generateFourierExpressions = (
           ? { start: options.gifTimeStart, end: options.gifTimeEnd }
           : undefined,
         options.gifTimeBasedSlider,
+        options.gifIsLastFrame,
       )}`
   );
 
@@ -1510,6 +1516,7 @@ const generateFourierExpressions = (
       gifTimeStart: options.gifTimeStart,
       gifTimeEnd: options.gifTimeEnd,
       skipFrameRestriction: options.skipFrameRestriction,
+      gifIsLastFrame: options.gifIsLastFrame,
     });
   }
 

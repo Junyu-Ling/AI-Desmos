@@ -31,16 +31,6 @@ const removeExpressionIds = (calculator: any, ids: string[]) => {
   }
 };
 
-const setExpressionHidden = (calculator: any, ids: string[], hidden: boolean) => {
-  if (!calculator || ids.length === 0) return;
-  const updates = ids.map(id => ({ id, hidden }));
-  if (typeof calculator.setExpressions === 'function') {
-    calculator.setExpressions(updates);
-  } else {
-    updates.forEach(u => calculator.setExpression(u));
-  }
-};
-
 export class GifWindowedPlaybackManager {
   private loadedFrames = new Map<number, StoredGifFrame>();
   private activeIndex = -1;
@@ -180,6 +170,18 @@ export class GifWindowedPlaybackManager {
     }
   }
 
+  private setSliderTime(timeSec: number): void {
+    if (!this.calculator) return;
+    try {
+      this.calculator.setExpression({
+        id: 'gif_time_slider',
+        latex: `${this.sliderVar}=${formatSliderTime(timeSec)}`,
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+
   private resetSliderToFrame(frameIndex: number): void {
     if (!this.calculator) return;
     const frame = this.archive.get(frameIndex);
@@ -188,14 +190,7 @@ export class GifWindowedPlaybackManager {
     const last = ordered[ordered.length - 1];
     const duration = last?.timeEnd ?? Math.max(time, 0.1);
     updateGifStreamDuration(this.calculator, duration, this.sliderVar);
-    try {
-      this.calculator.setExpression({
-        id: 'gif_time_slider',
-        latex: `${this.sliderVar}=${formatSliderTime(time)}`,
-      });
-    } catch {
-      /* ignore */
-    }
+    this.setSliderTime(time);
   }
 
   private readSliderValue(): number {
@@ -259,15 +254,12 @@ export class GifWindowedPlaybackManager {
     return indices;
   }
 
-  private async injectFrame(frame: StoredGifFrame, hidden: boolean): Promise<void> {
+  private async injectFrame(frame: StoredGifFrame): Promise<void> {
     if (!this.calculator) return;
     const expressions = frame.expressions.map(expr => ({ ...expr }));
     await appendGifFrameToCalculator(this.calculator, expressions, {
-      deferVisibility: true,
       fastInject: true,
     });
-    setExpressionHidden(this.calculator, frame.visibleIds, hidden);
-    setExpressionHidden(this.calculator, frame.auxIds, true);
     this.loadedFrames.set(frame.index, frame);
   }
 
@@ -278,14 +270,13 @@ export class GifWindowedPlaybackManager {
     this.loadedFrames.delete(index);
   }
 
-  private setFrameVisible(frame: StoredGifFrame, visible: boolean): void {
-    if (!this.calculator) return;
-    setExpressionHidden(this.calculator, frame.visibleIds, !visible);
-    setExpressionHidden(this.calculator, frame.auxIds, true);
-  }
-
   async syncWindow(forcedIndex?: number, force = false): Promise<void> {
     if (!this.calculator || this.archive.size === 0) return;
+
+    if (this.followLatestDuringGeneration && forcedIndex != null) {
+      const previewTime = this.archive.get(forcedIndex)?.timeStart ?? 0;
+      this.setSliderTime(previewTime);
+    }
 
     const timeSec = forcedIndex != null
       ? (this.archive.get(forcedIndex)?.timeStart ?? this.readSliderValue())
@@ -295,7 +286,6 @@ export class GifWindowedPlaybackManager {
     if (!force && nextIndex === this.activeIndex) return;
 
     const needed = new Set(this.frameIndicesInWindow(nextIndex));
-    const prevIndex = this.activeIndex;
     this.activeIndex = nextIndex;
 
     this.syncing = true;
@@ -317,19 +307,7 @@ export class GifWindowedPlaybackManager {
         const cached = this.loadedFrames.get(idx);
         if (cached && this.isFramePresentOnCalculator(cached)) continue;
         if (cached) this.loadedFrames.delete(idx);
-        await this.injectFrame(frame, idx !== nextIndex);
-      }
-
-      if (prevIndex >= 0 && prevIndex !== nextIndex) {
-        const prev = this.loadedFrames.get(prevIndex);
-        if (prev && this.isFramePresentOnCalculator(prev)) {
-          this.setFrameVisible(prev, false);
-        }
-      }
-
-      const active = this.loadedFrames.get(nextIndex);
-      if (active && this.isFramePresentOnCalculator(active)) {
-        this.setFrameVisible(active, true);
+        await this.injectFrame(frame);
       }
     } finally {
       this.syncing = false;
