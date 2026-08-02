@@ -75,7 +75,65 @@ export function normalizeDesmosFormulaLatex(formula: string): string {
   clean = clean.replace(/,\s*$/, '').trim();
 
   clean = wrapIntegralIntegrandInParens(clean);
+  clean = normalizeDesmosAbsoluteValue(clean);
   return clean;
+}
+
+/**
+ * 裸写 |expr| 或 \\|expr\\| → \\left|expr\\right|
+ * Desmos 不识别裸 |；已存在的 \\left| ... \\right| 保持不变
+ */
+export function normalizeDesmosAbsoluteValue(formula: string): string {
+  let result = '';
+  let i = 0;
+  let absDepth = 0;
+
+  while (i < formula.length) {
+    const rest = formula.slice(i);
+
+    const leftMatch = rest.match(/^\\left\s*\|/);
+    if (leftMatch) {
+      result += leftMatch[0];
+      i += leftMatch[0].length;
+      continue;
+    }
+
+    const rightMatch = rest.match(/^\\right\s*\|/);
+    if (rightMatch) {
+      result += rightMatch[0];
+      i += rightMatch[0].length;
+      continue;
+    }
+
+    if (rest.startsWith('\\|')) {
+      if (absDepth === 0) {
+        result += '\\left|';
+        absDepth += 1;
+      } else {
+        result += '\\right|';
+        absDepth -= 1;
+      }
+      i += 2;
+      continue;
+    }
+
+    if (formula[i] === '|') {
+      if (absDepth === 0) {
+        result += '\\left|';
+        absDepth += 1;
+      } else {
+        result += '\\right|';
+        absDepth -= 1;
+      }
+      i += 1;
+      continue;
+    }
+
+    result += formula[i];
+    i += 1;
+  }
+
+  return result;
 }
 
 const isBalancedParenExpr = (s: string): boolean => {

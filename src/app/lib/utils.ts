@@ -18,6 +18,13 @@ import {
   normalizeDesmosTagsInText,
   prepareChatMessageDisplay,
 } from './desmos-display';
+import {
+  expandFormulaForInject,
+  createVariableInjectState,
+  isBlockedSliderDefinition,
+  type VariableInjectState,
+} from './desmos-variables';
+import { getActiveWindowedPlayback } from './gif-playback';
 
 export { prepareChatMessageDisplay, desmosLatexToKatexDisplay } from './desmos-display';
 
@@ -144,10 +151,15 @@ export interface DesmosInjectOptions {
 export interface DesmosInjectState {
   executedTags: Set<string>;
   hasClearedCanvas: boolean;
+  vars: VariableInjectState;
 }
 
 export function createDesmosInjectState(): DesmosInjectState {
-  return { executedTags: new Set(), hasClearedCanvas: false };
+  return {
+    executedTags: new Set(),
+    hasClearedCanvas: false,
+    vars: createVariableInjectState(),
+  };
 }
 
 /**
@@ -168,6 +180,38 @@ export function processDesmosStreamChunk(
   const tagRegex = new RegExp(DESMOS_TAG_PATTERN.source, 'gi');
   const legacyRegex = /\[DESMOS:?\s*([\s\S]*?)\]/gi;
   let match;
+  const injectBatch = (cleanFormula: string, correctionExprId?: string | null) => {
+    const injectOne = (latex: string, exprId: string) => {
+      if (correctionExprId && correctionExprId !== 'unknown') {
+        calculator.setExpression({ id: correctionExprId, latex });
+        return;
+      }
+      calculator.setExpression({ id: exprId, latex });
+    };
+
+    if (correctionExprId && correctionExprId !== 'unknown') {
+      if (!state.hasClearedCanvas) {
+        injectOne(cleanFormula, correctionExprId);
+        state.hasClearedCanvas = true;
+      }
+      return;
+    }
+
+    if (!state.hasClearedCanvas) {
+      const gifPlayback = getActiveWindowedPlayback();
+      if (!gifPlayback || gifPlayback.getFrameCount() === 0) {
+        calculator.setBlank();
+        state.vars = createVariableInjectState();
+      }
+      state.hasClearedCanvas = true;
+    }
+
+    const toInject = expandFormulaForInject(cleanFormula, state.vars);
+    for (const { latex, exprId } of toInject) {
+      injectOne(latex, exprId);
+    }
+  };
+
   while ((match = tagRegex.exec(normalizedRaw)) !== null) {
     const fullTag = match[0];
     const formulaContent = match[1];
@@ -178,26 +222,11 @@ export function processDesmosStreamChunk(
 
     const cleanFormula = normalizeDesmosFormulaLatex(formulaContent);
 
-    if (/^\s*t\s*=\s*[-+]?\d/.test(cleanFormula)) continue;
-    if (/^\s*\\?theta\s*=\s*[-+]?\d/i.test(cleanFormula)) continue;
-    if (/^\s*[uvs]\s*=\s*[-+]?\d/i.test(cleanFormula)) continue;
-
+    if (isBlockedSliderDefinition(cleanFormula)) continue;
     if (!cleanFormula) continue;
 
     try {
-      const correctionExprId = options.correctionExprId;
-      if (correctionExprId && correctionExprId !== 'unknown') {
-        if (!state.hasClearedCanvas) {
-          calculator.setExpression({ id: correctionExprId, latex: cleanFormula });
-          state.hasClearedCanvas = true;
-        }
-      } else {
-        if (!state.hasClearedCanvas) {
-          calculator.setBlank();
-          state.hasClearedCanvas = true;
-        }
-        calculator.setExpression({ latex: cleanFormula });
-      }
+      injectBatch(cleanFormula, options.correctionExprId);
     } catch (e) {
       console.error('[Desmos] Injection failed:', e);
     }
@@ -210,18 +239,9 @@ export function processDesmosStreamChunk(
     if (state.executedTags.has(tagKey)) continue;
     state.executedTags.add(tagKey);
     const cleanFormula = normalizeDesmosFormulaLatex(formulaContent);
-    if (
-      !cleanFormula ||
-      /^\s*t\s*=\s*[-+]?\d/.test(cleanFormula) ||
-      /^\s*\\?theta\s*=\s*[-+]?\d/i.test(cleanFormula) ||
-      /^\s*[uvs]\s*=\s*[-+]?\d/i.test(cleanFormula)
-    ) continue;
+    if (!cleanFormula || isBlockedSliderDefinition(cleanFormula)) continue;
     try {
-      if (!state.hasClearedCanvas) {
-        calculator.setBlank();
-        state.hasClearedCanvas = true;
-      }
-      calculator.setExpression({ latex: cleanFormula });
+      injectBatch(cleanFormula, options.correctionExprId);
     } catch (e) {
       console.error('[Desmos] Injection failed:', e);
     }

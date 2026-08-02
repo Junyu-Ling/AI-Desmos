@@ -121,7 +121,7 @@ export const resolveVisionModel = (providerId: string, model: string): string =>
 
 export { detectProviderFromKey, getProviderById, API_PROVIDERS } from './api-providers';
 
-// ─── System Prompt（系统提示词）──────────────────────────────────────────────
+import { getCreativityModeAddon } from './creativity-prompt';
 
 /**
  * 【什么是 System Prompt？】
@@ -297,10 +297,13 @@ const PROMPT_ZH = [
   // 变量处理规则（防止 AI 乱生成没有赋值的变量）
   '**变量处理规则：**',
   '1.  **复用变量**：如果上下文中已经存在某个变量（如 a, b），除非用户要求改变或重置，否则尽量复用，避免生成 a_{1}, a_{2} 这种冗余变量。',
-  '2.  **滑块定义**：变量定义（如 a=1）必须单独成行。',
-  '3.  **强制初始值**：除 **x、y、t（仅参数方程）、\\\\theta（仅极坐标 r=f(\\\\theta)）** 外，其余自由变量（a, b, k, h, R 等）须在单独 <DESMOS> 中赋初值。',
-  '4.  **变量命名**：含数字下标时必须写 a_{1}、x_{1}，**严禁** a1、x1（Desmos 不识别字母直接粘连数字的变量名）。',
-  '5.  **隐式乘法**：变量/系数与 x 相邻即表示相乘，ax、2x、kx 均合法，无需 a*x 或 a\\\\cdot x。',
+  '2.  **一变量一定义**：每个自由变量在整个画板中**只能出现一次**赋值行（如 <DESMOS>a=1</DESMOS>）。**禁止**对同一变量输出两条定义；已定义过的变量直接在其后的公式中复用，不要再次赋值。',
+  '3.  **每条公式都要写入画板**：每一个 <DESMOS>...</DESMOS> 标签内的公式（函数、不等式、参数方程、点坐标等）都必须输出，系统会逐条注入 Desmos；**禁止**只在文字里写公式而不包在 <DESMOS> 中。',
+  '4.  **滑块定义**：变量定义（如 a=1）必须单独成行。',
+  '5.  **强制初始值（最高优先级）**：除 **x、y、t（仅参数方程）、\\\\theta（仅极坐标 r=f(\\\\theta)）** 外，**每一个**在公式中出现的自由变量都必须在**单独的 <DESMOS> 中先赋初值**，再输出使用该变量的图形。**禁止**出现未定义变量（Desmos 会报错或无法渲染）。',
+  '6.  **输出顺序**：先输出所有变量赋值（如 <DESMOS>h=0</DESMOS><DESMOS>k=0</DESMOS><DESMOS>r=2</DESMOS>），再输出函数/不等式/参数方程。',
+  '7.  **变量命名**：含数字下标时必须写 a_{1}、x_{1}，**严禁** a1、x1（Desmos 不识别字母直接粘连数字的变量名）。',
+  '8.  **隐式乘法**：变量/系数与 x 相邻即表示相乘，ax、2x、kx 均合法，无需 a*x 或 a\\\\cdot x。',
   '    - 笛卡尔填色半径可用 R：<DESMOS>R=2</DESMOS><DESMOS>x^2+y^2\\\\le R^2</DESMOS>',
   '    - **严禁**单独定义 t 或 \\\\theta 滑块；t 用于 (X(t),Y(t))；\\\\theta 仅出现在极坐标 r=f(\\\\theta) 中。',
   '',
@@ -406,10 +409,12 @@ const PROMPT_EN = [
   '',
   '**Variable Handling:**',
   '1.  **Reuse Variables**: If a variable (e.g., a, b) exists in the context, reuse it unless the user asks to change or reset it.',
-  '2.  **Slider Definition**: Variable definitions (e.g., a=1) must be on their own lines.',
-  '3.  **Mandatory Initialization**: Exempt: **x, y, t (parametric only), \\\\theta (polar r=f(\\\\theta) only)**. All other constants (a, b, k, h, R, …) need their own <DESMOS> line.',
-  '4.  **Variable naming**: Numeric subscripts MUST use subscript notation — a_{1}, x_{1}. **Never** write a1 or x1 (Desmos does not recognize bare letter+digit variable names).',
-  '5.  **Implicit multiplication**: Juxtaposition means multiplication — ax, 2x, kx, ax^2+bx+c are all valid; no need for a*x or a\\\\cdot x.',
+  '2.  **One definition per variable**: Each free variable may appear in **at most one** assignment line (e.g. <DESMOS>a=1</DESMOS>). **Never** output two definitions for the same variable; reuse it in later formulas instead.',
+  '3.  **Slider Definition**: Variable definitions (e.g., a=1) must be on their own lines.',
+  '4.  **Mandatory Initialization (highest priority)**: Exempt: **x, y, t (parametric only), \\\\theta (polar r=f(\\\\theta) only)**. **Every** free variable in a formula MUST have its own <DESMOS> assignment **before** the graph. **Never** leave variables undefined.',
+  '5.  **Output order**: Variable assignments first, then functions/inequalities/parametric curves.',
+  '6.  **Variable naming**: Numeric subscripts MUST use subscript notation — a_{1}, x_{1}. **Never** write a1 or x1 (Desmos does not recognize bare letter+digit variable names).',
+  '7.  **Implicit multiplication**: Juxtaposition means multiplication — ax, 2x, kx, ax^2+bx+c are all valid; no need for a*x or a\\\\cdot x.',
   '    - Cartesian fill radius: <DESMOS>R=2</DESMOS><DESMOS>x^2+y^2\\\\le R^2</DESMOS>',
   '    - **Never** define t or \\\\theta sliders; t for (X(t),Y(t)); \\\\theta only inside polar r=f(\\\\theta).',
   '',
@@ -484,7 +489,8 @@ const PROMPTS: Record<string, string> = {
  * @returns 系统提示词字符串
  */
 export const getSystemPrompt = (lang: string = 'zh') => {
-  return PROMPTS[lang] || PROMPTS['zh'];
+  const base = PROMPTS[lang] || PROMPTS['zh'];
+  return base + getCreativityModeAddon(lang);
 };
 
 // ─── 非流式 AI 调用 ──────────────────────────────────────────────────────────

@@ -74,6 +74,8 @@ import {
 // 把 $f(x)=x^2$ 这样的字符串渲染成美观的数学公式
 import { ChatMessageContent } from './ChatMessageContent';
 
+import { getExplainModePrompt } from '../lib/creativity-prompt';
+
 import { UserGuideContent } from './UserGuideContent';
 
 // 国际化（中英双语）
@@ -822,11 +824,17 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
   /**
    * revealDrawingProgress — 逐行/逐笔把公式写入 Desmos，展示绘画过程
    */
-  const revealDrawingProgress = async (expressions: any[], progressMsgId: string, signal?: AbortSignal) => {
+  const revealDrawingProgress = async (
+    expressions: any[],
+    progressMsgId: string,
+    signal?: AbortSignal,
+    mode: SmartDrawMode = 'both',
+  ) => {
     const calc = calculatorRef.current;
     if (!calc || expressions.length === 0) return;
 
     await applyFourierExpressionsProgressively(calc, expressions, {
+      mode,
       signal,
       onProgress: (step, totalSteps, phase, phaseDone, phaseTotal) => {
         if (signal?.aborted) return;
@@ -1011,7 +1019,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
       },
     });
     if (signal?.aborted) return;
-    await revealDrawingProgress(result.expressions, aiMsgId, signal);
+    await revealDrawingProgress(result.expressions, aiMsgId, signal, mode);
 
     setMessages(prev => prev.map(m =>
       m.id === aiMsgId ? {
@@ -1036,10 +1044,12 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     setShowDrawModeSheet(true);
   };
 
-  const handleSendMessage = async (manualContent?: string, options?: { analyzeOnly?: boolean; correctionExprId?: string }) => {
+  const handleSendMessage = async (manualContent?: string, options?: { analyzeOnly?: boolean; explainMode?: boolean; correctionExprId?: string }) => {
     const textToSend = manualContent || input;
     if (!textToSend.trim()) return;
     const isAnalyzeOnly = options?.analyzeOnly === true;
+    const isExplainMode = options?.explainMode === true;
+    const readOnlyCanvas = isAnalyzeOnly || isExplainMode;
     /** 纠错模式：仅替换指定 ID 的表达式，不清空画板 */
     const correctionExprId = options?.correctionExprId || null;
 
@@ -1070,12 +1080,14 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
       const MAX_HISTORY_MSG = 10;
       let history: ChatMessage[];
 
-      if (isAnalyzeOnly) {
-        // 分析模式：不携带聊天历史，仅使用点击瞬间读取的画布快照
+      if (readOnlyCanvas) {
+        // 分析 / 教学模式：不携带聊天历史，仅使用点击瞬间读取的画布快照
         const contextContent = getCalculatorContext({ forAnalyze: true });
-        const analysisPrompt = language === 'zh'
-          ? "【分析模式】你只能依据上方「实时画板快照」作答。禁止引用聊天记录中的旧公式。禁止输出 <DESMOS> 标签，禁止修改画板。若快照为空，直接告知用户画板为空。用 $...$ 表示数学公式，分段清晰解释每条可见内容的含义及其关系。"
-          : "[Analysis Mode] Answer ONLY from the live canvas snapshot above. Do NOT cite formulas from chat history. Do NOT output <DESMOS> tags or modify the canvas. If the snapshot is empty, say so. Use $...$ for math. Explain each visible item and how they relate.";
+        const analysisPrompt = isExplainMode
+          ? getExplainModePrompt(language)
+          : language === 'zh'
+            ? "【分析模式】你只能依据上方「实时画板快照」作答。禁止引用聊天记录中的旧公式。禁止输出 <DESMOS> 标签，禁止修改画板。若快照为空，直接告知用户画板为空。用 $...$ 表示数学公式，分段清晰解释每条可见内容的含义及其关系。"
+            : "[Analysis Mode] Answer ONLY from the live canvas snapshot above. Do NOT cite formulas from chat history. Do NOT output <DESMOS> tags or modify the canvas. If the snapshot is empty, say so. Use $...$ for math. Explain each visible item and how they relate.";
 
         history = [
           { role: 'system', content: contextContent },
@@ -1168,7 +1180,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
             fullRawContent,
             calculatorRef.current,
             desmosState,
-            { skip: isAnalyzeOnly, correctionExprId },
+            { skip: readOnlyCanvas, correctionExprId },
           );
           setMessages(prev => prev.map(m =>
               m.id === aiMsgId ? { ...m, content: displayContent, rawContent: fullRawContent } : m
@@ -1217,6 +1229,19 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
         if (onExternalQueryHandled) onExternalQueryHandled();
     }
   }, [externalQuery]);
+
+  const handleExplainMath = () => {
+    if (getVisibleCanvasCount() === 0) {
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        role: 'system',
+        content: t('analyze_empty'),
+        translationKey: 'analyze_empty',
+      }]);
+      return;
+    }
+    handleSendMessage(t('explain_prompt'), { explainMode: true });
+  };
 
   /**
    * handleAnalyzeGraph — 分析当前画板
@@ -1487,6 +1512,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
               expressions,
               progressMsgId,
               task.signal.aborted ? undefined : task.signal,
+              mode,
             );
         }
 
@@ -1833,6 +1859,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
             </div>
             
             <div className="flex items-center flex-wrap gap-0.5">
+                <button onClick={handleExplainMath} className="p-1.5 text-violet-600 hover:bg-violet-50 rounded-lg transition-colors" title={t('explain_canvas')}>
+                    <GraduationCap size={17} />
+                </button>
                 <button onClick={handleAnalyzeGraph} className="p-1.5 text-blue-500 hover:bg-blue-50 rounded-lg transition-colors" title={t('analyze_canvas')}>
                     <ScanEye size={17} />
                 </button>

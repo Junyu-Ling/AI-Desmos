@@ -649,7 +649,13 @@ export async function processGifToDesmosAnimation(
   }
 
   if (useStreaming && streamInitialized && playbackManager && options.calculator) {
-    attachGifWindowedPlayback(options.calculator, playbackManager, GIF_TIME_SLIDER, 0);
+    attachGifWindowedPlayback(
+      options.calculator,
+      playbackManager,
+      GIF_TIME_SLIDER,
+      0,
+      true,
+    );
   }
 
   const scaledStub: ScaledKeyframe[] = timeline.keyframes.map((kf, fi) => ({

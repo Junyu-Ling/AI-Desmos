@@ -1,7 +1,4 @@
-/**
- * 聊天消息 LaTeX 规范化、分隔符切分与渲染
- * 语法参考：https://www.uinio.com/Math/LaTex/ （KaTeX 渲染子集）
- */
+import { normalizeDesmosAbsoluteValue } from './desmos-display';
 
 /** 聊天 LaTeX 语法参考（中文，供 AI 系统提示词） */
 export const CHAT_LATEX_SYNTAX_ZH: string[] = [
@@ -89,6 +86,8 @@ export function fixChatLatexMathBody(latex: string): string {
 
   // x^10 等多位数字上标补花括号（仅纯数字）
   s = s.replace(/\^(\d{2,})(?![\d{])/g, '^{$1}');
+
+  s = normalizeDesmosAbsoluteValue(s);
 
   return s;
 }

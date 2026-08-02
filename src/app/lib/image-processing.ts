@@ -1450,6 +1450,9 @@ export type ImageFourierOptions = {
  * @param height - 图像高度
  * @returns Desmos 表达式数组 + 说明文字
  */
+/** GIF 每帧傅里叶变量步长（须大于单帧最大轮廓数 ~55，避免跨帧 F_n 互相覆盖） */
+const GIF_FOURIER_VAR_STRIDE = 64;
+
 const generateFourierExpressions = (
   ctx: CanvasRenderingContext2D,
   width: number,
@@ -1700,7 +1703,10 @@ const generateFourierExpressions = (
     const L_imag = coeffs.map(c => c.im.toFixed(5));   // 虚部
 
     const index    = idx;
-    const nameKey  = options.varNamespace !== undefined ? options.varNamespace * 100 + index : index;
+    // varNamespace = 帧序号（1-based）；第 1 帧从 F_0 起，第 2 帧从 F_64 起，互不冲突
+    const nameKey  = options.varNamespace !== undefined
+      ? (options.varNamespace - 1) * GIF_FOURIER_VAR_STRIDE + index
+      : index;
     const id_freq  = `F_{${nameKey}}`;
     const id_re    = `R_{${nameKey}}`;
     const id_im    = `I_{${nameKey}}`;
@@ -1795,10 +1801,11 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 
 const prepareFourierExpression = (expr: any): any => {
   const options = { ...expr };
-  if (expr.id && expr.id.startsWith('dft_plot')) {
+  const id = String(expr.id || '');
+  if (/(?:^|_)dft_plot_\d+$/.test(id) || /(?:^|_)hd_plot_\d+$/.test(id)) {
     options.parametricDomain = { min: '0', max: '2\\pi' };
   }
-  if (expr.id && String(expr.id).startsWith('fill_poly_')) {
+  if (/(?:^|_)fill_poly_\d+$/.test(id)) {
     if (options.fill === undefined) options.fill = true;
     if (options.fillOpacity === undefined) options.fillOpacity = 1;
     if (options.lineOpacity === undefined) options.lineOpacity = 0;
@@ -1808,6 +1815,24 @@ const prepareFourierExpression = (expr: any): any => {
 
 const isFillExpression = (expr: any): boolean =>
   /(?:^|_)fill_poly_\d+$/.test(String(expr.id || ''));
+
+const isOutlinePlotExpression = (expr: any): boolean =>
+  /(?:^|_)dft_plot_\d+$/.test(String(expr?.id || ''))
+  || /(?:^|_)hd_plot_\d+$/.test(String(expr?.id || ''));
+
+const toHiddenFillExpr = (expr: any) => ({
+  ...prepareFourierExpression(expr),
+  hidden: true,
+  fillOpacity: 0,
+  lineOpacity: 0,
+});
+
+const toVisibleFillPatch = (expr: any) => ({
+  id: prepareFourierExpression(expr).id,
+  hidden: false,
+  fillOpacity: 1,
+  lineOpacity: 0,
+});
 
 const getContourGroupKey = (expr: any): string | null => {
   const id = String(expr.id || '');
@@ -1872,6 +1897,8 @@ export type ProgressiveDrawPhase = 'fill' | 'outline' | 'inject';
 
 export type ProgressiveDrawOptions = {
   clearFirst?: boolean;
+  /** 智能绘图模式；both 时强制先勾线再填色动画 */
+  mode?: import('./smart-draw-repair').SmartDrawMode;
   /** 每条可见轮廓曲线之间的间隔（毫秒） */
   contourDelayMs?: number;
   /** 每个填色 polygon 之间的间隔（毫秒） */
@@ -1898,7 +1925,30 @@ const pushExprBatch = (calculator: any, chunk: any[]) => {
   chunk.forEach(expr => calculator.setExpression(expr));
 };
 
-/** both 模式渐进注入：先勾线再填色；填色预载 hidden，避免盖住轮廓 */
+/** 填色完成后把黑色勾线重新置顶，避免被后写入的色块盖住 */
+const bringOutlinePlotsToFront = (calculator: any, contours: any[]) => {
+  const plots = contours.filter(isOutlinePlotExpression).map(prepareFourierExpression);
+  if (!plots.length) return;
+  for (const plot of plots) {
+    if (typeof calculator.removeExpression === 'function') {
+      calculator.removeExpression({ id: plot.id });
+    }
+  }
+  for (let i = 0; i < plots.length; i += DESMOS_EXPR_BATCH) {
+    pushExprBatch(calculator, plots.slice(i, i + DESMOS_EXPR_BATCH));
+  }
+};
+
+const pushVisibleFillBatch = (calculator: any, batch: any[]) => {
+  const patches = batch.map(toVisibleFillPatch);
+  if (typeof calculator.setExpressions === 'function') {
+    calculator.setExpressions(patches);
+    return;
+  }
+  patches.forEach(expr => calculator.setExpression(expr));
+};
+
+/** both 模式渐进注入：用户先见勾线、再见填色；填色底层静默预载 */
 export async function applyFourierExpressionsProgressively(
   calculator: any,
   expressions: any[],
@@ -1908,6 +1958,7 @@ export async function applyFourierExpressionsProgressively(
 
   const {
     clearFirst = true,
+    mode = 'both',
     onProgress,
     signal,
   } = options;
@@ -1918,11 +1969,11 @@ export async function applyFourierExpressionsProgressively(
   const fills = rawFills.map(prepareFourierExpression);
   const contours = rawContours.map(prepareFourierExpression);
   const contourGroups = groupContourExpressions(contours);
-  const bothMode = fills.length > 0 && contourGroups.length > 0;
+  const bothMode = mode === 'both' && fills.length > 0 && contourGroups.length > 0;
   const fillBatchCount = fills.length > 0 ? Math.ceil(fills.length / DESMOS_EXPR_BATCH) : 0;
   const outlineStepCount = contourGroups.length;
   const totalSteps = bothMode
-    ? fillBatchCount + outlineStepCount + fillBatchCount
+    ? outlineStepCount + fillBatchCount
     : outlineStepCount + fillBatchCount;
 
   let step = 0;
@@ -1934,11 +1985,15 @@ export async function applyFourierExpressionsProgressively(
   const flushRemaining = () => {
     if (bothMode) {
       for (let i = 0; i < fills.length; i += DESMOS_EXPR_BATCH) {
-        pushExprBatch(calculator, fills.slice(i, i + DESMOS_EXPR_BATCH).map(e => ({ ...e, hidden: false })));
+        pushExprBatch(calculator, fills.slice(i, i + DESMOS_EXPR_BATCH).map(toHiddenFillExpr));
       }
       for (let i = 0; i < contourGroups.length; i++) {
         pushExprBatch(calculator, contourGroups[i]);
       }
+      for (let i = 0; i < fills.length; i += DESMOS_EXPR_BATCH) {
+        pushVisibleFillBatch(calculator, fills.slice(i, i + DESMOS_EXPR_BATCH));
+      }
+      bringOutlinePlotsToFront(calculator, contours);
       onProgress?.(totalSteps, totalSteps, 'fill', fills.length, fills.length);
       return;
     }
@@ -1954,16 +2009,16 @@ export async function applyFourierExpressionsProgressively(
   };
 
   if (bothMode) {
-    // 1) 填色预写入（隐藏，占底层）— 小批快速上传并持续更新进度
+    // 0) 填色静默预载（hidden + fillOpacity:0，不占进度；保证最终线条在色块上方）
     for (let i = 0; i < fills.length; i += DESMOS_EXPR_BATCH) {
       if (signal?.aborted) break;
-      const batch = fills.slice(i, i + DESMOS_EXPR_BATCH).map(e => ({ ...e, hidden: true }));
-      pushExprBatch(calculator, batch);
-      bump('inject', Math.min(i + batch.length, fills.length), fills.length);
-      await yieldQuick();
+      pushExprBatch(
+        calculator,
+        fills.slice(i, i + DESMOS_EXPR_BATCH).map(toHiddenFillExpr),
+      );
     }
 
-    // 2) 轮廓先显现（勾线）
+    // 1) 先勾线 — 用户可见的第一阶段
     if (!signal?.aborted) {
       for (let i = 0; i < contourGroups.length; i++) {
         if (signal?.aborted) break;
@@ -1973,19 +2028,16 @@ export async function applyFourierExpressionsProgressively(
       }
     }
 
-    // 3) 填色显现
+    // 2) 再填色显现
     if (!signal?.aborted) {
       for (let i = 0; i < fills.length; i += DESMOS_EXPR_BATCH) {
         if (signal?.aborted) break;
-        const batch = fills.slice(i, i + DESMOS_EXPR_BATCH).map(e => ({ id: e.id, hidden: false }));
-        if (typeof calculator.setExpressions === 'function') {
-          calculator.setExpressions(batch);
-        } else {
-          batch.forEach(expr => calculator.setExpression(expr));
-        }
+        const batch = fills.slice(i, i + DESMOS_EXPR_BATCH);
+        pushVisibleFillBatch(calculator, batch);
         bump('fill', Math.min(i + batch.length, fills.length), fills.length);
         await yieldQuick();
       }
+      bringOutlinePlotsToFront(calculator, contours);
     }
   } else {
     // 仅轮廓或仅填色
@@ -2128,7 +2180,7 @@ export async function appendGifFrameToCalculator(
 
   if (bothMode) {
     for (let i = 0; i < fills.length; i += GIF_STREAM_FILL_BATCH) {
-      const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH).map(e => prepareForStream(e, true));
+      const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH).map(toHiddenFillExpr);
       pushExprBatch(calculator, batch);
       added += batch.length;
       if (!fastInject) await yieldQuick();
@@ -2139,17 +2191,11 @@ export async function appendGifFrameToCalculator(
       if (!fastInject) await yieldQuick();
     }
     for (let i = 0; i < fills.length; i += GIF_STREAM_FILL_BATCH) {
-      const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH).map(e => ({
-        id: prepareFourierExpression(e).id,
-        hidden: false,
-      }));
-      if (typeof calculator.setExpressions === 'function') {
-        calculator.setExpressions(batch);
-      } else {
-        batch.forEach(expr => calculator.setExpression(expr));
-      }
+      const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH);
+      pushVisibleFillBatch(calculator, batch);
       if (!fastInject) await yieldQuick();
     }
+    bringOutlinePlotsToFront(calculator, contours.map(prepareFourierExpression));
     return added;
   }
 

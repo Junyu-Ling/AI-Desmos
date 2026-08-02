@@ -114,7 +114,7 @@ export const UserGuideContent: React.FC<UserGuideContentProps> = ({ compact, sho
         title={t('smart_draw')}
         desc={t('smart_draw_desc')}
         how={t('smart_draw_how')}
-        examples={['smart_draw_tip1', 'smart_draw_tip2', 'smart_draw_tip3', 'smart_draw_tip4']}
+        examples={['smart_draw_tip1', 'smart_draw_tip2', 'smart_draw_tip3', 'smart_draw_tip4', 'smart_draw_tip5']}
         principle={t('smart_draw_principle')}
       />
 

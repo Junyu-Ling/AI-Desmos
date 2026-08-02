@@ -54,12 +54,13 @@ export class GifFrameArchive {
 
   add(index: number, timeStart: number, timeEnd: number, expressions: any[]): void {
     if (expressions.length === 0) return;
-    const ids = classifyGifFrameExpressionIds(expressions);
+    const cloned = expressions.map(expr => ({ ...expr }));
+    const ids = classifyGifFrameExpressionIds(cloned);
     this.frames.set(index, {
       index,
       timeStart,
       timeEnd,
-      expressions,
+      expressions: cloned,
       visibleIds: ids.visibleIds,
       auxIds: ids.auxIds,
     });

@@ -54,13 +54,50 @@ export const translations = {
   zh: {
     // ── 基础 UI ──────────────────────────────────────────────────────────────
     title: 'AI Desmos',                        // 应用标题（品牌名，中英文相同）
+    subtitle: 'AI 数学创作平台',                 // 副标题
     beta: 'Beta',                              // Beta 版标志（中英文相同）
     analyze_canvas: '分析当前画板',              // 顶部工具栏：分析按钮文字
+    explain_canvas: 'AI 教学解释',
+    explain_prompt: '请用初学者能懂的方式，解释当前画板上所有图形的数学原理、建模思路和每个参数的作用。',
     export_to_desmos: '导出到官网',              // 顶部工具栏：导出按钮文字
     clear_canvas: '清空画板',                   // 顶部工具栏：清空画板按钮文字
     clear_history: '清除记录',                  // 顶部工具栏：清除聊天记录按钮文字
     api_settings: 'API 设置',                  // 设置按钮 tooltip
     help: '使用说明',                           // 帮助按钮文字
+
+    // ── 数学创作工作室 ────────────────────────────────────────────────────────
+    creativity_title: '数学创作工作室',
+    creativity_subtitle: '想象 → 数学模型 → 交互可视化',
+    creativity_templates: '数学艺术模板',
+    creativity_params: '参数探索',
+    creativity_color: '主色',
+    creativity_explain: 'Explain 教学',
+    creativity_ai_demo: 'AI 拱桥 Demo',
+
+    tpl_bridge: '拱桥',
+    tpl_bridge_desc: '抛物线拱形结构，可调跨度与高度',
+    tpl_bridge_model: '模型：$y = -\\frac{4H}{W^2}x^2 + H$（抛物线拱）。抛物线将桥面荷载传向桥墩，是经典承重结构。',
+    tpl_ferris: '摩天轮',
+    tpl_ferris_desc: '圆形结构 + 辐条，展示周期与对称',
+    tpl_ferris_model: '模型：$x^2+y^2=R^2$（圆）+ 参数曲线 $(R\\cos t, R\\sin t)$。圆是最均匀的旋转对称结构。',
+    tpl_flower: '花朵',
+    tpl_flower_desc: '极坐标玫瑰线，花瓣数量可调',
+    tpl_flower_model: '模型：$r = a\\cos(n\\theta)$（玫瑰线）。$n$ 控制花瓣数，$a$ 控制大小。',
+    tpl_logo: 'Logo',
+    tpl_logo_desc: '参数方程心形曲线，适合品牌图形',
+    tpl_logo_model: '模型：参数方程 $(16\\sin^3 t,\\; 13\\cos t - 5\\cos 2t - \\cdots)$。参数 $t$ 沿曲线扫过，$s$ 控制整体缩放。',
+    tpl_stars: '星空',
+    tpl_stars_desc: '背景 + 星点分布，可调密度',
+    tpl_stars_model: '模型：背景不等式填色 + 离散点 $(x_i, y_i)$。用数学分布模拟星空密度。',
+
+    tpl_param_span: '跨度 W',
+    tpl_param_height: '高度 H',
+    tpl_param_radius: '半径 R',
+    tpl_param_size: '大小 a',
+    tpl_param_petals: '花瓣数 n',
+    tpl_param_scale: '缩放 s',
+    tpl_param_star_count: '星数 N',
+    tpl_param_spread: '范围 S',
 
     // ── 图片上传 ──────────────────────────────────────────────────────────────
     upload_image: '上传图片',                   // 上传图片按钮文字
@@ -92,8 +129,9 @@ export const translations = {
     smart_draw_principle: 'AI 用 <DESMOS> 标签（仅后台注入，聊天里不显示标签）写入画板；蓝框内公式自动排版为 LaTeX。简略请求时优先通项与多参数说明。',
     smart_draw_tip1: '"画一个爱心"',              // 示例提示词 1
     smart_draw_tip2: '"画 y=sin(x) 和 y=cos(x)"', // 示例提示词 2
-    smart_draw_tip3: '"把它变大一点" / "改成红色"', // 示例提示词 3
-    smart_draw_tip4: '"添加一个参数 a 控制振幅"',  // 示例提示词 4
+    smart_draw_tip3: '"把它变大一点" / "改成红色"',
+    smart_draw_tip4: '"设计一座跨度30米的现代拱桥"',
+    smart_draw_tip5: '"Explain 这个图形用了什么数学"',
     smart_draw_mode_title: '选择绘图方式',
     smart_draw_mode_outline: '仅轮廓',
     smart_draw_mode_outline_desc: '只提取黑色轮廓线，不填色',
@@ -462,13 +500,49 @@ export const translations = {
   en: {
     // ── 基础 UI ──────────────────────────────────────────────────────────────
     title: 'AI Desmos',
+    subtitle: 'AI Mathematical Creativity Platform',
     beta: 'Beta',
     analyze_canvas: 'Analyze Canvas',
+    explain_canvas: 'AI Teach (Explain)',
+    explain_prompt: 'Explain everything on the canvas in beginner-friendly language: the math used, why this model fits, and what each parameter does.',
     export_to_desmos: 'Export to Desmos',
     clear_canvas: 'Clear Canvas',
     clear_history: 'Clear History',
     api_settings: 'API Settings',
     help: 'Help',
+
+    creativity_title: 'Creativity Studio',
+    creativity_subtitle: 'Imagination → Math Model → Interactive Viz',
+    creativity_templates: 'Math Art Templates',
+    creativity_params: 'Parameter Explorer',
+    creativity_color: 'Accent color',
+    creativity_explain: 'Explain',
+    creativity_ai_demo: 'AI Bridge Demo',
+
+    tpl_bridge: 'Bridge',
+    tpl_bridge_desc: 'Parabolic arch — adjustable span & height',
+    tpl_bridge_model: 'Model: $y = -\\frac{4H}{W^2}x^2 + H$. Parabolic arches transfer load to supports — a classic structural form.',
+    tpl_ferris: 'Ferris wheel',
+    tpl_ferris_desc: 'Circle + spokes — symmetry & rotation',
+    tpl_ferris_model: 'Model: $x^2+y^2=R^2$ plus $(R\\cos t, R\\sin t)$. Circles are perfectly rotation-symmetric.',
+    tpl_flower: 'Flower',
+    tpl_flower_desc: 'Polar rose curve — petal count adjustable',
+    tpl_flower_model: 'Model: $r = a\\cos(n\\theta)$ (rose curve). $n$ = petals, $a$ = size.',
+    tpl_logo: 'Logo',
+    tpl_logo_desc: 'Parametric heart curve for brand shapes',
+    tpl_logo_model: 'Model: parametric heart $(16\\sin^3 t, 13\\cos t - 5\\cos 2t - \\cdots)$; $s$ scales the shape.',
+    tpl_stars: 'Starry sky',
+    tpl_stars_desc: 'Background fill + star points',
+    tpl_stars_model: 'Model: inequality shading + discrete points $(x_i,y_i)$ to simulate star density.',
+
+    tpl_param_span: 'Span W',
+    tpl_param_height: 'Height H',
+    tpl_param_radius: 'Radius R',
+    tpl_param_size: 'Size a',
+    tpl_param_petals: 'Petals n',
+    tpl_param_scale: 'Scale s',
+    tpl_param_star_count: 'Stars N',
+    tpl_param_spread: 'Spread S',
 
     // ── 图片上传 ──────────────────────────────────────────────────────────────
     upload_image: 'Upload Image',
@@ -501,7 +575,8 @@ export const translations = {
     smart_draw_tip1: '"Draw a heart"',
     smart_draw_tip2: '"Draw y=sin(x) and y=cos(x)"',
     smart_draw_tip3: '"Make it bigger" / "Change to red"',
-    smart_draw_tip4: '"Add a parameter a to control amplitude"',
+    smart_draw_tip4: '"Design a modern arch bridge, 30m span"',
+    smart_draw_tip5: '"Explain the math on this graph"',
     smart_draw_mode_title: 'Choose drawing mode',
     smart_draw_mode_outline: 'Outline only',
     smart_draw_mode_outline_desc: 'Black contour lines only, no fill',
