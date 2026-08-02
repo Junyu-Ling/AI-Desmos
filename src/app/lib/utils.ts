@@ -22,9 +22,9 @@ import {
   expandFormulaForInject,
   createVariableInjectState,
   isBlockedSliderDefinition,
+  seedVariableInjectStateFromCalculator,
   type VariableInjectState,
 } from './desmos-variables';
-import { getActiveWindowedPlayback } from './gif-playback';
 
 export { prepareChatMessageDisplay, desmosLatexToKatexDisplay } from './desmos-display';
 
@@ -66,60 +66,35 @@ export const parseDesmosResponse = (text: string): { display: string; desmos: st
   let displayText = text;
 
   // ── 第一步：识别新格式 <DESMOS>...</DESMOS> ──────────────────────────────
-  // 这是一个"正则表达式"（Regular Expression），用于匹配文字中的特定模式。
-  // /<DESMOS>([\s\S]*?)<\/DESMOS>/g 的含义：
-  //   <DESMOS>       匹配开标签
-  //   ([\s\S]*?)     捕获组：匹配任意字符（包括换行），尽量少匹配（懒惰模式）
-  //   <\/DESMOS>     匹配闭标签（/ 需要用 \/ 转义）
-  //   g              全局模式：找出文本中所有匹配，不止第一个
   const xmlRegex = /<DESMOS>([\s\S]*?)<\/DESMOS>/g;
 
-  // match 用来保存每次匹配到的结果
   let match;
 
-  // exec() 每次调用会找到下一个匹配，循环直到找不到为止
   while ((match = xmlRegex.exec(text)) !== null) {
-    // match[1] 是第一个捕获组里的内容，即 <DESMOS> 和 </DESMOS> 之间的公式
     const rawContent = match[1];
-
-    // 把公式里的换行符（\n \r）全替换成空格，让公式保持在一行
-    // Desmos 不支持多行公式，必须单行
     const cleanFormula = rawContent.replace(/[\n\r]+/g, ' ').trim();
-
-    // 只有公式不为空才收录
     if (cleanFormula) {
-      desmosMatches.push(cleanFormula); // 推入公式数组
+      desmosMatches.push(cleanFormula);
     }
   }
 
-  // 把展示文字中的 <DESMOS>...</DESMOS> 标签全部删掉，只留普通文字
-  // replace() 的第二个参数是空字符串 ''，相当于"删除匹配到的部分"
   displayText = displayText.replace(xmlRegex, '');
 
-  // ── 第二步：识别旧格式 [DESMOS: ...] ────────────────────────────────────
-  // 这是早期版本使用的格式，现在仍然保留兼容，防止旧聊天记录显示异常
-  // /\[DESMOS:\s*([\s\S]*?)\]/g 含义：
-  //   \[DESMOS:\s*   匹配 [DESMOS: 开头（\s* 允许有任意空格）
-  //   ([\s\S]*?)     捕获公式内容
-  //   \]             匹配 ] 结束符
   const legacyRegex = /\[DESMOS:\s*([\s\S]*?)\]/g;
 
   while ((match = legacyRegex.exec(displayText)) !== null) {
     const rawContent = match[1];
     const cleanFormula = rawContent.replace(/[\n\r]+/g, ' ').trim();
     if (cleanFormula) {
-      desmosMatches.push(cleanFormula); // 旧格式公式也推入同一个数组
+      desmosMatches.push(cleanFormula);
     }
   }
 
-  // 同样把展示文字里的旧格式标签也删掉
   displayText = displayText.replace(legacyRegex, '');
 
-  // ── 返回结果 ──────────────────────────────────────────────────────────────
-  // trim() 去掉首尾多余的空白字符
   return {
-    display: displayText.trim(), // 给用户看的纯文字
-    desmos: desmosMatches        // 给 Desmos 用的公式列表
+    display: displayText.trim(),
+    desmos: desmosMatches
   };
 };
 
@@ -150,20 +125,22 @@ export interface DesmosInjectOptions {
 
 export interface DesmosInjectState {
   executedTags: Set<string>;
-  hasClearedCanvas: boolean;
+  /** 已从画板同步过已有变量定义 */
+  canvasSeeded: boolean;
   vars: VariableInjectState;
 }
 
 export function createDesmosInjectState(): DesmosInjectState {
   return {
     executedTags: new Set(),
-    hasClearedCanvas: false,
+    canvasSeeded: false,
     vars: createVariableInjectState(),
   };
 }
 
 /**
  * 从流式 AI 回复中解析 <DESMOS> 标签并注入画板
+ * 默认**追加**到现有画板，不会 setBlank 清空 GIF/已有公式。
  */
 export function processDesmosStreamChunk(
   fullRawContent: string,
@@ -180,6 +157,13 @@ export function processDesmosStreamChunk(
   const tagRegex = new RegExp(DESMOS_TAG_PATTERN.source, 'gi');
   const legacyRegex = /\[DESMOS:?\s*([\s\S]*?)\]/gi;
   let match;
+
+  const ensureCanvasContext = () => {
+    if (state.canvasSeeded) return;
+    seedVariableInjectStateFromCalculator(calculator, state.vars);
+    state.canvasSeeded = true;
+  };
+
   const injectBatch = (cleanFormula: string, correctionExprId?: string | null) => {
     const injectOne = (latex: string, exprId: string) => {
       if (correctionExprId && correctionExprId !== 'unknown') {
@@ -190,21 +174,14 @@ export function processDesmosStreamChunk(
     };
 
     if (correctionExprId && correctionExprId !== 'unknown') {
-      if (!state.hasClearedCanvas) {
-        injectOne(cleanFormula, correctionExprId);
-        state.hasClearedCanvas = true;
-      }
+      const correctionKey = `__correction__:${correctionExprId}`;
+      if (state.executedTags.has(correctionKey)) return;
+      state.executedTags.add(correctionKey);
+      injectOne(cleanFormula, correctionExprId);
       return;
     }
 
-    if (!state.hasClearedCanvas) {
-      const gifPlayback = getActiveWindowedPlayback();
-      if (!gifPlayback || gifPlayback.getFrameCount() === 0) {
-        calculator.setBlank();
-        state.vars = createVariableInjectState();
-      }
-      state.hasClearedCanvas = true;
-    }
+    ensureCanvasContext();
 
     const toInject = expandFormulaForInject(cleanFormula, state.vars);
     for (const { latex, exprId } of toInject) {
@@ -252,12 +229,10 @@ export function processDesmosStreamChunk(
 
 export const autoCorrectInput = (input: string): string => {
   return input
-    // .replace(目标字符, 替换字符) 是字符串的替换方法
-    // /，/g 是正则表达式，g 表示全局替换（不只替换第一个）
-    .replace(/，/g, ',')   // 中文逗号 → 英文逗号
-    .replace(/。/g, '.')   // 中文句号 → 英文点号
-    .replace(/（/g, '(')   // 中文左括号 → 英文左括号
-    .replace(/）/g, ')')   // 中文右括号 → 英文右括号
-    .replace(/【/g, '[')   // 中文左方括号 → 英文左方括号
-    .replace(/】/g, ']');  // 中文右方括号 → 英文右方括号
+    .replace(/，/g, ',')
+    .replace(/。/g, '.')
+    .replace(/（/g, '(')
+    .replace(/）/g, ')')
+    .replace(/【/g, '[')
+    .replace(/】/g, ']');
 };

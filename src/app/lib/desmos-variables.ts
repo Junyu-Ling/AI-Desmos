@@ -138,6 +138,22 @@ export function expandFormulaForInject(
   return items;
 }
 
+/** 从画板已有表达式同步变量定义，避免 AI 追加注入时重复赋值或误清画布 */
+export function seedVariableInjectStateFromCalculator(
+  calculator: any,
+  state: VariableInjectState,
+): void {
+  const list = calculator?.getState?.()?.expressions?.list ?? [];
+  for (const expr of list) {
+    const latex = String(expr?.latex ?? '').trim();
+    const assignVar = parseAssignmentVariable(latex);
+    if (!assignVar || state.definedVars.has(assignVar)) continue;
+    state.definedVars.add(assignVar);
+    const id = String(expr?.id ?? '').trim();
+    if (id) state.varExprIds.set(assignVar, id);
+  }
+}
+
 /** 按依赖顺序排列：先赋值、再图形；并补全缺失的变量初值 */
 export function orderFormulasWithDefinitions(formulas: string[]): string[] {
   const defined = new Set<string>();
