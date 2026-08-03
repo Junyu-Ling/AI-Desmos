@@ -2186,8 +2186,10 @@ export async function applyGifExpressionsToCalculator(
   return { committed: total, total, partial: false };
 }
 
-const GIF_STREAM_FILL_BATCH = 32;
-const GIF_STREAM_CONTOUR_BATCH = 16;
+const GIF_STREAM_FILL_BATCH = 48;
+const GIF_STREAM_FILL_BATCH_FAST = 96;
+const GIF_STREAM_CONTOUR_BATCH = 24;
+const GIF_STREAM_CONTOUR_BATCH_FAST = 48;
 
 /** 流式注入：写入时间滑块（首次 setBlank） */
 export function initGifStreamCalculator(
@@ -2238,12 +2240,14 @@ export async function appendGifFrameToCalculator(
     if (batchTick % 4 === 0) await yieldToInteractive();
     else await yieldQuick();
   };
+  const fillBatch = fastInject ? GIF_STREAM_FILL_BATCH_FAST : GIF_STREAM_FILL_BATCH;
+  const contourBatch = fastInject ? GIF_STREAM_CONTOUR_BATCH_FAST : GIF_STREAM_CONTOUR_BATCH;
   const bothMode = outlineFirst && !deferVisibility && fills.length > 0 && contours.length > 0;
   const contourGroups = bothMode ? groupContourExpressions(contours.map(prepareFourierExpression)) : [];
 
   if (bothMode) {
-    for (let i = 0; i < fills.length; i += GIF_STREAM_FILL_BATCH) {
-      const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH).map(toHiddenFillExpr);
+    for (let i = 0; i < fills.length; i += fillBatch) {
+      const batch = fills.slice(i, i + fillBatch).map(toHiddenFillExpr);
       pushBatch(batch);
       added += batch.length;
       if (!fastInject) await yieldAfterBatch();
@@ -2253,7 +2257,7 @@ export async function appendGifFrameToCalculator(
       added += contourGroups[i].length;
       if (!fastInject) await yieldAfterBatch();
     }
-    for (let i = 0; i < fills.length; i += GIF_STREAM_FILL_BATCH) {
+    for (let i = 0; i < fills.length; i += fillBatch) {
       const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH);
       if (appendOnly) {
         pushVisibleFillBatchAppend(calculator, batch);
@@ -2266,14 +2270,14 @@ export async function appendGifFrameToCalculator(
     return added;
   }
 
-  for (let i = 0; i < fills.length; i += GIF_STREAM_FILL_BATCH) {
-    const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH).map(e => prepareForStream(e));
+  for (let i = 0; i < fills.length; i += fillBatch) {
+    const batch = fills.slice(i, i + fillBatch).map(e => prepareForStream(e));
     pushBatch(batch);
     added += batch.length;
     if (!fastInject) await yieldAfterBatch();
   }
-  for (let i = 0; i < contours.length; i += GIF_STREAM_CONTOUR_BATCH) {
-    const batch = contours.slice(i, i + GIF_STREAM_CONTOUR_BATCH).map(e => prepareForStream(e));
+  for (let i = 0; i < contours.length; i += contourBatch) {
+    const batch = contours.slice(i, i + contourBatch).map(e => prepareForStream(e));
     pushBatch(batch);
     added += batch.length;
     if (!fastInject) await yieldAfterBatch();

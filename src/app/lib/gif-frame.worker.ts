@@ -107,7 +107,7 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
         tuning,
         aiContours,
         fillImageData,
-        maxFillPolygons: msg.maxFillPolygons ?? SINGLE_IMAGE_MAX_FILL_POLYGONS,
+        maxFillPolygons: msg.maxFillPolygons ?? 220,
         varNamespace: msg.frameSlot,
         frameSlot: msg.frameSlot,
         frameSliderVar: GIF_TIME_SLIDER,
@@ -117,6 +117,7 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
         gifIsLastFrame: msg.gifIsLastFrame,
         idPrefix: `gif_f${msg.frameSlot}_`,
         outlineStyle: msg.outlineStyle,
+        skipFrameRestriction: msg.skipFrameRestriction ?? true,
       },
     );
 

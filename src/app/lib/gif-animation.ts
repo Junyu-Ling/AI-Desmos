@@ -14,8 +14,6 @@ import {
 import {
   generateFourierExpressionsFromContext,
   initGifStreamCalculator,
-  SINGLE_IMAGE_MAX_DIM,
-  SINGLE_IMAGE_MAX_FILL_POLYGONS,
   updateGifStreamDuration,
   yieldQuick,
   yieldToInteractive,
@@ -71,10 +69,10 @@ const mergeGifTuning = (
     maxContours: profile.maxContours,
     fourierK: profile.fourierKCap,
     targetPointCount: profile.targetPointCountCap,
-    preserveFineDetails: true,
-    sharpenAmount: 0.7,
-    edgeThresholdFactor: 0.8,
-    strengthThresholdRatio: 0.18,
+    preserveFineDetails: false,
+    sharpenAmount: 0.55,
+    edgeThresholdFactor: 0.88,
+    strengthThresholdRatio: 0.22,
   };
   if (!aiResult) {
     return { tuning: defaults, contours: [] };
@@ -338,7 +336,7 @@ const buildGifResult = (
     streamed,
     explanation: partial
       ? `GIF ${tierLabel}部分完成（${completed}/${totalFrames} 帧，${durationLabel}s）。滑块 s 可播放已完成部分。`
-      : `GIF ${tierLabel}（${completed} 帧，${durationLabel}s，${fpsLabel}）。定格动画：每帧独立高保真绘制（3600 填色 / 1280px）；滑块 s 控制播放。`,
+      : `GIF ${tierLabel}（${completed} 帧，${durationLabel}s）。按需换帧播放：生成完即可拖动 s，切换时加载对应帧。`,
   };
 };
 
@@ -364,7 +362,7 @@ export async function processGifToDesmosAnimation(
 ): Promise<ProcessGifResult> {
   const mode = options.mode ?? 'both';
   const outlineStyle = options.outlineStyle ?? 'mono';
-  const enableAi = options.enableAiRepair !== false;
+  const enableAi = options.enableAiRepair === true && mode === 'both';
   const baseProfile = getGifQualityProfile(options.quality ?? 'standard');
   const useStreaming = Boolean(
     options.calculator && options.streamToCalculator !== false,
@@ -385,8 +383,8 @@ export async function processGifToDesmosAnimation(
   const frameCount = timeline.keyframes.length;
   if (frameCount === 0) throw new Error('GIF has no frames');
 
-  const profile = tuneGifProfileForAsset(baseProfile, file, frameCount);
-  const maxDim = Math.min(profile.maxDim, SINGLE_IMAGE_MAX_DIM);
+  const profile = tuneGifProfileForAsset(baseProfile, file, frameCount, mode);
+  const maxDim = profile.maxDim;
   const chunkSize = profile.pipelineChunkSize;
   const needDataUrl = enableAi && mode === 'both';
   const workerCount = resolveGifWorkerCount(profile);
@@ -427,9 +425,10 @@ export async function processGifToDesmosAnimation(
       timeStartSec: sf.timeStartSec,
       timeEndSec: sf.timeEndSec,
       gifIsLastFrame: sf.fi === frameCount - 1,
-      useAiPrepare: mode === 'both',
-      maxFillPolygons: SINGLE_IMAGE_MAX_FILL_POLYGONS,
+      useAiPrepare: mode === 'both' && enableAi,
+      maxFillPolygons: profile.maxFillPolygons,
       outlineStyle,
+      skipFrameRestriction: true,
     };
   };
 
@@ -464,7 +463,7 @@ export async function processGifToDesmosAnimation(
         aiContours: prepared.aiContours,
         fillImageData,
         outlineStyle,
-        maxFillPolygons: SINGLE_IMAGE_MAX_FILL_POLYGONS,
+        maxFillPolygons: profile.maxFillPolygons,
         varNamespace: frameSlot,
         frameSlot,
         frameSliderVar: GIF_TIME_SLIDER,
@@ -473,6 +472,7 @@ export async function processGifToDesmosAnimation(
         gifTimeEnd: sf.timeEndSec,
         gifIsLastFrame: sf.fi === frameCount - 1,
         idPrefix: `gif_f${frameSlot}_`,
+        skipFrameRestriction: true,
       },
     );
     return expressions;

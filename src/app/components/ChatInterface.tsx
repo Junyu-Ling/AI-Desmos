@@ -1359,7 +1359,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
         outlineStyle,
         quality,
         apiKey: customApiKey,
-        enableAiRepair: mode === 'both',
+        enableAiRepair: false,
         signal: task.signal,
         calculator: calculatorRef.current ?? undefined,
         streamToCalculator: true,

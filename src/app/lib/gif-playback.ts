@@ -1,6 +1,5 @@
 /**
- * GIF 全量动画播放：生成阶段只归档；完成后将所有帧追加到画板，
- * 每帧表达式带时间域限制，滑块 s 控制显示哪一帧（不卸载、不覆盖）。
+ * GIF 按需播放：生成只归档；画板同时仅 1 帧，滑块 s 切换时再注入（秒开、公式极少）。
  */
 import { GIF_TIME_SLIDER } from './gif-quality';
 import {
@@ -13,6 +12,8 @@ import { appendGifFrameToCalculator, updateGifStreamDuration } from './image-pro
 
 export type { GifFrameVisibilitySet } from './gif-frame-archive';
 export { classifyGifFrameExpressionIds } from './gif-frame-archive';
+
+const SLIDER_DEBOUNCE_MS = 50;
 
 const formatSliderTime = (sec: number): string => {
   const rounded = Math.round(sec * 100) / 100;
@@ -36,11 +37,15 @@ export type GifPlaybackAttachOptions = {
 
 export class GifWindowedPlaybackManager {
   private loadedFrames = new Map<number, StoredGifFrame>();
+  private activeIndex = -1;
   private calculator: any = null;
   private sliderVar = GIF_TIME_SLIDER;
+  private sliderHelper: any = null;
   private followLatestDuringGeneration = true;
-  private allFramesInjected = false;
   private injectAbort = false;
+  private syncing = false;
+  private swapChain = Promise.resolve();
+  private debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private archive: GifFrameArchive) {}
 
@@ -61,7 +66,7 @@ export class GifWindowedPlaybackManager {
     return this.archive;
   }
 
-  /** 生成阶段：仅更新滑块总时长，不向 Desmos 注入帧 */
+  /** 生成阶段：只更新滑块总时长，不向 Desmos 写公式 */
   onFrameArchived(_index: number): void {
     if (!this.calculator || !this.followLatestDuringGeneration) return;
     const ordered = this.archive.getOrderedFrames();
@@ -71,25 +76,25 @@ export class GifWindowedPlaybackManager {
     }
   }
 
-  /** 生成阶段：仅挂载 calculator 引用 */
   attachForGeneration(calculator: any, sliderVar = GIF_TIME_SLIDER): void {
     if (this.calculator !== calculator) {
       this.detach();
     }
     this.calculator = calculator;
     this.sliderVar = sliderVar;
-    this.allFramesInjected = false;
     this.followLatestDuringGeneration = true;
   }
 
-  /** 生成完成 → 将全部帧追加到画板，滑块 s 按时间域切换可见帧 */
+  /** 首帧注入 + 滑块绑定，立即返回 */
   async transitionToPlayback(
     initialIndex = 0,
     options: GifPlaybackAttachOptions = {},
   ): Promise<void> {
     this.followLatestDuringGeneration = false;
     this.resetSliderToFrame(initialIndex);
-    await this.injectAllFrames(options);
+    this.bindSliderObserver();
+    await this.swapToFrame(initialIndex, true);
+    options.onInjectProgress?.(1, this.archive.size);
   }
 
   attach(
@@ -105,24 +110,119 @@ export class GifWindowedPlaybackManager {
     this.sliderVar = sliderVar;
     this.followLatestDuringGeneration = false;
     this.resetSliderToFrame(initialIndex);
-    void this.injectAllFrames(options);
+    this.bindSliderObserver();
+    void this.swapToFrame(initialIndex, true).then(() => {
+      options.onInjectProgress?.(1, this.archive.size);
+    });
   }
 
   detach(): void {
     this.injectAbort = true;
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
+    this.unbindSliderObserver();
     this.clearLoadedFramesFromCalculator();
     this.calculator = null;
-    this.allFramesInjected = false;
+    this.activeIndex = -1;
+    this.swapChain = Promise.resolve();
     this.followLatestDuringGeneration = true;
   }
 
-  private clearLoadedFramesFromCalculator(): void {
-    if (this.calculator) {
-      for (const idx of [...this.loadedFrames.keys()]) {
-        this.unloadFrame(idx);
+  private unbindSliderObserver(): void {
+    if (this.sliderHelper?.unobserve) {
+      try {
+        this.sliderHelper.unobserve('numericValue');
+      } catch {
+        /* ignore */
+      }
+    }
+    this.sliderHelper = null;
+  }
+
+  private bindSliderObserver(): void {
+    if (!this.calculator) return;
+    this.unbindSliderObserver();
+
+    if (typeof this.calculator.HelperExpression === 'function') {
+      try {
+        this.sliderHelper = this.calculator.HelperExpression({ latex: this.sliderVar });
+        this.sliderHelper.observe('numericValue', () => {
+          if (this.syncing || this.followLatestDuringGeneration) return;
+          this.scheduleSwap();
+        });
+      } catch {
+        this.sliderHelper = null;
+      }
+    }
+
+    if (!this.sliderHelper && typeof this.calculator.observeEvent === 'function') {
+      this.calculator.observeEvent('change', () => {
+        if (this.syncing || this.followLatestDuringGeneration) return;
+        this.scheduleSwap();
+      });
+    }
+  }
+
+  private scheduleSwap(): void {
+    if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = null;
+      this.swapChain = this.swapChain
+        .catch(() => undefined)
+        .then(() => this.swapToCurrentSliderFrame(false));
+    }, SLIDER_DEBOUNCE_MS);
+  }
+
+  private readSliderValue(): number {
+    if (this.sliderHelper && Number.isFinite(this.sliderHelper.numericValue)) {
+      return this.sliderHelper.numericValue;
+    }
+    if (!this.calculator?.getState) return 0;
+    for (const item of this.calculator.getState()?.expressions?.list ?? []) {
+      if (item?.id !== 'gif_time_slider') continue;
+      const latex = String(item.latex ?? '');
+      const eq = latex.indexOf('=');
+      if (eq < 0) continue;
+      const value = parseFloat(latex.slice(eq + 1));
+      if (Number.isFinite(value)) return value;
+    }
+    return 0;
+  }
+
+  private findFrameIndex(timeSec: number): number {
+    const frames = this.archive.getOrderedFrames();
+    if (frames.length === 0) return -1;
+    for (const frame of frames) {
+      if (timeSec >= frame.timeStart && timeSec < frame.timeEnd) return frame.index;
+    }
+    const last = frames[frames.length - 1];
+    if (timeSec >= last.timeStart) return last.index;
+    return frames[0].index;
+  }
+
+  private async swapToCurrentSliderFrame(force = false): Promise<void> {
+    const index = this.findFrameIndex(this.readSliderValue());
+    if (index >= 0) await this.swapToFrame(index, force);
+  }
+
+  private purgeAllGifFrameExpressions(): void {
+    if (!this.calculator?.getState) return;
+    for (const expr of this.calculator.getState()?.expressions?.list ?? []) {
+      const id = String(expr?.id || '');
+      if (parseGifFrameIndexFromId(id) == null) continue;
+      try {
+        this.calculator.removeExpression({ id });
+      } catch {
+        /* ignore */
       }
     }
     this.loadedFrames.clear();
+  }
+
+  private clearLoadedFramesFromCalculator(): void {
+    this.purgeAllGifFrameExpressions();
   }
 
   private setSliderTime(timeSec: number): void {
@@ -148,88 +248,52 @@ export class GifWindowedPlaybackManager {
     this.setSliderTime(time);
   }
 
-  private getCalculatorExprIds(): Set<string> {
+  private isFramePresentOnCalculator(frame: StoredGifFrame): boolean {
+    if (frame.visibleIds.length === 0) return false;
     const ids = new Set<string>();
-    if (!this.calculator?.getState) return ids;
-    for (const item of this.calculator.getState()?.expressions?.list ?? []) {
+    for (const item of this.calculator?.getState?.()?.expressions?.list ?? []) {
       const id = String(item?.id || '');
       if (id) ids.add(id);
     }
-    return ids;
+    return frame.visibleIds.some(id => ids.has(id));
   }
 
-  private isFramePresentOnCalculator(frame: StoredGifFrame): boolean {
-    if (frame.visibleIds.length === 0) return false;
-    const ids = this.getCalculatorExprIds();
-    return frame.visibleIds.every(id => ids.has(id));
-  }
-
-  private async injectFrame(frame: StoredGifFrame): Promise<boolean> {
-    if (!this.calculator || this.injectAbort) return false;
-    if (this.isFramePresentOnCalculator(frame)) {
-      this.loadedFrames.set(frame.index, frame);
-      return false;
-    }
+  private async injectFrame(frame: StoredGifFrame): Promise<void> {
+    if (!this.calculator || this.injectAbort) return;
     const expressions = frame.expressions.map(expr => ({ ...expr }));
     await appendGifFrameToCalculator(this.calculator, expressions, {
-      fastInject: false,
+      fastInject: true,
       appendOnly: true,
     });
     this.loadedFrames.set(frame.index, frame);
-    return true;
   }
 
-  private unloadFrame(index: number): void {
-    const frame = this.loadedFrames.get(index);
-    if (!frame || !this.calculator) return;
-    removeExpressionIds(this.calculator, [...frame.visibleIds, ...frame.auxIds]);
-    this.loadedFrames.delete(index);
-  }
+  /** 画板只保留一帧；切换时先清空再注入 */
+  private async swapToFrame(index: number, force = false): Promise<void> {
+    if (!this.calculator || this.archive.size === 0 || index < 0) return;
+    const frame = this.archive.get(index);
+    if (!frame) return;
 
-  /** 逐帧追加全部表达式；Desmos 时间域自动切换可见帧 */
-  async injectAllFrames(options: GifPlaybackAttachOptions = {}): Promise<void> {
-    if (!this.calculator || this.archive.size === 0) return;
-    if (this.allFramesInjected) return;
-
-    this.injectAbort = false;
-    const frames = this.archive.getOrderedFrames();
-    const total = frames.length;
-    let injected = 0;
-
-    for (const frame of frames) {
-      if (this.injectAbort) break;
-      const added = await this.injectFrame(frame);
-      if (added) injected += 1;
-      options.onInjectProgress?.(injected, total);
+    if (!force && index === this.activeIndex && this.isFramePresentOnCalculator(frame)) {
+      return;
     }
 
-    this.allFramesInjected = !this.injectAbort;
+    this.syncing = true;
+    this.activeIndex = index;
+    try {
+      this.purgeAllGifFrameExpressions();
+      await this.injectFrame(frame);
+    } finally {
+      this.syncing = false;
+    }
   }
 }
 
-/** 从旧版全量注入状态迁移到归档播放 */
 export async function migrateCalculatorToWindowedPlayback(
   calculator: any,
   archive: GifFrameArchive,
   sliderVar = GIF_TIME_SLIDER,
 ): Promise<GifWindowedPlaybackManager> {
-  const state = calculator.getState?.();
-  const list = state?.expressions?.list ?? [];
-  const removeIds: string[] = [];
-
-  for (const expr of list) {
-    const id = String(expr?.id || '');
-    if (parseGifFrameIndexFromId(id) != null) removeIds.push(id);
-  }
-
-  for (const id of removeIds) {
-    try {
-      calculator.removeExpression({ id });
-    } catch {
-      /* ignore */
-    }
-  }
-
   const manager = new GifWindowedPlaybackManager(archive);
   manager.attach(calculator, sliderVar, 0);
   return manager;
@@ -271,7 +335,7 @@ export function getActivePlaybackSnapshot(): GifFrameVisibilitySet[] | null {
   return frames.length > 0 ? frames : null;
 }
 
-/** @deprecated 兼容旧调用 */
+/** @deprecated */
 export class GifPlaybackManager extends GifWindowedPlaybackManager {}
 
 export function attachGifPlayback(
