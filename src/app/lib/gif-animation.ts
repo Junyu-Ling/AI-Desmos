@@ -347,8 +347,8 @@ const buildGifResult = (
     partial,
     streamed,
     explanation: partial
-      ? `GIF ${tierLabel}部分完成（${completed}/${totalFrames} 帧，${durationLabel}s）。已自动循环播放已完成部分。`
-      : `GIF ${tierLabel}（${completed} 帧，${durationLabel}s，${fpsLabel}）。单帧最高还原 · 画板仅 1 帧护显卡 · 自动循环。`,
+      ? `GIF ${tierLabel}部分完成（${completed}/${totalFrames} 帧，${durationLabel}s）。拖动滑块 s 播放已完成部分。`
+      : `GIF ${tierLabel}（${completed} 帧，${durationLabel}s，${fpsLabel}）。全帧已写入 · 滑块 s 控制定格动画。`,
   };
 };
 
@@ -440,7 +440,7 @@ export async function processGifToDesmosAnimation(
       useAiPrepare: mode === 'both' && enableAi,
       maxFillPolygons: profile.maxFillPolygons,
       outlineStyle,
-      skipFrameRestriction: true,
+      skipFrameRestriction: false,
     };
   };
 
@@ -484,7 +484,7 @@ export async function processGifToDesmosAnimation(
         gifTimeEnd: sf.timeEndSec,
         gifIsLastFrame: sf.fi === frameCount - 1,
         idPrefix: `gif_f${frameSlot}_`,
-        skipFrameRestriction: true,
+        skipFrameRestriction: false,
       },
     );
     return expressions;
