@@ -11,7 +11,7 @@ import {
   type SmartDrawTuningParams,
 } from './smart-draw-repair';
 
-export type { SmartDrawMode } from './smart-draw-repair';
+export type { SmartDrawMode, OutlineStyle } from './smart-draw-repair';
 export type { SmartDrawTuningParams, SmartDrawRepairPhase, SmartDrawAIContour } from './smart-draw-repair';
 
 // ─── 类型定义 ────────────────────────────────────────────────────────────────
@@ -323,31 +323,27 @@ const buildBorderBackgroundMask = (
   return isBg;
 };
 
-const sampleContourColor = (
-  ctx: CanvasRenderingContext2D,
+const sampleContourColorFromData = (
+  data: Uint8ClampedArray,
   width: number,
   height: number,
   points: Point[],
 ): string => {
-  const { data } = ctx.getImageData(0, 0, width, height);
   const samples: { r: number; g: number; b: number }[] = [];
-  const step = Math.max(1, Math.floor(points.length / 36));
+  const step = Math.max(1, Math.floor(points.length / 24));
 
   for (let i = 0; i < points.length; i += step) {
-    for (const [ox, oy] of [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1], [2, 0], [0, 2]]) {
-      const x = Math.round(points[i].x + ox);
-      const y = Math.round(points[i].y + oy);
-      if (x < 0 || x >= width || y < 0 || y >= height) continue;
-
-      const idx = (y * width + x) * 4;
-      const r = data[idx];
-      const g = data[idx + 1];
-      const b = data[idx + 2];
-      if (!isCanvasBackground(r, g, b)) samples.push({ r, g, b });
-    }
+    const x = Math.round(points[i].x);
+    const y = Math.round(points[i].y);
+    if (x < 0 || x >= width || y < 0 || y >= height) continue;
+    const idx = (y * width + x) * 4;
+    const r = data[idx];
+    const g = data[idx + 1];
+    const b = data[idx + 2];
+    if (!isCanvasBackground(r, g, b)) samples.push({ r, g, b });
   }
 
-  if (samples.length === 0) return DESMOS_FALLBACK_COLORS[0];
+  if (samples.length === 0) return '#000000';
 
   const median = (values: number[]) => {
     const sorted = [...values].sort((a, b) => a - b);
@@ -359,6 +355,16 @@ const sampleContourColor = (
     median(samples.map(s => s.g)),
     median(samples.map(s => s.b)),
   );
+};
+
+const sampleContourColor = (
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  points: Point[],
+): string => {
+  const { data } = ctx.getImageData(0, 0, width, height);
+  return sampleContourColorFromData(data, width, height, points);
 };
 
 // ─── 轮廓提取 ────────────────────────────────────────────────────────────────
@@ -1404,6 +1410,8 @@ const createFillContext = (
 export type ImageFourierOptions = {
   /** 智能绘图模式：仅轮廓 / 仅涂色 / 轮廓+涂色，默认 both */
   mode?: import('./smart-draw-repair').SmartDrawMode;
+  /** 仅轮廓：mono=黑色线稿，color=沿边缘采样原色 */
+  outlineStyle?: import('./smart-draw-repair').OutlineStyle;
   /** AI/启发式修复后的拟合参数 */
   tuning?: SmartDrawTuningParams;
   /** AI 视觉模型追踪的主轮廓（与边缘检测合并） */
@@ -1663,6 +1671,10 @@ const generateFourierExpressions = (
   finalContours = finalContours.slice(0, maxContours);
 
   const contourExpressions: any[] = [];
+  const useColorOutline = !includeFill && (options.outlineStyle ?? 'mono') === 'color';
+  const colorSampleData = useColorOutline
+    ? (options.fillImageData?.data ?? ctx.getImageData(0, 0, width, height).data)
+    : null;
 
   finalContours.forEach((rawPoints, idx) => {
     const m = meta[rawContours.indexOf(rawPoints)];
@@ -1720,7 +1732,9 @@ const generateFourierExpressions = (
     const func_X   = `X_{${nameKey}}`;
     const func_Y   = `Y_{${nameKey}}`;
 
-    const plotColor = SMART_DRAW_OUTLINE_COLOR;
+    const plotColor = colorSampleData
+      ? sampleContourColorFromData(colorSampleData, width, height, processedPoints)
+      : SMART_DRAW_OUTLINE_COLOR;
 
     contourExpressions.push(
       { id: `${idPrefix}dft_freq_${index}`, latex: `${id_freq} = [${L_freq.join(',')}]`, hidden: true },
@@ -1764,7 +1778,9 @@ const generateFourierExpressions = (
       ? `绘画已完成（${fillPolys.length} 个色块 + ${finalContours.length} 条黑色轮廓${outlineNote}）。`
       : includeFill
         ? '绘画已完成。'
-        : `绘画已完成（${finalContours.length} 条黑色轮廓${outlineNote}，仅勾线）。`,
+        : useColorOutline
+          ? `绘画已完成（${finalContours.length} 条彩色轮廓${outlineNote}，仅勾线）。`
+          : `绘画已完成（${finalContours.length} 条黑色轮廓${outlineNote}，仅勾线）。`,
   };
 };
 
@@ -1932,6 +1948,31 @@ const pushExprBatch = (calculator: any, chunk: any[]) => {
   chunk.forEach(expr => calculator.setExpression(expr));
 };
 
+export const getCalculatorExprIdSet = (calculator: any): Set<string> => {
+  const ids = new Set<string>();
+  for (const item of calculator?.getState?.()?.expressions?.list ?? []) {
+    const id = String(item?.id || '');
+    if (id) ids.add(id);
+  }
+  return ids;
+};
+
+/** 仅追加 id 尚未存在的表达式，避免 Desmos 同 id 覆盖上一行 */
+const pushExprBatchAppend = (calculator: any, chunk: any[]): number => {
+  if (!chunk.length) return 0;
+  const existing = getCalculatorExprIdSet(calculator);
+  const novel = chunk.filter(expr => {
+    const id = String(expr?.id || '');
+    return id && !existing.has(id);
+  });
+  if (!novel.length) return 0;
+  pushExprBatch(calculator, novel);
+  for (const expr of novel) {
+    existing.add(String(expr.id));
+  }
+  return novel.length;
+};
+
 /** 填色完成后把黑色勾线重新置顶，避免被后写入的色块盖住 */
 const bringOutlinePlotsToFront = (calculator: any, contours: any[]) => {
   const plots = contours.filter(isOutlinePlotExpression).map(prepareFourierExpression);
@@ -1953,6 +1994,10 @@ const pushVisibleFillBatch = (calculator: any, batch: any[]) => {
     return;
   }
   patches.forEach(expr => calculator.setExpression(expr));
+};
+
+const pushVisibleFillBatchAppend = (calculator: any, batch: any[]) => {
+  pushExprBatchAppend(calculator, batch.map(toVisibleFillPatch));
 };
 
 /** both 模式渐进注入：用户先见勾线、再见填色；填色底层静默预载 */
@@ -2166,13 +2211,17 @@ export function initGifStreamCalculator(
 export async function appendGifFrameToCalculator(
   calculator: any,
   frameExpressions: any[],
-  options?: { deferVisibility?: boolean; fastInject?: boolean; outlineFirst?: boolean },
+  options?: { deferVisibility?: boolean; fastInject?: boolean; outlineFirst?: boolean; appendOnly?: boolean },
 ): Promise<number> {
   if (!calculator || frameExpressions.length === 0) return 0;
 
   const deferVisibility = options?.deferVisibility ?? false;
   const fastInject = options?.fastInject ?? false;
   const outlineFirst = options?.outlineFirst ?? false;
+  const appendOnly = options?.appendOnly ?? false;
+  const pushBatch = appendOnly
+    ? (batch: any[]) => pushExprBatchAppend(calculator, batch)
+    : (batch: any[]) => { pushExprBatch(calculator, batch); return batch.length; };
   const prepareForStream = (expr: any, hidden = deferVisibility) => {
     const prepared = prepareFourierExpression(expr);
     if (isSliderExpression(prepared)) return prepared;
@@ -2182,25 +2231,36 @@ export async function appendGifFrameToCalculator(
 
   const { fills, contours } = partitionExpressions(frameExpressions);
   let added = 0;
+  let batchTick = 0;
+  const yieldAfterBatch = async () => {
+    if (fastInject) return;
+    batchTick += 1;
+    if (batchTick % 4 === 0) await yieldToInteractive();
+    else await yieldQuick();
+  };
   const bothMode = outlineFirst && !deferVisibility && fills.length > 0 && contours.length > 0;
   const contourGroups = bothMode ? groupContourExpressions(contours.map(prepareFourierExpression)) : [];
 
   if (bothMode) {
     for (let i = 0; i < fills.length; i += GIF_STREAM_FILL_BATCH) {
       const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH).map(toHiddenFillExpr);
-      pushExprBatch(calculator, batch);
+      pushBatch(batch);
       added += batch.length;
-      if (!fastInject) await yieldQuick();
+      if (!fastInject) await yieldAfterBatch();
     }
     for (let i = 0; i < contourGroups.length; i += 1) {
-      pushExprBatch(calculator, contourGroups[i]);
+      pushBatch(contourGroups[i]);
       added += contourGroups[i].length;
-      if (!fastInject) await yieldQuick();
+      if (!fastInject) await yieldAfterBatch();
     }
     for (let i = 0; i < fills.length; i += GIF_STREAM_FILL_BATCH) {
       const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH);
-      pushVisibleFillBatch(calculator, batch);
-      if (!fastInject) await yieldQuick();
+      if (appendOnly) {
+        pushVisibleFillBatchAppend(calculator, batch);
+      } else {
+        pushVisibleFillBatch(calculator, batch);
+      }
+      if (!fastInject) await yieldAfterBatch();
     }
     bringOutlinePlotsToFront(calculator, contours.map(prepareFourierExpression));
     return added;
@@ -2208,15 +2268,15 @@ export async function appendGifFrameToCalculator(
 
   for (let i = 0; i < fills.length; i += GIF_STREAM_FILL_BATCH) {
     const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH).map(e => prepareForStream(e));
-    pushExprBatch(calculator, batch);
+    pushBatch(batch);
     added += batch.length;
-    if (!fastInject) await yieldQuick();
+    if (!fastInject) await yieldAfterBatch();
   }
   for (let i = 0; i < contours.length; i += GIF_STREAM_CONTOUR_BATCH) {
     const batch = contours.slice(i, i + GIF_STREAM_CONTOUR_BATCH).map(e => prepareForStream(e));
-    pushExprBatch(calculator, batch);
+    pushBatch(batch);
     added += batch.length;
-    if (!fastInject) await yieldQuick();
+    if (!fastInject) await yieldAfterBatch();
   }
   return added;
 }

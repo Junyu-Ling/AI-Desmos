@@ -71,6 +71,10 @@ const mergeGifTuning = (
     maxContours: profile.maxContours,
     fourierK: profile.fourierKCap,
     targetPointCount: profile.targetPointCountCap,
+    preserveFineDetails: true,
+    sharpenAmount: 0.7,
+    edgeThresholdFactor: 0.8,
+    strengthThresholdRatio: 0.18,
   };
   if (!aiResult) {
     return { tuning: defaults, contours: [] };
@@ -249,7 +253,7 @@ const fetchBatchAiParallel = async (
   onProgress: (done: number, total: number) => void,
 ): Promise<Map<number, { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] }>> => {
   const aiMap = new Map<number, { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] }>();
-  if (!enableAi || mode === 'fill') return aiMap;
+  if (!enableAi || mode !== 'both') return aiMap;
 
   const batches: ScaledKeyframe[][] = [];
   for (let i = 0; i < scaledFrames.length; i += profile.aiBatchSize) {
@@ -334,12 +338,13 @@ const buildGifResult = (
     streamed,
     explanation: partial
       ? `GIF ${tierLabel}部分完成（${completed}/${totalFrames} 帧，${durationLabel}s）。滑块 s 可播放已完成部分。`
-      : `GIF ${tierLabel}（${completed} 帧，${durationLabel}s，${fpsLabel}）。每帧与单图相同精度（3600 填色 / 1280px）；滑块 s 控制播放。`,
+      : `GIF ${tierLabel}（${completed} 帧，${durationLabel}s，${fpsLabel}）。定格动画：每帧独立高保真绘制（3600 填色 / 1280px）；滑块 s 控制播放。`,
   };
 };
 
 export type ProcessGifOptions = {
   mode?: SmartDrawMode;
+  outlineStyle?: import('./smart-draw-repair').OutlineStyle;
   apiKey?: string;
   enableAiRepair?: boolean;
   quality?: GifQualityTier;
@@ -349,7 +354,7 @@ export type ProcessGifOptions = {
   onProgress?: (
     current: number,
     total: number,
-    phase: 'decode' | 'frame' | 'ai' | 'worker' | 'inject',
+    phase: 'decode' | 'frame' | 'ai' | 'worker' | 'archive' | 'inject',
   ) => void;
 };
 
@@ -358,6 +363,7 @@ export async function processGifToDesmosAnimation(
   options: ProcessGifOptions = {},
 ): Promise<ProcessGifResult> {
   const mode = options.mode ?? 'both';
+  const outlineStyle = options.outlineStyle ?? 'mono';
   const enableAi = options.enableAiRepair !== false;
   const baseProfile = getGifQualityProfile(options.quality ?? 'standard');
   const useStreaming = Boolean(
@@ -382,7 +388,7 @@ export async function processGifToDesmosAnimation(
   const profile = tuneGifProfileForAsset(baseProfile, file, frameCount);
   const maxDim = Math.min(profile.maxDim, SINGLE_IMAGE_MAX_DIM);
   const chunkSize = profile.pipelineChunkSize;
-  const needDataUrl = enableAi && mode !== 'fill';
+  const needDataUrl = enableAi && mode === 'both';
   const workerCount = resolveGifWorkerCount(profile);
 
   let streamInitialized = false;
@@ -421,8 +427,9 @@ export async function processGifToDesmosAnimation(
       timeStartSec: sf.timeStartSec,
       timeEndSec: sf.timeEndSec,
       gifIsLastFrame: sf.fi === frameCount - 1,
-      useAiPrepare: true,
+      useAiPrepare: mode === 'both',
       maxFillPolygons: SINGLE_IMAGE_MAX_FILL_POLYGONS,
+      outlineStyle,
     };
   };
 
@@ -456,6 +463,7 @@ export async function processGifToDesmosAnimation(
         tuning: prepared.tuning,
         aiContours: prepared.aiContours,
         fillImageData,
+        outlineStyle,
         maxFillPolygons: SINGLE_IMAGE_MAX_FILL_POLYGONS,
         varNamespace: frameSlot,
         frameSlot,
@@ -482,7 +490,7 @@ export async function processGifToDesmosAnimation(
   const frameStream = useStreaming
     ? new OrderedFrameStream(async (fi, exprs) => {
       archiveFrame(fi, exprs);
-      options.onProgress?.(fi + 1, frameCount, 'inject');
+      options.onProgress?.(fi + 1, frameCount, 'archive');
       if ((fi + 1) % 3 === 0) await yieldQuick();
     })
     : null;
@@ -649,12 +657,17 @@ export async function processGifToDesmosAnimation(
   }
 
   if (useStreaming && streamInitialized && playbackManager && options.calculator) {
-    attachGifWindowedPlayback(
+    await attachGifWindowedPlayback(
       options.calculator,
       playbackManager,
       GIF_TIME_SLIDER,
       0,
       true,
+      {
+        onInjectProgress: (done, total) => {
+          options.onProgress?.(done, total, 'inject');
+        },
+      },
     );
   }
 

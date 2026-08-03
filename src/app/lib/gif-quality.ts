@@ -1,6 +1,10 @@
 /**
  * GIF 动画质量档位：标准 / 电影级（高采样）
- * 每帧与单图相同精度（3600 填色 / 1280px）；流畅播放靠窗口化注入，不降级画质。
+ *
+ * 设计原则（定格动画）：
+ * GIF 本质是「逐帧定格照片」——动画感来自相邻帧之间的细微差异。
+ * 每一帧都必须按单图最高精度独立绘制（轮廓、填色、傅里叶项），
+ * 绝不能跨帧简化或合并；帧内细节越多，播放时才越像真的在动。
  */
 
 /** 秒级时间滑块；勿用 t（与参数曲线参数 t 冲突） */
@@ -55,13 +59,13 @@ export const GIF_QUALITY_PROFILES: Record<GifQualityTier, GifQualityProfile> = {
     targetFps: 8,
     maxKeyframes: 150,
     maxDim: GIF_SINGLE_FRAME_MAX_DIM,
-    aiBatchSize: 16,
+    aiBatchSize: 8,
     aiParallelBatches: 8,
     localPrepareConcurrency: 6,
     workerCount: 8,
     scaleConcurrency: 8,
-    jpegQuality: 0.92,
-    sceneChangeThreshold: 7,
+    jpegQuality: 0.95,
+    sceneChangeThreshold: 5,
     pipelineChunkSize: 16,
     maxFillPolygons: GIF_SINGLE_FRAME_MAX_FILL,
     maxContours: GIF_SINGLE_FRAME_MAX_CONTOURS,
@@ -74,13 +78,13 @@ export const GIF_QUALITY_PROFILES: Record<GifQualityTier, GifQualityProfile> = {
     targetFps: 24,
     maxKeyframes: 220,
     maxDim: GIF_SINGLE_FRAME_MAX_DIM,
-    aiBatchSize: 16,
+    aiBatchSize: 8,
     aiParallelBatches: 8,
     localPrepareConcurrency: 6,
     workerCount: 8,
     scaleConcurrency: 8,
-    jpegQuality: 0.92,
-    sceneChangeThreshold: 4,
+    jpegQuality: 0.95,
+    sceneChangeThreshold: 3,
     pipelineChunkSize: 12,
     maxFillPolygons: GIF_SINGLE_FRAME_MAX_FILL,
     maxContours: GIF_SINGLE_FRAME_MAX_CONTOURS,

@@ -62,7 +62,7 @@ import {
 } from '../lib/deepseek';
 
 // 图像处理：图片/Emoji → 傅里叶变换 → Desmos 表达式
-import { processImageToFourier, processEmojiToFourier, applyFourierExpressionsProgressively, type SmartDrawMode } from '../lib/image-processing';
+import { processImageToFourier, processEmojiToFourier, applyFourierExpressionsProgressively, type SmartDrawMode, type OutlineStyle } from '../lib/image-processing';
 import { processGifToDesmosAnimation, applyGifExpressionsToCalculator, detachGifPlayback, type GifQualityTier } from '../lib/gif-animation';
 import {
   clearWorkspaceAsync,
@@ -650,13 +650,15 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
 
   /** drawModeRef — 用户选定的绘图模式，供文件选择器回调使用 */
   const drawModeRef = useRef<SmartDrawMode>('both');
+  const outlineStyleRef = useRef<OutlineStyle>('mono');
+  const [outlineStyle, setOutlineStyle] = useState<OutlineStyle>('mono');
 
   /** GIF 质量档位（标准 / 电影级） */
   const gifQualityRef = useRef<GifQualityTier>('standard');
   const [gifQualityTier, setGifQualityTier] = useState<GifQualityTier>('standard');
   const [drawModeSheetIsGif, setDrawModeSheetIsGif] = useState(false);
   const [showGifQualitySheet, setShowGifQualitySheet] = useState(false);
-  const pendingGifFileRef = useRef<{ file: File; mode: SmartDrawMode } | null>(null);
+  const pendingGifFileRef = useRef<{ file: File; mode: SmartDrawMode; outlineStyle: OutlineStyle } | null>(null);
 
   /** solveFileRef — 解题模式的隐藏文件选择器的引用 */
   const solveFileRef = useRef<HTMLInputElement>(null);
@@ -1009,8 +1011,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
 
     const result = await processEmojiToFourier(emoji, {
       mode,
+      outlineStyle: outlineStyleRef.current,
       apiKey: customApiKey,
-      enableAiRepair: true,
+      enableAiRepair: mode === 'both',
       onRepairProgress: (phase) => {
         const key = phase === 'ai_analyze' ? 'drawing_ai_repair' : 'drawing_local_repair';
         setMessages(prev => prev.map(m =>
@@ -1283,6 +1286,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     file: File,
     mode: SmartDrawMode = 'both',
     quality: GifQualityTier = 'standard',
+    outlineStyle: OutlineStyle = outlineStyleRef.current,
   ) => {
     const imageUrl = URL.createObjectURL(file);
 
@@ -1311,7 +1315,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
       let pendingGifProgress: {
         current: number;
         total: number;
-        phase: 'decode' | 'frame' | 'ai' | 'worker' | 'inject';
+        phase: 'decode' | 'frame' | 'ai' | 'worker' | 'archive' | 'inject';
       } | null = null;
 
       const flushGifProgress = () => {
@@ -1322,7 +1326,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
           ? 'gif_drawing_processing'
           : phase === 'inject'
             ? 'gif_drawing_inject'
-            : phase === 'ai'
+            : phase === 'archive'
+              ? 'gif_drawing_archive'
+              : phase === 'ai'
               ? 'gif_drawing_ai'
               : phase === 'worker'
                 ? 'gif_drawing_worker'
@@ -1350,9 +1356,10 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
 
       const result = await processGifToDesmosAnimation(file, {
         mode,
+        outlineStyle,
         quality,
         apiKey: customApiKey,
-        enableAiRepair: true,
+        enableAiRepair: mode === 'both',
         signal: task.signal,
         calculator: calculatorRef.current ?? undefined,
         streamToCalculator: true,
@@ -1494,8 +1501,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
 
         const result = await processImageToFourier(file, {
             mode,
+            outlineStyle: outlineStyleRef.current,
             apiKey: customApiKey,
-            enableAiRepair: true,
+            enableAiRepair: mode === 'both',
             onRepairProgress: (phase) => {
                 const key = phase === 'ai_analyze' ? 'drawing_ai_repair' : 'drawing_local_repair';
                 setMessages(prev => prev.map(m =>
@@ -1578,7 +1586,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
       setShowSolveOptions(true);
     } else {
       if (isGifFile(file)) {
-        pendingGifFileRef.current = { file, mode: drawModeRef.current };
+        pendingGifFileRef.current = {
+          file,
+          mode: drawModeRef.current,
+          outlineStyle: outlineStyleRef.current,
+        };
         setShowGifQualitySheet(true);
       } else {
         await processFile(file, drawModeRef.current);
@@ -1709,7 +1721,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     const pending = pendingGifFileRef.current;
     if (pending) {
       pendingGifFileRef.current = null;
-      await processGifFile(pending.file, pending.mode, quality);
+      await processGifFile(pending.file, pending.mode, quality, pending.outlineStyle);
     }
   };
 
@@ -1720,6 +1732,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
   /** 用户选定绘图模式后：Emoji / 文件 / 打开文件选择器 */
   const handleDrawModeSelect = async (mode: SmartDrawMode) => {
     drawModeRef.current = mode;
+    outlineStyleRef.current = outlineStyle;
     setShowDrawModeSheet(false);
     setDrawModeSheetSubtitle(null);
 
@@ -2201,6 +2214,32 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
                                 <ChevronRight size={15} className="text-gray-300 shrink-0" />
                             </button>
                         ))}
+                    </div>
+                    <div className="mt-4 pt-4 border-t border-gray-100">
+                      <p className="text-xs text-gray-500 mb-2" style={{ fontWeight: 600 }}>
+                        {t('outline_style_title')}
+                      </p>
+                      <div className="grid grid-cols-2 gap-2">
+                        {([
+                          { id: 'mono' as const, label: t('outline_style_mono'), desc: t('outline_style_mono_desc') },
+                          { id: 'color' as const, label: t('outline_style_color'), desc: t('outline_style_color_desc') },
+                        ]).map(opt => (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            onClick={() => setOutlineStyle(opt.id)}
+                            className={`px-3 py-2.5 rounded-xl border text-left transition-colors ${
+                              outlineStyle === opt.id
+                                ? 'ring-2 ring-slate-400 bg-slate-50 border-slate-200'
+                                : 'bg-gray-50 hover:bg-gray-100 border-gray-100'
+                            }`}
+                          >
+                            <p className="text-sm text-gray-800" style={{ fontWeight: 600 }}>{opt.label}</p>
+                            <p className="text-[11px] text-gray-500 mt-0.5">{opt.desc}</p>
+                          </button>
+                        ))}
+                      </div>
+                      <p className="text-[11px] text-gray-400 mt-2">{t('outline_style_hint')}</p>
                     </div>
                     {drawModeSheetIsGif && (
                       <div className="mt-4 pt-4 border-t border-gray-100">

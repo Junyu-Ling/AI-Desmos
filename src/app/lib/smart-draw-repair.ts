@@ -10,6 +10,9 @@ import { buildProviderRequest, compressImageDataUrl } from './gemini-api';
 
 export type SmartDrawMode = 'outline' | 'fill' | 'both';
 
+/** 仅轮廓模式：黑白统一线稿 / 沿边缘采样原图颜色 */
+export type OutlineStyle = 'mono' | 'color';
+
 export type SmartDrawTuningParams = {
   contrastBoost: number;
   sharpenAmount: number;
@@ -166,8 +169,16 @@ For "contours" (skip or [] if mode is fill-only):
 - Max 20 contours. Prioritize accuracy over quantity.
 - closed=true for loops; false for open strokes.`;
 
-const SMART_DRAW_BATCH_AI_PROMPT = `You analyze {N} animation frames (indices 0..{N-1}) for Smart Drawing on Desmos.
+const SMART_DRAW_BATCH_AI_PROMPT = `You analyze {N} STOP-MOTION animation frames (indices 0..{N-1}) for Smart Drawing on Desmos.
 Return ONLY valid JSON (no markdown). Mode: {MODE}.
+
+CRITICAL — STOP-MOTION RULE:
+Each frame is an independent still photograph. Motion is an ILLUSION created by small differences between consecutive frames.
+- Analyze EVERY frame on its own; do NOT interpolate, smooth, or average across frames.
+- Preserve ALL visible details IN THAT FRAME: outlines, fills, facial features, limbs, props, shadows, text.
+- When a body part moves slightly between frames, trace its EXACT position in each frame separately.
+- Use high fourierK (90-160) and targetPointCount (400-800) when the frame has fine detail.
+- Set preserveFineDetails=true unless the frame is extremely simple.
 
 {
   "frames": [
@@ -189,8 +200,8 @@ Return ONLY valid JSON (no markdown). Mode: {MODE}.
 }
 
 Each frame image is labeled "Frame index K" before the image. Match results to that index.
-For "contours" (skip or [] if mode is fill-only): normalized coords 0-1000, 12-60 points, max 20 contours per frame.
-Prioritize accuracy; analyze EACH frame independently.`;
+For "contours" (skip or [] if mode is fill-only): normalized coords 0-1000, 20-60 points per contour, up to 40 contours per frame.
+Prioritize per-frame accuracy over speed; missing micro-details kills the animation illusion.`;
 
 type RawAIResponse = Partial<SmartDrawTuningParams> & {
   contours?: Array<{
@@ -299,7 +310,7 @@ async function callOpenAiVisionBatch(
 
   for (const frame of batch) {
     content.push({ type: 'text', text: `Frame index ${frame.frameIndex}:` });
-    content.push({ type: 'image_url', image_url: { url: frame.dataUrl, detail: 'low' } });
+    content.push({ type: 'image_url', image_url: { url: frame.dataUrl, detail: 'high' } });
   }
 
   const headers = headersOverride ?? { 'Content-Type': 'application/json' };
@@ -757,7 +768,10 @@ export async function prepareSmartDrawImage(
   let tuning = analyzeImageHeuristically(ctx, width, height, mode);
   let aiContours: SmartDrawAIContour[] = [];
 
-  if (options.enableAiRepair !== false) {
+  // 仅轮廓/仅填色：本地 Sobel + 对比度即可，无需视觉 API（减负服务器）
+  const needsAi = options.enableAiRepair !== false && mode === 'both';
+
+  if (needsAi) {
     options.onProgress?.('ai_analyze');
     const aiResult = await analyzeSmartDrawWithAI(dataUrl, mode, width, height, options.apiKey);
     if (aiResult) {

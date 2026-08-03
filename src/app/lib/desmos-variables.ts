@@ -138,19 +138,27 @@ export function expandFormulaForInject(
   return items;
 }
 
-/** 从画板已有表达式同步变量定义，避免 AI 追加注入时重复赋值或误清画布 */
+/** 从画板已有表达式同步变量定义，避免 AI 追加注入时重复赋值或覆盖已有 ai_* 行 */
 export function seedVariableInjectStateFromCalculator(
   calculator: any,
   state: VariableInjectState,
 ): void {
   const list = calculator?.getState?.()?.expressions?.list ?? [];
+  let maxAiSeq = -1;
   for (const expr of list) {
+    const id = String(expr?.id ?? '').trim();
+    const aiMatch = /^ai_(\d+)$/.exec(id);
+    if (aiMatch) {
+      maxAiSeq = Math.max(maxAiSeq, parseInt(aiMatch[1], 10));
+    }
     const latex = String(expr?.latex ?? '').trim();
     const assignVar = parseAssignmentVariable(latex);
     if (!assignVar || state.definedVars.has(assignVar)) continue;
     state.definedVars.add(assignVar);
-    const id = String(expr?.id ?? '').trim();
     if (id) state.varExprIds.set(assignVar, id);
+  }
+  if (maxAiSeq >= 0) {
+    state.injectSeq = Math.max(state.injectSeq, maxAiSeq + 1);
   }
 }
 

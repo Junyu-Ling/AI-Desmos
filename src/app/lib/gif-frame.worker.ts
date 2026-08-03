@@ -37,6 +37,7 @@ export type GifFrameWorkerInput = {
   /** 播放管理器负责可见性，省略 latex 时间限制 */
   skipFrameRestriction?: boolean;
   maxFillPolygons?: number;
+  outlineStyle?: import('./smart-draw-repair').OutlineStyle;
 };
 
 export type GifFrameWorkerOutput = {
@@ -115,6 +116,7 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
         gifTimeEnd: msg.timeEndSec,
         gifIsLastFrame: msg.gifIsLastFrame,
         idPrefix: `gif_f${msg.frameSlot}_`,
+        outlineStyle: msg.outlineStyle,
       },
     );
 

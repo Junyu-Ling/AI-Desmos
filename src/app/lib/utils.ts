@@ -170,6 +170,9 @@ export function processDesmosStreamChunk(
         calculator.setExpression({ id: correctionExprId, latex });
         return;
       }
+      const existingIds = calculator?.getState?.()?.expressions?.list
+        ?.map((e: { id?: string }) => String(e?.id ?? '')) ?? [];
+      if (existingIds.includes(exprId)) return;
       calculator.setExpression({ id: exprId, latex });
     };
 
