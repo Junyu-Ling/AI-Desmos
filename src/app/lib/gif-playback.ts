@@ -77,9 +77,12 @@ export class GifWindowedPlaybackManager {
   }
 
   attachForGeneration(calculator: any, sliderVar = GIF_TIME_SLIDER): void {
-    if (this.calculator !== calculator) {
+    // 仅在已绑定别的 calculator 时清理；calculator===null 时勿 detach，
+    // 否则 injectAbort 会被置 true 且后续注入全部被跳过。
+    if (this.calculator && this.calculator !== calculator) {
       this.detach();
     }
+    this.injectAbort = false;
     this.calculator = calculator;
     this.sliderVar = sliderVar;
     this.followLatestDuringGeneration = true;
@@ -90,6 +93,7 @@ export class GifWindowedPlaybackManager {
     initialIndex = 0,
     options: GifPlaybackAttachOptions = {},
   ): Promise<void> {
+    this.injectAbort = false;
     this.followLatestDuringGeneration = false;
     this.resetSliderToFrame(initialIndex);
     this.bindSliderObserver();
@@ -103,10 +107,11 @@ export class GifWindowedPlaybackManager {
     initialIndex = 0,
     options: GifPlaybackAttachOptions = {},
   ): void {
-    if (this.calculator !== calculator) {
+    if (this.calculator && this.calculator !== calculator) {
       this.detach();
-      this.calculator = calculator;
     }
+    this.injectAbort = false;
+    this.calculator = calculator;
     this.sliderVar = sliderVar;
     this.followLatestDuringGeneration = false;
     this.resetSliderToFrame(initialIndex);
