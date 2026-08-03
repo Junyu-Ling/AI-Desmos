@@ -1,5 +1,5 @@
 /**
- * GIF 按需播放：生成只归档；画板同时仅 1 帧，滑块 s 切换时再注入（秒开、公式极少）。
+ * GIF 按需播放：生成时预览最新帧；完成后自动循环换帧，看起来像表情包在动。
  */
 import { GIF_TIME_SLIDER } from './gif-quality';
 import {
@@ -14,25 +14,18 @@ export type { GifFrameVisibilitySet } from './gif-frame-archive';
 export { classifyGifFrameExpressionIds } from './gif-frame-archive';
 
 const SLIDER_DEBOUNCE_MS = 50;
+const MIN_FRAME_HOLD_MS = 45;
 
 const formatSliderTime = (sec: number): string => {
   const rounded = Math.round(sec * 100) / 100;
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, '');
 };
 
-const removeExpressionIds = (calculator: any, ids: string[]) => {
-  if (!calculator || ids.length === 0) return;
-  for (const id of ids) {
-    try {
-      calculator.removeExpression({ id });
-    } catch {
-      /* already removed */
-    }
-  }
-};
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 export type GifPlaybackAttachOptions = {
   onInjectProgress?: (done: number, total: number) => void;
+  autoplay?: boolean;
 };
 
 export class GifWindowedPlaybackManager {
@@ -46,6 +39,9 @@ export class GifWindowedPlaybackManager {
   private syncing = false;
   private swapChain = Promise.resolve();
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private playing = false;
+  private playToken = 0;
+  private pendingPreviewIndex: number | null = null;
 
   constructor(private archive: GifFrameArchive) {}
 
@@ -66,19 +62,42 @@ export class GifWindowedPlaybackManager {
     return this.archive;
   }
 
-  /** 生成阶段：只更新滑块总时长，不向 Desmos 写公式 */
-  onFrameArchived(_index: number): void {
+  /** 生成阶段：更新时长并预览刚归档的帧（顺序可见，像在动） */
+  onFrameArchived(index: number): void {
     if (!this.calculator || !this.followLatestDuringGeneration) return;
-    const ordered = this.archive.getOrderedFrames();
-    const last = ordered[ordered.length - 1];
-    if (last) {
-      updateGifStreamDuration(this.calculator, last.timeEnd, this.sliderVar);
-    }
+    const frame = this.archive.get(index);
+    if (!frame) return;
+
+    updateGifStreamDuration(
+      this.calculator,
+      frame.timeEnd,
+      this.sliderVar,
+      undefined,
+      frame.timeStart,
+    );
+
+    this.pendingPreviewIndex = index;
+    this.swapChain = this.swapChain
+      .catch(() => undefined)
+      .then(async () => {
+        if (!this.followLatestDuringGeneration || this.injectAbort) return;
+        const target = this.pendingPreviewIndex;
+        this.pendingPreviewIndex = null;
+        if (target == null) return;
+        // 若积压，直接跳到当前最新已归档帧，避免预览落后太多
+        const ordered = this.archive.getOrderedFrames();
+        const latest = ordered[ordered.length - 1]?.index ?? target;
+        this.syncing = true;
+        try {
+          this.setSliderTime(this.archive.get(latest)?.timeStart ?? 0);
+          await this.swapToFrame(latest, true);
+        } finally {
+          this.syncing = false;
+        }
+      });
   }
 
   attachForGeneration(calculator: any, sliderVar = GIF_TIME_SLIDER): void {
-    // 仅在已绑定别的 calculator 时清理；calculator===null 时勿 detach，
-    // 否则 injectAbort 会被置 true 且后续注入全部被跳过。
     if (this.calculator && this.calculator !== calculator) {
       this.detach();
     }
@@ -88,17 +107,21 @@ export class GifWindowedPlaybackManager {
     this.followLatestDuringGeneration = true;
   }
 
-  /** 首帧注入 + 滑块绑定，立即返回 */
+  /** 首帧就绪后进入播放：绑定滑块并自动循环 */
   async transitionToPlayback(
     initialIndex = 0,
     options: GifPlaybackAttachOptions = {},
   ): Promise<void> {
     this.injectAbort = false;
     this.followLatestDuringGeneration = false;
+    await this.swapChain.catch(() => undefined);
     this.resetSliderToFrame(initialIndex);
     this.bindSliderObserver();
     await this.swapToFrame(initialIndex, true);
     options.onInjectProgress?.(1, this.archive.size);
+    if (options.autoplay !== false) {
+      this.startAutoplay();
+    }
   }
 
   attach(
@@ -118,10 +141,58 @@ export class GifWindowedPlaybackManager {
     this.bindSliderObserver();
     void this.swapToFrame(initialIndex, true).then(() => {
       options.onInjectProgress?.(1, this.archive.size);
+      if (options.autoplay !== false) {
+        this.startAutoplay();
+      }
     });
   }
 
+  startAutoplay(): void {
+    const frames = this.archive.getOrderedFrames();
+    if (!this.calculator || frames.length === 0) return;
+
+    const token = ++this.playToken;
+    this.playing = true;
+
+    const loop = async () => {
+      let i = Math.max(0, frames.findIndex(f => f.index === this.activeIndex));
+      if (i < 0) i = 0;
+
+      while (this.playing && token === this.playToken && !this.injectAbort && this.calculator) {
+        const live = this.archive.getOrderedFrames();
+        if (live.length === 0) break;
+        if (i >= live.length) i = 0;
+        const frame = live[i];
+
+        this.syncing = true;
+        try {
+          this.setSliderTime(frame.timeStart);
+          await this.swapToFrame(frame.index, true);
+        } finally {
+          this.syncing = false;
+        }
+
+        if (!this.playing || token !== this.playToken) break;
+
+        const holdMs = Math.max(
+          MIN_FRAME_HOLD_MS,
+          Math.round((frame.timeEnd - frame.timeStart) * 1000),
+        );
+        await sleep(holdMs);
+        i = (i + 1) % live.length;
+      }
+    };
+
+    void loop();
+  }
+
+  stopAutoplay(): void {
+    this.playing = false;
+    this.playToken += 1;
+  }
+
   detach(): void {
+    this.stopAutoplay();
     this.injectAbort = true;
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
@@ -133,6 +204,7 @@ export class GifWindowedPlaybackManager {
     this.activeIndex = -1;
     this.swapChain = Promise.resolve();
     this.followLatestDuringGeneration = true;
+    this.pendingPreviewIndex = null;
   }
 
   private unbindSliderObserver(): void {
@@ -155,6 +227,7 @@ export class GifWindowedPlaybackManager {
         this.sliderHelper = this.calculator.HelperExpression({ latex: this.sliderVar });
         this.sliderHelper.observe('numericValue', () => {
           if (this.syncing || this.followLatestDuringGeneration) return;
+          this.stopAutoplay();
           this.scheduleSwap();
         });
       } catch {
@@ -165,6 +238,7 @@ export class GifWindowedPlaybackManager {
     if (!this.sliderHelper && typeof this.calculator.observeEvent === 'function') {
       this.calculator.observeEvent('change', () => {
         if (this.syncing || this.followLatestDuringGeneration) return;
+        this.stopAutoplay();
         this.scheduleSwap();
       });
     }
@@ -214,6 +288,32 @@ export class GifWindowedPlaybackManager {
 
   private purgeAllGifFrameExpressions(): void {
     if (!this.calculator?.getState) return;
+
+    // 优先 setState 整表替换，比逐条 remove 快很多
+    if (typeof this.calculator.setState === 'function') {
+      try {
+        const state = this.calculator.getState();
+        const list = state?.expressions?.list ?? [];
+        const kept = list.filter((expr: any) => {
+          const id = String(expr?.id || '');
+          if (!id) return false;
+          if (id === 'gif_time_slider') return true;
+          return parseGifFrameIndexFromId(id) == null;
+        });
+        this.calculator.setState({
+          ...state,
+          expressions: {
+            ...state.expressions,
+            list: kept,
+          },
+        });
+        this.loadedFrames.clear();
+        return;
+      } catch {
+        /* fall through */
+      }
+    }
+
     for (const expr of this.calculator.getState()?.expressions?.list ?? []) {
       const id = String(expr?.id || '');
       if (parseGifFrameIndexFromId(id) == null) continue;
@@ -249,8 +349,7 @@ export class GifWindowedPlaybackManager {
     const ordered = this.archive.getOrderedFrames();
     const last = ordered[ordered.length - 1];
     const duration = last?.timeEnd ?? Math.max(time, 0.1);
-    updateGifStreamDuration(this.calculator, duration, this.sliderVar);
-    this.setSliderTime(time);
+    updateGifStreamDuration(this.calculator, duration, this.sliderVar, undefined, time);
   }
 
   private isFramePresentOnCalculator(frame: StoredGifFrame): boolean {
@@ -265,6 +364,47 @@ export class GifWindowedPlaybackManager {
 
   private async injectFrame(frame: StoredGifFrame): Promise<void> {
     if (!this.calculator || this.injectAbort) return;
+
+    // 整帧 setState 替换：换帧更快，自动播放更跟手
+    if (typeof this.calculator.setState === 'function' && typeof this.calculator.getState === 'function') {
+      try {
+        const state = this.calculator.getState();
+        const list = state?.expressions?.list ?? [];
+        const kept = list.filter((expr: any) => {
+          const id = String(expr?.id || '');
+          if (!id) return false;
+          if (id === 'gif_time_slider') return true;
+          return parseGifFrameIndexFromId(id) == null;
+        });
+        const expressions = frame.expressions.map(expr => {
+          const next = { ...expr };
+          const id = String(next.id || '');
+          if (/(?:^|_)dft_plot_\d+$/.test(id) || /(?:^|_)hd_plot_\d+$/.test(id)) {
+            next.parametricDomain = { min: '0', max: '2\\pi' };
+          }
+          if (/(?:^|_)fill_poly_\d+$/.test(id)) {
+            if (next.fill === undefined) next.fill = true;
+            if (next.fillOpacity === undefined) next.fillOpacity = 1;
+            if (next.lineOpacity === undefined) next.lineOpacity = 0;
+          }
+          return next;
+        });
+        this.calculator.setState({
+          ...state,
+          expressions: {
+            ...state.expressions,
+            list: [...kept, ...expressions],
+          },
+        });
+        this.loadedFrames.clear();
+        this.loadedFrames.set(frame.index, frame);
+        return;
+      } catch {
+        /* fall through to append path */
+      }
+    }
+
+    this.purgeAllGifFrameExpressions();
     const expressions = frame.expressions.map(expr => ({ ...expr }));
     await appendGifFrameToCalculator(this.calculator, expressions, {
       fastInject: true,
@@ -273,7 +413,7 @@ export class GifWindowedPlaybackManager {
     this.loadedFrames.set(frame.index, frame);
   }
 
-  /** 画板只保留一帧；切换时先清空再注入 */
+  /** 画板只保留一帧；切换时替换注入 */
   private async swapToFrame(index: number, force = false): Promise<void> {
     if (!this.calculator || this.archive.size === 0 || index < 0) return;
     const frame = this.archive.get(index);
@@ -283,14 +423,8 @@ export class GifWindowedPlaybackManager {
       return;
     }
 
-    this.syncing = true;
     this.activeIndex = index;
-    try {
-      this.purgeAllGifFrameExpressions();
-      await this.injectFrame(frame);
-    } finally {
-      this.syncing = false;
-    }
+    await this.injectFrame(frame);
   }
 }
 
@@ -319,9 +453,9 @@ export async function attachGifWindowedPlayback(
   }
   activeManager = manager;
   if (fromGeneration) {
-    await manager.transitionToPlayback(initialIndex, options);
+    await manager.transitionToPlayback(initialIndex, { autoplay: true, ...options });
   } else {
-    manager.attach(calculator, sliderVar, initialIndex, options);
+    manager.attach(calculator, sliderVar, initialIndex, { autoplay: true, ...options });
   }
 }
 

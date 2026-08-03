@@ -335,8 +335,8 @@ const buildGifResult = (
     partial,
     streamed,
     explanation: partial
-      ? `GIF ${tierLabel}部分完成（${completed}/${totalFrames} 帧，${durationLabel}s）。滑块 s 可播放已完成部分。`
-      : `GIF ${tierLabel}（${completed} 帧，${durationLabel}s）。按需换帧播放：生成完即可拖动 s，切换时加载对应帧。`,
+      ? `GIF ${tierLabel}部分完成（${completed}/${totalFrames} 帧，${durationLabel}s）。已自动循环播放已完成部分。`
+      : `GIF ${tierLabel}（${completed} 帧，${durationLabel}s，${fpsLabel}）。已自动循环播放；拖动滑块 s 可手动切换。`,
   };
 };
 

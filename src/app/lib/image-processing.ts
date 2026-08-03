@@ -2285,18 +2285,37 @@ export async function appendGifFrameToCalculator(
   return added;
 }
 
-/** 流式注入：更新部分完成时的滑块时长上限 */
+/** 流式注入：更新滑块时长上限（可保留当前时间，避免预览/播放被重置到 0） */
 export function updateGifStreamDuration(
   calculator: any,
   durationSec: number,
   sliderVar = 's',
   sliderStep = '0.01',
+  currentSec?: number,
 ): void {
   if (!calculator) return;
   const max = Math.max(0.1, Math.round(durationSec * 100) / 100);
+  let value = currentSec;
+  if (value == null || !Number.isFinite(value)) {
+    for (const item of calculator.getState?.()?.expressions?.list ?? []) {
+      if (item?.id !== 'gif_time_slider') continue;
+      const latex = String(item.latex ?? '');
+      const eq = latex.indexOf('=');
+      if (eq < 0) break;
+      const parsed = parseFloat(latex.slice(eq + 1));
+      if (Number.isFinite(parsed)) value = parsed;
+      break;
+    }
+  }
+  if (value == null || !Number.isFinite(value)) value = 0;
+  value = Math.max(0, Math.min(value, max));
+  const rounded = Math.round(value * 100) / 100;
+  const latexValue = Number.isInteger(rounded)
+    ? String(rounded)
+    : rounded.toFixed(2).replace(/\.?0+$/, '');
   calculator.setExpression(prepareFourierExpression({
     id: 'gif_time_slider',
-    latex: `${sliderVar}=0`,
+    latex: `${sliderVar}=${latexValue}`,
     sliderBounds: { min: '0', max: String(max), step: sliderStep },
     hidden: false,
   }));
