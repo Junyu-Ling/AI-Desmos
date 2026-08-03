@@ -107,7 +107,7 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
         tuning,
         aiContours,
         fillImageData,
-        maxFillPolygons: msg.maxFillPolygons ?? 720,
+        maxFillPolygons: msg.maxFillPolygons ?? 3200,
         varNamespace: msg.frameSlot,
         frameSlot: msg.frameSlot,
         frameSliderVar: GIF_TIME_SLIDER,

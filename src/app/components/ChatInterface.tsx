@@ -45,7 +45,7 @@ import React, { useState, useRef, useEffect } from 'react';
 // Pencil=铅笔  GraduationCap=学士帽（解题）  ChevronRight=右箭头  Lock=锁
 // Zap=闪电（试用）  ExternalLink=外部链接  ShieldCheck=盾牌+对勾（安全）
 // MousePointer2=鼠标指针（长手模式）  CloudOff=断网图标  RefreshCcw=刷新
-import { X, Send, Paperclip, Bot, User, Loader2, Trash2, Layers, HelpCircle, BookOpen, MessageSquareX, ScanEye, Share, Settings, Key, Globe, Pen, ImageIcon, Sigma, Eye, Upload, Lightbulb, Wrench, Pencil, GraduationCap, ChevronRight, Lock, Zap, ExternalLink, ShieldCheck, MousePointer2, CloudOff, RefreshCcw, Square, Check, Film } from 'lucide-react';
+import { X, Send, Paperclip, Bot, User, Loader2, Trash2, Layers, HelpCircle, BookOpen, MessageSquareX, ScanEye, Share, Settings, Key, Globe, Pen, ImageIcon, Sigma, Eye, Upload, Lightbulb, Wrench, Pencil, GraduationCap, ChevronRight, Lock, Zap, ExternalLink, ShieldCheck, MousePointer2, CloudOff, RefreshCcw, Square, Check, Film, Sparkles } from 'lucide-react';
 
 // 工具函数：Desmos 流式注入
 import { processDesmosStreamChunk, createDesmosInjectState } from '../lib/utils';
@@ -654,8 +654,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
   const [outlineStyle, setOutlineStyle] = useState<OutlineStyle>('mono');
 
   /** GIF 质量档位（标准 / 电影级） */
-  const gifQualityRef = useRef<GifQualityTier>('standard');
-  const [gifQualityTier, setGifQualityTier] = useState<GifQualityTier>('standard');
+  const gifQualityRef = useRef<GifQualityTier>('perfect');
+  const [gifQualityTier, setGifQualityTier] = useState<GifQualityTier>('perfect');
   const [drawModeSheetIsGif, setDrawModeSheetIsGif] = useState(false);
   const [showGifQualitySheet, setShowGifQualitySheet] = useState(false);
   const pendingGifFileRef = useRef<{ file: File; mode: SmartDrawMode; outlineStyle: OutlineStyle } | null>(null);
@@ -1041,8 +1041,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     setDrawModeSheetSubtitle(subtitle);
     setDrawModeSheetIsGif(isGif);
     if (isGif) {
-      setGifQualityTier('standard');
-      gifQualityRef.current = 'standard';
+      setGifQualityTier('perfect');
+      gifQualityRef.current = 'perfect';
     }
     setShowDrawModeSheet(true);
   };
@@ -1285,7 +1285,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
   const processGifFile = async (
     file: File,
     mode: SmartDrawMode = 'both',
-    quality: GifQualityTier = 'standard',
+    quality: GifQualityTier = 'perfect',
     outlineStyle: OutlineStyle = outlineStyleRef.current,
   ) => {
     const imageUrl = URL.createObjectURL(file);
@@ -2246,15 +2246,15 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
                         <p className="text-xs text-gray-500 mb-2" style={{ fontWeight: 600 }}>
                           {t('gif_quality_title')}
                         </p>
-                        <div className="grid grid-cols-2 gap-2">
+                        <div className="grid grid-cols-1 gap-2">
                           {([
                             {
-                              tier: 'standard' as const,
-                              label: t('gif_quality_standard'),
-                              desc: t('gif_quality_standard_desc'),
-                              icon: <Zap size={15} className="text-amber-600" />,
-                              cls: gifQualityTier === 'standard'
-                                ? 'ring-2 ring-amber-400 bg-amber-50'
+                              tier: 'perfect' as const,
+                              label: t('gif_quality_perfect'),
+                              desc: t('gif_quality_perfect_desc'),
+                              icon: <Sparkles size={15} className="text-rose-600" />,
+                              cls: gifQualityTier === 'perfect'
+                                ? 'ring-2 ring-rose-400 bg-rose-50'
                                 : 'bg-gray-50 hover:bg-gray-100',
                             },
                             {
@@ -2264,6 +2264,15 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
                               icon: <Film size={15} className="text-violet-600" />,
                               cls: gifQualityTier === 'cinema'
                                 ? 'ring-2 ring-violet-400 bg-violet-50'
+                                : 'bg-gray-50 hover:bg-gray-100',
+                            },
+                            {
+                              tier: 'standard' as const,
+                              label: t('gif_quality_standard'),
+                              desc: t('gif_quality_standard_desc'),
+                              icon: <Zap size={15} className="text-amber-600" />,
+                              cls: gifQualityTier === 'standard'
+                                ? 'ring-2 ring-amber-400 bg-amber-50'
                                 : 'bg-gray-50 hover:bg-gray-100',
                             },
                           ]).map(opt => (
@@ -2315,11 +2324,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
                     <div className="space-y-2">
                         {([
                             {
-                              tier: 'standard' as const,
-                              label: t('gif_quality_standard'),
-                              desc: t('gif_quality_standard_desc'),
-                              cls: 'bg-amber-50 hover:bg-amber-100 border border-amber-100',
-                              icon: <Zap size={16} className="text-amber-600" />,
+                              tier: 'perfect' as const,
+                              label: t('gif_quality_perfect'),
+                              desc: t('gif_quality_perfect_desc'),
+                              cls: 'bg-rose-50 hover:bg-rose-100 border border-rose-100',
+                              icon: <Sparkles size={16} className="text-rose-600" />,
                             },
                             {
                               tier: 'cinema' as const,
@@ -2327,6 +2336,13 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
                               desc: t('gif_quality_cinema_desc'),
                               cls: 'bg-violet-50 hover:bg-violet-100 border border-violet-100',
                               icon: <Film size={16} className="text-violet-600" />,
+                            },
+                            {
+                              tier: 'standard' as const,
+                              label: t('gif_quality_standard'),
+                              desc: t('gif_quality_standard_desc'),
+                              cls: 'bg-amber-50 hover:bg-amber-100 border border-amber-100',
+                              icon: <Zap size={16} className="text-amber-600" />,
                             },
                         ]).map(opt => (
                             <button

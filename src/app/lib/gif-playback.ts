@@ -168,6 +168,8 @@ export class GifWindowedPlaybackManager {
         try {
           this.setSliderTime(frame.timeStart);
           await this.swapToFrame(frame.index, true);
+          // 重帧后让出一帧，避免 Desmos/GPU 连续重绘烧干
+          await new Promise<void>(r => requestAnimationFrame(() => r()));
         } finally {
           this.syncing = false;
         }

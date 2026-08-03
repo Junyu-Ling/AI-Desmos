@@ -60,7 +60,7 @@ const releaseTimelineKeyframe = (kf: DecodedGifKeyframe) => {
 const isAbortError = (error: unknown) =>
   error instanceof DOMException && error.name === 'AbortError';
 
-/** 合并 AI tuning：只补默认值，不压低 AI/启发式给出的上限 */
+/** 合并 AI / 档位 tuning：高保真档强制保留细节 */
 const mergeGifTuning = (
   aiResult: { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] } | undefined,
   profile: GifQualityProfile,
@@ -69,16 +69,24 @@ const mergeGifTuning = (
     maxContours: profile.maxContours,
     fourierK: profile.fourierKCap,
     targetPointCount: profile.targetPointCountCap,
-    preserveFineDetails: false,
-    sharpenAmount: 0.55,
-    edgeThresholdFactor: 0.88,
-    strengthThresholdRatio: 0.22,
+    preserveFineDetails: profile.preserveFineDetails,
+    sharpenAmount: profile.sharpenAmount,
+    edgeThresholdFactor: profile.edgeThresholdFactor,
+    strengthThresholdRatio: profile.preserveFineDetails ? 0.16 : 0.22,
   };
   if (!aiResult) {
     return { tuning: defaults, contours: [] };
   }
   return {
-    tuning: { ...defaults, ...aiResult.tuning },
+    tuning: {
+      ...defaults,
+      ...aiResult.tuning,
+      // 档位上限优先：不允许 AI 把保真参数压低
+      maxContours: Math.max(defaults.maxContours ?? 0, aiResult.tuning.maxContours ?? 0),
+      fourierK: Math.max(defaults.fourierK ?? 0, aiResult.tuning.fourierK ?? 0),
+      targetPointCount: Math.max(defaults.targetPointCount ?? 0, aiResult.tuning.targetPointCount ?? 0),
+      preserveFineDetails: Boolean(defaults.preserveFineDetails || aiResult.tuning.preserveFineDetails),
+    },
     contours: aiResult.contours,
   };
 };
@@ -319,7 +327,11 @@ const buildGifResult = (
     ? scaledFrames[completed - 1].timeEndSec
     : timeline.durationSec;
 
-  const tierLabel = profile.tier === 'cinema' ? '电影级' : '标准';
+  const tierLabel = profile.tier === 'perfect'
+    ? '完美定格'
+    : profile.tier === 'cinema'
+      ? '电影级'
+      : '标准';
   const fpsLabel = `${profile.targetFps}fps`;
   const durationLabel = durationSec.toFixed(1);
 
@@ -336,7 +348,7 @@ const buildGifResult = (
     streamed,
     explanation: partial
       ? `GIF ${tierLabel}部分完成（${completed}/${totalFrames} 帧，${durationLabel}s）。已自动循环播放已完成部分。`
-      : `GIF ${tierLabel}（${completed} 帧，${durationLabel}s，${fpsLabel}）。已自动循环播放；拖动滑块 s 可手动切换。`,
+      : `GIF ${tierLabel}（${completed} 帧，${durationLabel}s，${fpsLabel}）。单帧最高还原 · 画板仅 1 帧护显卡 · 自动循环。`,
   };
 };
 
@@ -363,7 +375,7 @@ export async function processGifToDesmosAnimation(
   const mode = options.mode ?? 'both';
   const outlineStyle = options.outlineStyle ?? 'mono';
   const enableAi = options.enableAiRepair === true && mode === 'both';
-  const baseProfile = getGifQualityProfile(options.quality ?? 'standard');
+  const baseProfile = getGifQualityProfile(options.quality ?? 'perfect');
   const useStreaming = Boolean(
     options.calculator && options.streamToCalculator !== false,
   );
