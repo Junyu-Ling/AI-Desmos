@@ -1888,12 +1888,15 @@ const isSliderExpression = (expr: any): boolean => {
   return id === 'gif_time_slider' || id === 'gif_frame_slider';
 };
 
+const isFolderExpression = (expr: any): boolean =>
+  expr?.type === 'folder' || /^gif_folder_\d+$/.test(String(expr?.id || ''));
+
 const partitionExpressions = (expressions: any[]) => {
   const meta: any[] = [];
   const fills: any[] = [];
   const contours: any[] = [];
   for (const expr of expressions) {
-    if (isSliderExpression(expr)) meta.push(expr);
+    if (isSliderExpression(expr) || isFolderExpression(expr)) meta.push(expr);
     else if (isFillExpression(expr)) fills.push(expr);
     else contours.push(expr);
   }
@@ -1958,9 +1961,13 @@ export const getCalculatorExprIdSet = (calculator: any): Set<string> => {
 };
 
 /** 仅追加 id 尚未存在的表达式，避免 Desmos 同 id 覆盖上一行 */
-const pushExprBatchAppend = (calculator: any, chunk: any[]): number => {
+const pushExprBatchAppend = (
+  calculator: any,
+  chunk: any[],
+  knownIds?: Set<string>,
+): number => {
   if (!chunk.length) return 0;
-  const existing = getCalculatorExprIdSet(calculator);
+  const existing = knownIds ?? getCalculatorExprIdSet(calculator);
   const novel = chunk.filter(expr => {
     const id = String(expr?.id || '');
     return id && !existing.has(id);
@@ -2186,10 +2193,10 @@ export async function applyGifExpressionsToCalculator(
   return { committed: total, total, partial: false };
 }
 
-const GIF_STREAM_FILL_BATCH = 48;
-const GIF_STREAM_FILL_BATCH_FAST = 96;
-const GIF_STREAM_CONTOUR_BATCH = 24;
-const GIF_STREAM_CONTOUR_BATCH_FAST = 48;
+const GIF_STREAM_FILL_BATCH = 16;
+const GIF_STREAM_FILL_BATCH_FAST = 24;
+const GIF_STREAM_CONTOUR_BATCH = 8;
+const GIF_STREAM_CONTOUR_BATCH_FAST = 12;
 
 /** 流式注入：写入时间滑块（首次 setBlank） */
 export function initGifStreamCalculator(
@@ -2209,11 +2216,23 @@ export function initGifStreamCalculator(
   })]);
 }
 
-/** 流式/批量注入单帧：both 时填色在前（层叠置顶线条）；可选 outlineFirst 动画 */
+export type AppendGifFrameOptions = {
+  deferVisibility?: boolean;
+  fastInject?: boolean;
+  outlineFirst?: boolean;
+  appendOnly?: boolean;
+  /** 避免每批 getState；调用方维护已写入 id */
+  knownIds?: Set<string>;
+  folderId?: string;
+  folderTitle?: string;
+  folderHidden?: boolean;
+};
+
+/** 流式/批量注入单帧：小批次 + 让出主线程，避免列表一次性暴涨卡死 */
 export async function appendGifFrameToCalculator(
   calculator: any,
   frameExpressions: any[],
-  options?: { deferVisibility?: boolean; fastInject?: boolean; outlineFirst?: boolean; appendOnly?: boolean },
+  options?: AppendGifFrameOptions,
 ): Promise<number> {
   if (!calculator || frameExpressions.length === 0) return 0;
 
@@ -2221,66 +2240,95 @@ export async function appendGifFrameToCalculator(
   const fastInject = options?.fastInject ?? false;
   const outlineFirst = options?.outlineFirst ?? false;
   const appendOnly = options?.appendOnly ?? false;
+  const knownIds = options?.knownIds;
+  const folderId = options?.folderId;
+  const folderHidden = options?.folderHidden ?? false;
   const pushBatch = appendOnly
-    ? (batch: any[]) => pushExprBatchAppend(calculator, batch)
+    ? (batch: any[]) => pushExprBatchAppend(calculator, batch, knownIds)
     : (batch: any[]) => { pushExprBatch(calculator, batch); return batch.length; };
-  const prepareForStream = (expr: any, hidden = deferVisibility) => {
+  const stamp = (expr: any) => {
     const prepared = prepareFourierExpression(expr);
-    if (isSliderExpression(prepared)) return prepared;
+    if (folderId && !isSliderExpression(prepared) && !isFolderExpression(prepared)) {
+      prepared.folderId = folderId;
+      if (!isFillExpression(prepared) && !isOutlinePlotExpression(prepared)) {
+        prepared.secret = true;
+        prepared.hidden = true;
+      }
+    }
+    return prepared;
+  };
+  const prepareForStream = (expr: any, hidden = deferVisibility) => {
+    const prepared = stamp(expr);
+    if (isSliderExpression(prepared) || isFolderExpression(prepared)) return prepared;
     if (!hidden) return prepared;
     return { ...prepared, hidden: true };
   };
 
-  const { fills, contours } = partitionExpressions(frameExpressions);
   let added = 0;
   let batchTick = 0;
   const yieldAfterBatch = async () => {
-    if (fastInject) return;
     batchTick += 1;
-    if (batchTick % 4 === 0) await yieldToInteractive();
+    if (fastInject) {
+      if (batchTick % 2 === 0) await yieldQuick();
+      return;
+    }
+    if (batchTick % 3 === 0) await yieldToInteractive();
     else await yieldQuick();
   };
+
+  if (folderId) {
+    added += pushBatch([{
+      id: folderId,
+      type: 'folder',
+      title: options?.folderTitle || folderId,
+      collapsed: true,
+      hidden: folderHidden,
+      secret: false,
+    }]);
+    await yieldAfterBatch();
+  }
+
+  const { fills, contours } = partitionExpressions(frameExpressions);
   const fillBatch = fastInject ? GIF_STREAM_FILL_BATCH_FAST : GIF_STREAM_FILL_BATCH;
   const contourBatch = fastInject ? GIF_STREAM_CONTOUR_BATCH_FAST : GIF_STREAM_CONTOUR_BATCH;
   const bothMode = outlineFirst && !deferVisibility && fills.length > 0 && contours.length > 0;
-  const contourGroups = bothMode ? groupContourExpressions(contours.map(prepareFourierExpression)) : [];
+  const contourGroups = bothMode ? groupContourExpressions(contours.map(stamp)) : [];
 
   if (bothMode) {
     for (let i = 0; i < fills.length; i += fillBatch) {
-      const batch = fills.slice(i, i + fillBatch).map(toHiddenFillExpr);
-      pushBatch(batch);
-      added += batch.length;
-      if (!fastInject) await yieldAfterBatch();
+      const batch = fills.slice(i, i + fillBatch).map(e => stamp(toHiddenFillExpr(e)));
+      added += pushBatch(batch);
+      await yieldAfterBatch();
     }
     for (let i = 0; i < contourGroups.length; i += 1) {
-      pushBatch(contourGroups[i]);
-      added += contourGroups[i].length;
-      if (!fastInject) await yieldAfterBatch();
+      added += pushBatch(contourGroups[i]);
+      await yieldAfterBatch();
     }
     for (let i = 0; i < fills.length; i += fillBatch) {
-      const batch = fills.slice(i, i + GIF_STREAM_FILL_BATCH);
+      const batch = fills.slice(i, i + fillBatch).map(e => {
+        const next = stamp(e);
+        return folderId ? { ...next, hidden: folderHidden } : next;
+      });
       if (appendOnly) {
         pushVisibleFillBatchAppend(calculator, batch);
       } else {
         pushVisibleFillBatch(calculator, batch);
       }
-      if (!fastInject) await yieldAfterBatch();
+      await yieldAfterBatch();
     }
-    bringOutlinePlotsToFront(calculator, contours.map(prepareFourierExpression));
+    bringOutlinePlotsToFront(calculator, contours.map(stamp));
     return added;
   }
 
   for (let i = 0; i < fills.length; i += fillBatch) {
     const batch = fills.slice(i, i + fillBatch).map(e => prepareForStream(e));
-    pushBatch(batch);
-    added += batch.length;
-    if (!fastInject) await yieldAfterBatch();
+    added += pushBatch(batch);
+    await yieldAfterBatch();
   }
   for (let i = 0; i < contours.length; i += contourBatch) {
     const batch = contours.slice(i, i + contourBatch).map(e => prepareForStream(e));
-    pushBatch(batch);
-    added += batch.length;
-    if (!fastInject) await yieldAfterBatch();
+    added += pushBatch(batch);
+    await yieldAfterBatch();
   }
   return added;
 }
