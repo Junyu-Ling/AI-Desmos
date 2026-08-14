@@ -38,6 +38,8 @@ export type GifFrameWorkerInput = {
   skipFrameRestriction?: boolean;
   maxFillPolygons?: number;
   outlineStyle?: import('./smart-draw-repair').OutlineStyle;
+  fillDetailMode?: 'row' | 'merged' | 'cell';
+  compactFourier?: boolean;
 };
 
 export type GifFrameWorkerOutput = {
@@ -107,7 +109,7 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
         tuning,
         aiContours,
         fillImageData,
-        maxFillPolygons: msg.maxFillPolygons ?? 3200,
+        maxFillPolygons: msg.maxFillPolygons ?? 480,
         varNamespace: msg.frameSlot,
         frameSlot: msg.frameSlot,
         frameSliderVar: GIF_TIME_SLIDER,
@@ -117,7 +119,9 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
         gifIsLastFrame: msg.gifIsLastFrame,
         idPrefix: `gif_f${msg.frameSlot}_`,
         outlineStyle: msg.outlineStyle,
-        skipFrameRestriction: msg.skipFrameRestriction ?? false,
+        skipFrameRestriction: msg.skipFrameRestriction ?? true,
+        fillDetailMode: msg.fillDetailMode ?? 'merged',
+        compactFourier: msg.compactFourier ?? true,
       },
     );
 

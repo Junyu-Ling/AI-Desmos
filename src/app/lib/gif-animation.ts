@@ -440,7 +440,9 @@ export async function processGifToDesmosAnimation(
       useAiPrepare: mode === 'both' && enableAi,
       maxFillPolygons: profile.maxFillPolygons,
       outlineStyle,
-      skipFrameRestriction: false,
+      skipFrameRestriction: true,
+      fillDetailMode: 'merged',
+      compactFourier: true,
     };
   };
 
@@ -484,7 +486,9 @@ export async function processGifToDesmosAnimation(
         gifTimeEnd: sf.timeEndSec,
         gifIsLastFrame: sf.fi === frameCount - 1,
         idPrefix: `gif_f${frameSlot}_`,
-        skipFrameRestriction: false,
+        skipFrameRestriction: true,
+        fillDetailMode: 'merged',
+        compactFourier: true,
       },
     );
     return expressions;

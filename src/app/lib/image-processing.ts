@@ -1276,9 +1276,33 @@ const extractColorFillPolygons = (
   desmosScale: number,
   maxFillPolygons = MAX_FILL_POLYGONS,
   skipOutlineBlackFills = false,
-): FillPolygon[] => extractPerCellFillPolygons(
-  ctx, width, height, offsetX, offsetY, desmosScale, maxFillPolygons, skipOutlineBlackFills,
-);
+  detailMode: FillDetailMode = 'cell',
+): FillPolygon[] => {
+  if (detailMode === 'cell') {
+    return extractPerCellFillPolygons(
+      ctx, width, height, offsetX, offsetY, desmosScale, maxFillPolygons, skipOutlineBlackFills,
+    );
+  }
+
+  // 更密的采样网格再合并：边缘更齐，最终矩形更少
+  const gridMax = computeOptimalFillGrid(
+    width,
+    height,
+    Math.min(MAX_FILL_POLYGONS, Math.max(maxFillPolygons * 8, 1600)),
+  );
+  let polys = extractColorFillPolygonsAtGrid(
+    ctx, width, height, offsetX, offsetY, desmosScale, gridMax, detailMode,
+  );
+  polys = polys.filter(poly => {
+    if (skipOutlineBlackFills && isOutlineBlackFillHex(poly.color)) return false;
+    return true;
+  });
+  if (polys.length > maxFillPolygons) {
+    polys.sort((a, b) => b.area - a.area);
+    polys = polys.slice(0, maxFillPolygons);
+  }
+  return polys;
+};
 
 const extractColorFillPolygonsAtGrid = (
   ctx: CanvasRenderingContext2D,
@@ -1441,6 +1465,10 @@ export type ImageFourierOptions = {
   gifIsLastFrame?: boolean;
   /** 填色 polygon 数量上限（GIF 多帧时降低） */
   maxFillPolygons?: number;
+  /** cell=逐格（单图）；merged=同色矩形合并（GIF，行数少、观感接近） */
+  fillDetailMode?: 'row' | 'merged' | 'cell';
+  /** 轮廓压成 3 个列表 + 1 条曲线（少 2 行辅助函数） */
+  compactFourier?: boolean;
   /** 播放管理器控制可见性时，不在 latex 上附加时间限制 */
   skipFrameRestriction?: boolean;
 };
@@ -1507,6 +1535,7 @@ const generateFourierExpressions = (
     fillPolys = extractColorFillPolygons(
       fillCtx, width, height, offsetX, offsetY, desmosScale, options.maxFillPolygons,
       skipOutlineBlackFills,
+      options.fillDetailMode ?? 'cell',
     );
     fillPolys = fillPolys.filter(poly => !skipOutlineBlackFills || !isOutlineBlackFillHex(poly.color));
     fillPolys.sort((a, b) => {
@@ -1736,30 +1765,40 @@ const generateFourierExpressions = (
       ? sampleContourColorFromData(colorSampleData, width, height, processedPoints)
       : SMART_DRAW_OUTLINE_COLOR;
 
+    const plotLatex = options.compactFourier
+      ? restrictPlot(
+        `(\\operatorname{total}(${id_re}\\cos(${id_freq}t)-${id_im}\\sin(${id_freq}t)),\\operatorname{total}(${id_re}\\sin(${id_freq}t)+${id_im}\\cos(${id_freq}t)))`,
+      )
+      : restrictPlot(`(${func_X}(t), ${func_Y}(t))`);
+
     contourExpressions.push(
       { id: `${idPrefix}dft_freq_${index}`, latex: `${id_freq} = [${L_freq.join(',')}]`, hidden: true },
       { id: `${idPrefix}dft_real_${index}`, latex: `${id_re} = [${L_real.join(',')}]`, hidden: true },
       { id: `${idPrefix}dft_imag_${index}`, latex: `${id_im} = [${L_imag.join(',')}]`, hidden: true },
-      {
-        id: `${idPrefix}dft_x_${index}`,
-        latex: `${func_X}(t) = \\operatorname{total}(${id_re}\\cos(${id_freq}t) - ${id_im}\\sin(${id_freq}t))`,
-        hidden: true,
-      },
-      {
-        id: `${idPrefix}dft_y_${index}`,
-        latex: `${func_Y}(t) = \\operatorname{total}(${id_re}\\sin(${id_freq}t) + ${id_im}\\cos(${id_freq}t))`,
-        hidden: true,
-      },
-      {
-        id: `${idPrefix}dft_plot_${index}`,
-        latex: restrictPlot(`(${func_X}(t), ${func_Y}(t))`),
-        color: plotColor,
-        lineWidth: fillPolys.length > 0 ? 2 : 2.5,
-        lineOpacity: 1,
-        hidden: false,
-        parametricDomain: { min: "0", max: "2\\pi" },
-      },
     );
+    if (!options.compactFourier) {
+      contourExpressions.push(
+        {
+          id: `${idPrefix}dft_x_${index}`,
+          latex: `${func_X}(t) = \\operatorname{total}(${id_re}\\cos(${id_freq}t) - ${id_im}\\sin(${id_freq}t))`,
+          hidden: true,
+        },
+        {
+          id: `${idPrefix}dft_y_${index}`,
+          latex: `${func_Y}(t) = \\operatorname{total}(${id_re}\\sin(${id_freq}t) + ${id_im}\\cos(${id_freq}t))`,
+          hidden: true,
+        },
+      );
+    }
+    contourExpressions.push({
+      id: `${idPrefix}dft_plot_${index}`,
+      latex: plotLatex,
+      color: plotColor,
+      lineWidth: fillPolys.length > 0 ? 2 : 2.5,
+      lineOpacity: 1,
+      hidden: false,
+      parametricDomain: { min: "0", max: "2\\pi" },
+    });
   });
 
   // both：列表顺序填色→轮廓（层叠线条置顶）；渐进动画先勾线再填色见 applyFourierExpressionsProgressively

@@ -1,29 +1,25 @@
 /**
- * GIF 全帧滑块播放：
- * - 每一帧写入画板，收进折叠文件夹，辅助公式 secret（列表不暴涨）
- * - 同时只显示当前帧文件夹，拖动滑块 s 换帧（Desmos 不会同时画全部帧）
- * - 自动播放按帧时长推进 s；用户一拖滑块就停，不再抢控制权
+ * GIF 播放：归档全部帧，画板只挂当前 1 帧。
+ * 滑块 s 变了只在「换帧」时 setState，弱机器也能跟手。
  */
 import { GIF_TIME_SLIDER, GIF_SLIDER_STEP } from './gif-quality';
 import {
   GifFrameArchive,
+  parseGifFrameIndexFromId,
   type GifFrameVisibilitySet,
   type StoredGifFrame,
 } from './gif-frame-archive';
-import { appendGifFrameToCalculator, updateGifStreamDuration } from './image-processing';
+import { updateGifStreamDuration } from './image-processing';
 
 export type { GifFrameVisibilitySet } from './gif-frame-archive';
 export { classifyGifFrameExpressionIds } from './gif-frame-archive';
 
-const SLIDER_DEBOUNCE_MS = 30;
-const MIN_FRAME_HOLD_MS = 50;
+const SLIDER_DEBOUNCE_MS = 24;
 
 const formatSliderTime = (sec: number): string => {
   const rounded = Math.round(sec * 100) / 100;
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, '');
 };
-
-const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 export const gifFolderId = (frameIndex: number): string => `gif_folder_${frameIndex + 1}`;
 
@@ -33,21 +29,16 @@ export type GifPlaybackAttachOptions = {
 };
 
 export class GifWindowedPlaybackManager {
-  private loadedFrames = new Map<number, StoredGifFrame>();
-  private knownIds = new Set<string>(['gif_time_slider']);
   private calculator: any = null;
   private sliderVar = GIF_TIME_SLIDER;
   private sliderHelper: any = null;
   private followLatestDuringGeneration = true;
   private injectAbort = false;
-  private injectChain = Promise.resolve();
-  private playing = false;
-  private playToken = 0;
+  private swapChain = Promise.resolve();
   private syncingSlider = false;
   private lastSetTime = 0;
   private visibleIndex = -1;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
-  private durationDirty = 0;
   generating = false;
 
   constructor(private archive: GifFrameArchive) {}
@@ -69,62 +60,34 @@ export class GifWindowedPlaybackManager {
     return this.archive;
   }
 
-  /** 生成阶段：小批次写入该帧文件夹，只点亮最新帧 */
   onFrameArchived(index: number): void {
-    if (!this.calculator || this.injectAbort) return;
+    if (!this.calculator || this.injectAbort || !this.followLatestDuringGeneration) return;
     const frame = this.archive.get(index);
-    if (!frame || this.loadedFrames.has(index)) return;
+    if (!frame) return;
 
-    this.injectChain = this.injectChain
+    this.swapChain = this.swapChain
       .catch(() => undefined)
-      .then(async () => {
-        if (!this.calculator || this.injectAbort) return;
-        if (this.loadedFrames.has(index)) return;
-
-        const folderId = gifFolderId(index);
-        await appendGifFrameToCalculator(
+      .then(() => {
+        if (!this.calculator || this.injectAbort || !this.followLatestDuringGeneration) return;
+        updateGifStreamDuration(
           this.calculator,
-          frame.expressions.map(expr => ({ ...expr })),
-          {
-            appendOnly: true,
-            knownIds: this.knownIds,
-            folderId,
-            folderTitle: `帧 ${index + 1}`,
-            folderHidden: true,
-          },
+          frame.timeEnd,
+          this.sliderVar,
+          GIF_SLIDER_STEP,
+          frame.timeStart,
         );
-        this.loadedFrames.set(index, frame);
-        this.knownIds.add(folderId);
-
-        this.durationDirty += 1;
-        if (this.followLatestDuringGeneration && (this.durationDirty % 6 === 1 || index === 0)) {
-          updateGifStreamDuration(
-            this.calculator,
-            frame.timeEnd,
-            this.sliderVar,
-            GIF_SLIDER_STEP,
-            frame.timeStart,
-          );
-        }
-
-        if (this.followLatestDuringGeneration) {
-          this.setSliderTime(frame.timeStart);
-          this.showFolder(index);
-        }
+        this.setSliderTime(frame.timeStart);
+        this.putFrameOnCalculator(frame);
       });
   }
 
   attachForGeneration(calculator: any, sliderVar = GIF_TIME_SLIDER): void {
-    if (this.calculator && this.calculator !== calculator) {
-      this.detach();
-    }
+    if (this.calculator && this.calculator !== calculator) this.detach();
     this.injectAbort = false;
     this.calculator = calculator;
     this.sliderVar = sliderVar;
     this.followLatestDuringGeneration = true;
     this.generating = true;
-    this.durationDirty = 0;
-    this.knownIds = new Set(['gif_time_slider']);
   }
 
   async transitionToPlayback(
@@ -134,35 +97,11 @@ export class GifWindowedPlaybackManager {
     this.injectAbort = false;
     this.followLatestDuringGeneration = false;
     this.generating = false;
-    await this.injectChain.catch(() => undefined);
-
-    for (const frame of this.archive.getOrderedFrames()) {
-      if (this.loadedFrames.has(frame.index)) continue;
-      if (!this.calculator || this.injectAbort) break;
-      const folderId = gifFolderId(frame.index);
-      await appendGifFrameToCalculator(
-        this.calculator,
-        frame.expressions.map(expr => ({ ...expr })),
-        {
-          appendOnly: true,
-          knownIds: this.knownIds,
-          folderId,
-          folderHidden: true,
-        },
-      );
-      this.loadedFrames.set(frame.index, frame);
-      this.knownIds.add(folderId);
-      options.onInjectProgress?.(this.loadedFrames.size, this.archive.size);
-    }
-
-    options.onInjectProgress?.(this.archive.size, this.archive.size);
+    await this.swapChain.catch(() => undefined);
     this.resetSliderToFrame(initialIndex);
-    this.showFolder(initialIndex);
+    this.putFrameOnCalculator(this.archive.get(initialIndex));
     this.bindSliderObserver();
-
-    if (options.autoplay === true) {
-      this.startAutoplay();
-    }
+    options.onInjectProgress?.(1, Math.max(1, this.archive.size));
   }
 
   attach(
@@ -171,9 +110,7 @@ export class GifWindowedPlaybackManager {
     initialIndex = 0,
     options: GifPlaybackAttachOptions = {},
   ): void {
-    if (this.calculator && this.calculator !== calculator) {
-      this.detach();
-    }
+    if (this.calculator && this.calculator !== calculator) this.detach();
     this.injectAbort = false;
     this.calculator = calculator;
     this.sliderVar = sliderVar;
@@ -181,82 +118,22 @@ export class GifWindowedPlaybackManager {
     void this.transitionToPlayback(initialIndex, options);
   }
 
-  /** 刷新恢复：画板已有公式，只绑定滑块，不重新写入、不自动播放 */
   attachForRestore(calculator: any, sliderVar = GIF_TIME_SLIDER): void {
-    if (this.calculator && this.calculator !== calculator) {
-      this.detach();
-    }
+    if (this.calculator && this.calculator !== calculator) this.detach();
     this.injectAbort = false;
     this.calculator = calculator;
     this.sliderVar = sliderVar;
     this.followLatestDuringGeneration = false;
-    this.stopAutoplay();
-    for (const frame of this.archive.getOrderedFrames()) {
-      this.loadedFrames.set(frame.index, frame);
-      this.knownIds.add(gifFolderId(frame.index));
-    }
+    this.generating = false;
     this.bindSliderObserver();
-    const current = this.findFrameIndex(this.readSliderValue());
-    for (const frame of this.archive.getOrderedFrames()) {
-      if (frame.index === current) continue;
-      try {
-        this.calculator?.setExpression({
-          id: gifFolderId(frame.index),
-          type: 'folder',
-          hidden: true,
-          collapsed: true,
-        });
-      } catch {
-        /* ignore */
-      }
-    }
-    if (current >= 0) {
-      this.visibleIndex = -1;
-      this.showFolder(current);
-    }
+    const index = Math.max(0, this.findFrameIndex(this.readSliderValue()));
+    this.putFrameOnCalculator(this.archive.get(index));
   }
 
-  /** 按每帧真实时长推进 s；不每秒刷 60 次，避免卡死滑块 */
-  startAutoplay(): void {
-    const frames = this.archive.getOrderedFrames();
-    if (!this.calculator || frames.length === 0) return;
-
-    const token = ++this.playToken;
-    this.playing = true;
-
-    const loop = async () => {
-      let i = Math.max(0, frames.findIndex(f => f.index === this.visibleIndex));
-      if (i < 0) i = 0;
-
-      while (this.playing && token === this.playToken && !this.injectAbort && this.calculator) {
-        const live = this.archive.getOrderedFrames();
-        if (live.length === 0) break;
-        if (i >= live.length) i = 0;
-        const frame = live[i];
-
-        this.setSliderTime(frame.timeStart);
-        this.showFolder(frame.index);
-
-        const holdMs = Math.max(
-          MIN_FRAME_HOLD_MS,
-          Math.round((frame.timeEnd - frame.timeStart) * 1000),
-        );
-        await sleep(holdMs);
-        if (!this.playing || token !== this.playToken) break;
-        i = (i + 1) % live.length;
-      }
-    };
-
-    void loop();
-  }
-
-  stopAutoplay(): void {
-    this.playing = false;
-    this.playToken += 1;
-  }
+  startAutoplay(): void {}
+  stopAutoplay(): void {}
 
   detach(): void {
-    this.stopAutoplay();
     this.injectAbort = true;
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
@@ -264,9 +141,7 @@ export class GifWindowedPlaybackManager {
     }
     this.unbindSliderObserver();
     this.calculator = null;
-    this.loadedFrames.clear();
-    this.knownIds = new Set(['gif_time_slider']);
-    this.injectChain = Promise.resolve();
+    this.swapChain = Promise.resolve();
     this.followLatestDuringGeneration = true;
     this.generating = false;
     this.visibleIndex = -1;
@@ -274,11 +149,7 @@ export class GifWindowedPlaybackManager {
 
   private unbindSliderObserver(): void {
     if (this.sliderHelper?.unobserve) {
-      try {
-        this.sliderHelper.unobserve('numericValue');
-      } catch {
-        /* ignore */
-      }
+      try { this.sliderHelper.unobserve('numericValue'); } catch { /* ignore */ }
     }
     this.sliderHelper = null;
   }
@@ -286,32 +157,15 @@ export class GifWindowedPlaybackManager {
   private bindSliderObserver(): void {
     if (!this.calculator) return;
     this.unbindSliderObserver();
-
-    if (typeof this.calculator.HelperExpression === 'function') {
-      try {
-        this.sliderHelper = this.calculator.HelperExpression({ latex: this.sliderVar });
-        this.sliderHelper.observe('numericValue', () => {
-          if (this.followLatestDuringGeneration) return;
-          const value = this.sliderHelper?.numericValue;
-          if (this.syncingSlider) return;
-          if (Number.isFinite(value) && Math.abs(value - this.lastSetTime) < 0.015) return;
-          this.stopAutoplay();
-          this.scheduleShowFromSlider();
-        });
-        return;
-      } catch {
-        this.sliderHelper = null;
-      }
-    }
-
-    if (typeof this.calculator.observeEvent === 'function') {
-      this.calculator.observeEvent('change', () => {
+    if (typeof this.calculator.HelperExpression !== 'function') return;
+    try {
+      this.sliderHelper = this.calculator.HelperExpression({ latex: this.sliderVar });
+      this.sliderHelper.observe('numericValue', () => {
         if (this.syncingSlider || this.followLatestDuringGeneration) return;
-        const value = this.readSliderValue();
-        if (Math.abs(value - this.lastSetTime) < 0.015) return;
-        this.stopAutoplay();
         this.scheduleShowFromSlider();
       });
+    } catch {
+      this.sliderHelper = null;
     }
   }
 
@@ -320,7 +174,8 @@ export class GifWindowedPlaybackManager {
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
       const index = this.findFrameIndex(this.readSliderValue());
-      if (index >= 0) this.showFolder(index);
+      if (index < 0 || index === this.visibleIndex) return;
+      this.putFrameOnCalculator(this.archive.get(index));
     }, SLIDER_DEBOUNCE_MS);
   }
 
@@ -328,16 +183,7 @@ export class GifWindowedPlaybackManager {
     if (this.sliderHelper && Number.isFinite(this.sliderHelper.numericValue)) {
       return this.sliderHelper.numericValue;
     }
-    if (!this.calculator?.getState) return 0;
-    for (const item of this.calculator.getState()?.expressions?.list ?? []) {
-      if (item?.id !== 'gif_time_slider') continue;
-      const latex = String(item.latex ?? '');
-      const eq = latex.indexOf('=');
-      if (eq < 0) continue;
-      const value = parseFloat(latex.slice(eq + 1));
-      if (Number.isFinite(value)) return value;
-    }
-    return 0;
+    return this.lastSetTime;
   }
 
   private findFrameIndex(timeSec: number): number {
@@ -351,26 +197,26 @@ export class GifWindowedPlaybackManager {
     return frames[0].index;
   }
 
-  /** 定义域限制 + 文件夹 hidden：同时只画当前帧，滑块才跟手 */
-  private showFolder(index: number): void {
-    if (!this.calculator || index < 0) return;
-    const prev = this.visibleIndex;
-    if (index === prev) return;
-    this.visibleIndex = index;
+  /** 画板公式列表 = 滑块 + 当前帧（其它帧只在内存） */
+  private putFrameOnCalculator(frame?: StoredGifFrame): void {
+    if (!this.calculator || !frame || typeof this.calculator.getState !== 'function') return;
+    if (frame.index === this.visibleIndex) return;
+    this.visibleIndex = frame.index;
     try {
-      if (prev >= 0) {
-        this.calculator.setExpression({
-          id: gifFolderId(prev),
-          type: 'folder',
-          hidden: true,
-          collapsed: true,
-        });
-      }
-      this.calculator.setExpression({
-        id: gifFolderId(index),
-        type: 'folder',
-        hidden: false,
-        collapsed: true,
+      const state = this.calculator.getState();
+      const list = state?.expressions?.list ?? [];
+      const kept = list.filter((expr: any) => {
+        const id = String(expr?.id || '');
+        if (id === 'gif_time_slider') return true;
+        if (id.startsWith('gif_folder_')) return false;
+        return parseGifFrameIndexFromId(id) == null;
+      });
+      this.calculator.setState({
+        ...state,
+        expressions: {
+          ...state.expressions,
+          list: [...kept, ...frame.expressions],
+        },
       });
     } catch {
       /* ignore */
@@ -386,12 +232,8 @@ export class GifWindowedPlaybackManager {
         id: 'gif_time_slider',
         latex: `${this.sliderVar}=${formatSliderTime(timeSec)}`,
       });
-    } catch {
-      /* ignore */
-    }
-    window.setTimeout(() => {
-      this.syncingSlider = false;
-    }, 40);
+    } catch { /* ignore */ }
+    window.setTimeout(() => { this.syncingSlider = false; }, 30);
   }
 
   private resetSliderToFrame(frameIndex: number): void {
@@ -403,27 +245,24 @@ export class GifWindowedPlaybackManager {
     const duration = last?.timeEnd ?? Math.max(time, 0.1);
     this.syncingSlider = true;
     updateGifStreamDuration(this.calculator, duration, this.sliderVar, GIF_SLIDER_STEP, time);
-    requestAnimationFrame(() => {
-      this.syncingSlider = false;
-    });
+    this.lastSetTime = time;
+    window.setTimeout(() => { this.syncingSlider = false; }, 30);
   }
 }
+
+let activeManager: GifWindowedPlaybackManager | null = null;
 
 export async function migrateCalculatorToWindowedPlayback(
   calculator: any,
   archive: GifFrameArchive,
   sliderVar = GIF_TIME_SLIDER,
 ): Promise<GifWindowedPlaybackManager> {
-  if (activeManager) {
-    activeManager.detach();
-  }
+  if (activeManager) activeManager.detach();
   const manager = new GifWindowedPlaybackManager(archive);
   manager.attachForRestore(calculator, sliderVar);
   activeManager = manager;
   return manager;
 }
-
-let activeManager: GifWindowedPlaybackManager | null = null;
 
 export async function attachGifWindowedPlayback(
   calculator: any,
@@ -433,9 +272,7 @@ export async function attachGifWindowedPlayback(
   fromGeneration = false,
   options: GifPlaybackAttachOptions = {},
 ): Promise<void> {
-  if (activeManager && activeManager !== manager) {
-    activeManager.detach();
-  }
+  if (activeManager && activeManager !== manager) activeManager.detach();
   activeManager = manager;
   if (fromGeneration) {
     await manager.transitionToPlayback(initialIndex, { autoplay: false, ...options });
