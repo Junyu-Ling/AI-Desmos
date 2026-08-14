@@ -145,7 +145,9 @@ export class GifWorkerPool {
       this.run(input)
         .then(async exprs => {
           if (!exprs || exprs.length === 0) {
-            throw new Error('Worker returned no expressions');
+            results[i] = [];
+            notify();
+            return;
           }
           results[i] = exprs;
           notify();

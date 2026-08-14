@@ -100,30 +100,41 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
       ? new ImageData(msg.fillPixels, msg.width, msg.height)
       : new ImageData(new Uint8ClampedArray(msg.pixels), msg.width, msg.height);
 
-    const { expressions } = generateFourierExpressionsFromContext(
-      ctx as unknown as CanvasRenderingContext2D,
-      msg.width,
-      msg.height,
-      {
-        mode: msg.mode,
-        tuning,
-        aiContours,
-        fillImageData,
-        maxFillPolygons: msg.maxFillPolygons ?? 480,
-        varNamespace: msg.frameSlot,
-        frameSlot: msg.frameSlot,
-        frameSliderVar: GIF_TIME_SLIDER,
-        gifTimeBasedSlider: true,
-        gifTimeStart: msg.timeStartSec,
-        gifTimeEnd: msg.timeEndSec,
-        gifIsLastFrame: msg.gifIsLastFrame,
-        idPrefix: `gif_f${msg.frameSlot}_`,
-        outlineStyle: msg.outlineStyle,
-        skipFrameRestriction: msg.skipFrameRestriction ?? true,
-        fillDetailMode: msg.fillDetailMode ?? 'merged',
-        compactFourier: msg.compactFourier ?? true,
-      },
-    );
+    const baseOptions = {
+      mode: msg.mode,
+      tuning,
+      aiContours,
+      fillImageData,
+      maxFillPolygons: msg.maxFillPolygons ?? 480,
+      varNamespace: msg.frameSlot,
+      frameSlot: msg.frameSlot,
+      frameSliderVar: GIF_TIME_SLIDER,
+      gifTimeBasedSlider: true as const,
+      gifTimeStart: msg.timeStartSec,
+      gifTimeEnd: msg.timeEndSec,
+      gifIsLastFrame: msg.gifIsLastFrame,
+      idPrefix: `gif_f${msg.frameSlot}_`,
+      outlineStyle: msg.outlineStyle,
+      skipFrameRestriction: false,
+      compactFourier: true,
+    };
+
+    let expressions: any[] = [];
+    try {
+      expressions = generateFourierExpressionsFromContext(
+        ctx as unknown as CanvasRenderingContext2D,
+        msg.width,
+        msg.height,
+        { ...baseOptions, fillDetailMode: msg.fillDetailMode ?? 'merged' },
+      ).expressions;
+    } catch {
+      expressions = generateFourierExpressionsFromContext(
+        ctx as unknown as CanvasRenderingContext2D,
+        msg.width,
+        msg.height,
+        { ...baseOptions, fillDetailMode: 'cell', compactFourier: false },
+      ).expressions;
+    }
 
     self.postMessage({ taskId: msg.taskId, expressions } satisfies GifFrameWorkerOutput);
   } catch (err) {

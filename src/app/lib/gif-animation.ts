@@ -440,7 +440,7 @@ export async function processGifToDesmosAnimation(
       useAiPrepare: mode === 'both' && enableAi,
       maxFillPolygons: profile.maxFillPolygons,
       outlineStyle,
-      skipFrameRestriction: true,
+      skipFrameRestriction: false,
       fillDetailMode: 'merged',
       compactFourier: true,
     };
@@ -467,31 +467,36 @@ export async function processGifToDesmosAnimation(
       capped ?? null,
     );
     const frameSlot = sf.fi + 1;
-    const { expressions } = generateFourierExpressionsFromContext(
-      ctx,
-      sf.width,
-      sf.height,
-      {
-        mode,
-        tuning: prepared.tuning,
-        aiContours: prepared.aiContours,
-        fillImageData,
-        outlineStyle,
-        maxFillPolygons: profile.maxFillPolygons,
-        varNamespace: frameSlot,
-        frameSlot,
-        frameSliderVar: GIF_TIME_SLIDER,
-        gifTimeBasedSlider: true,
-        gifTimeStart: sf.timeStartSec,
-        gifTimeEnd: sf.timeEndSec,
-        gifIsLastFrame: sf.fi === frameCount - 1,
-        idPrefix: `gif_f${frameSlot}_`,
-        skipFrameRestriction: true,
-        fillDetailMode: 'merged',
-        compactFourier: true,
-      },
-    );
-    return expressions;
+    const baseOptions = {
+      mode,
+      tuning: prepared.tuning,
+      aiContours: prepared.aiContours,
+      fillImageData,
+      outlineStyle,
+      maxFillPolygons: profile.maxFillPolygons,
+      varNamespace: frameSlot,
+      frameSlot,
+      frameSliderVar: GIF_TIME_SLIDER,
+      gifTimeBasedSlider: true as const,
+      gifTimeStart: sf.timeStartSec,
+      gifTimeEnd: sf.timeEndSec,
+      gifIsLastFrame: sf.fi === frameCount - 1,
+      idPrefix: `gif_f${frameSlot}_`,
+      skipFrameRestriction: false,
+      compactFourier: true,
+    };
+    try {
+      return generateFourierExpressionsFromContext(ctx, sf.width, sf.height, {
+        ...baseOptions,
+        fillDetailMode: 'merged' as const,
+      }).expressions;
+    } catch {
+      return generateFourierExpressionsFromContext(ctx, sf.width, sf.height, {
+        ...baseOptions,
+        fillDetailMode: 'cell' as const,
+        compactFourier: false,
+      }).expressions;
+    }
   };
 
   const archiveFrame = (fi: number, expressions: any[]) => {
@@ -590,21 +595,20 @@ export async function processGifToDesmosAnimation(
           const globalIndex = chunkStart + localIdx;
           try {
             const expressions = generateFrameOnMainThread(sf, aiMap.get(sf.fi));
-            if (expressions.length === 0) continue;
             workerResults[localIdx] = expressions;
             if (frameStream) {
               frameStream.push(globalIndex, expressions);
-            } else {
+            } else if (expressions.length > 0) {
               frameExpressions[globalIndex] = expressions;
             }
             workerDone = Math.max(workerDone, globalIndex + 1);
             options.onProgress?.(workerDone, frameCount, 'worker');
             await yieldQuick();
           } catch (err) {
+            if (frameStream) frameStream.push(globalIndex, []);
             if (!isAbortError(err)) {
               console.warn(`[GIF] main-thread fallback failed for frame ${globalIndex}`, err);
             }
-            break;
           }
         }
       } else {
@@ -615,14 +619,21 @@ export async function processGifToDesmosAnimation(
             if (options.signal?.aborted) return;
             const sf = scaledChunk[localIdx];
             const globalIndex = chunkStart + localIdx;
-            const expressions = generateFrameOnMainThread(sf, aiMap.get(sf.fi));
-            if (frameStream) {
-              frameStream.push(globalIndex, expressions);
-            } else {
-              frameExpressions[globalIndex] = expressions;
+            try {
+              const expressions = generateFrameOnMainThread(sf, aiMap.get(sf.fi));
+              if (frameStream) {
+                frameStream.push(globalIndex, expressions);
+              } else {
+                frameExpressions[globalIndex] = expressions;
+              }
+              workerDone = Math.max(workerDone, globalIndex + 1);
+              options.onProgress?.(workerDone, frameCount, 'worker');
+            } catch (err) {
+              if (frameStream) frameStream.push(globalIndex, []);
+              if (!isAbortError(err)) {
+                console.warn(`[GIF] main-thread generate failed for frame ${globalIndex}`, err);
+              }
             }
-            workerDone = Math.max(workerDone, globalIndex + 1);
-            options.onProgress?.(workerDone, frameCount, 'worker');
             await yieldQuick();
           },
           () => Boolean(options.signal?.aborted),
@@ -648,10 +659,13 @@ export async function processGifToDesmosAnimation(
     pool?.terminate();
   }
 
+  if (frameArchive && frameArchive.size > 0) {
+    exprCompleted = Math.max(exprCompleted, frameArchive.size);
+  }
   if (exprCompleted === 0 && workerDone > 0) {
     exprCompleted = workerDone;
   }
-  if (exprCompleted === 0) {
+  if (exprCompleted === 0 || (frameArchive && frameArchive.size === 0 && !options.signal?.aborted)) {
     if (options.signal?.aborted) {
       throw new DOMException('Aborted', 'AbortError');
     }
