@@ -40,14 +40,35 @@ export function clearWorkspace(): void {
   }
 }
 
+const slimGifCalculatorState = (state: any): any => {
+  const list = state?.expressions?.list ?? [];
+  const kept = list.filter((expr: any) => {
+    const id = String(expr?.id || '');
+    if (!id) return false;
+    if (id === 'gif_time_slider') return true;
+    if (id.startsWith('gif_folder_')) return false;
+    return parseGifFrameIndexFromId(id) == null;
+  });
+  return {
+    ...state,
+    expressions: {
+      ...state.expressions,
+      list: kept,
+    },
+  };
+};
+
 export async function saveWorkspaceAsync(calculator: any): Promise<boolean> {
+  const manager = getActiveWindowedPlayback();
+  if (manager?.generating) return false;
   if (!calculator?.getState) return false;
 
   try {
     const manager = getActiveWindowedPlayback();
     const archive = manager?.getArchive();
+    const rawState = calculator.getState();
     const payload: PersistedWorkspace = {
-      calculatorState: calculator.getState(),
+      calculatorState: archive && archive.size > 0 ? slimGifCalculatorState(rawState) : rawState,
       savedAt: Date.now(),
     };
 

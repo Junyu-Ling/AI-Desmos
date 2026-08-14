@@ -64,6 +64,7 @@ import {
 // 图像处理：图片/Emoji → 傅里叶变换 → Desmos 表达式
 import { processImageToFourier, processEmojiToFourier, applyFourierExpressionsProgressively, type SmartDrawMode, type OutlineStyle } from '../lib/image-processing';
 import { processGifToDesmosAnimation, applyGifExpressionsToCalculator, detachGifPlayback, type GifQualityTier } from '../lib/gif-animation';
+import { getActiveWindowedPlayback } from '../lib/gif-playback';
 import {
   clearWorkspaceAsync,
   createDebouncedWorkspaceSaver,
@@ -246,6 +247,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     }
 
     const scheduleSave = () => {
+      if (getActiveWindowedPlayback()) return;
       saver.schedule(calculator);
     };
 

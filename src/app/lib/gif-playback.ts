@@ -47,6 +47,8 @@ export class GifWindowedPlaybackManager {
   private lastSetTime = 0;
   private visibleIndex = -1;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private durationDirty = 0;
+  generating = false;
 
   constructor(private archive: GifFrameArchive) {}
 
@@ -88,19 +90,22 @@ export class GifWindowedPlaybackManager {
             knownIds: this.knownIds,
             folderId,
             folderTitle: `帧 ${index + 1}`,
-            folderHidden: false,
+            folderHidden: true,
           },
         );
         this.loadedFrames.set(index, frame);
         this.knownIds.add(folderId);
 
-        updateGifStreamDuration(
-          this.calculator,
-          frame.timeEnd,
-          this.sliderVar,
-          GIF_SLIDER_STEP,
-          this.followLatestDuringGeneration ? frame.timeStart : undefined,
-        );
+        this.durationDirty += 1;
+        if (this.followLatestDuringGeneration && (this.durationDirty % 6 === 1 || index === 0)) {
+          updateGifStreamDuration(
+            this.calculator,
+            frame.timeEnd,
+            this.sliderVar,
+            GIF_SLIDER_STEP,
+            frame.timeStart,
+          );
+        }
 
         if (this.followLatestDuringGeneration) {
           this.setSliderTime(frame.timeStart);
@@ -117,6 +122,8 @@ export class GifWindowedPlaybackManager {
     this.calculator = calculator;
     this.sliderVar = sliderVar;
     this.followLatestDuringGeneration = true;
+    this.generating = true;
+    this.durationDirty = 0;
     this.knownIds = new Set(['gif_time_slider']);
   }
 
@@ -126,6 +133,7 @@ export class GifWindowedPlaybackManager {
   ): Promise<void> {
     this.injectAbort = false;
     this.followLatestDuringGeneration = false;
+    this.generating = false;
     await this.injectChain.catch(() => undefined);
 
     for (const frame of this.archive.getOrderedFrames()) {
@@ -139,8 +147,7 @@ export class GifWindowedPlaybackManager {
           appendOnly: true,
           knownIds: this.knownIds,
           folderId,
-          folderTitle: `帧 ${frame.index + 1}`,
-          folderHidden: false,
+          folderHidden: true,
         },
       );
       this.loadedFrames.set(frame.index, frame);
@@ -189,6 +196,24 @@ export class GifWindowedPlaybackManager {
       this.knownIds.add(gifFolderId(frame.index));
     }
     this.bindSliderObserver();
+    const current = this.findFrameIndex(this.readSliderValue());
+    for (const frame of this.archive.getOrderedFrames()) {
+      if (frame.index === current) continue;
+      try {
+        this.calculator?.setExpression({
+          id: gifFolderId(frame.index),
+          type: 'folder',
+          hidden: true,
+          collapsed: true,
+        });
+      } catch {
+        /* ignore */
+      }
+    }
+    if (current >= 0) {
+      this.visibleIndex = -1;
+      this.showFolder(current);
+    }
   }
 
   /** 按每帧真实时长推进 s；不每秒刷 60 次，避免卡死滑块 */
@@ -243,6 +268,7 @@ export class GifWindowedPlaybackManager {
     this.knownIds = new Set(['gif_time_slider']);
     this.injectChain = Promise.resolve();
     this.followLatestDuringGeneration = true;
+    this.generating = false;
     this.visibleIndex = -1;
   }
 
@@ -325,9 +351,30 @@ export class GifWindowedPlaybackManager {
     return frames[0].index;
   }
 
-  /** 定义域 {t0 ≤ s < t1} 负责显隐；不再靠隐藏文件夹，避免上一帧残留 */
+  /** 定义域限制 + 文件夹 hidden：同时只画当前帧，滑块才跟手 */
   private showFolder(index: number): void {
+    if (!this.calculator || index < 0) return;
+    const prev = this.visibleIndex;
+    if (index === prev) return;
     this.visibleIndex = index;
+    try {
+      if (prev >= 0) {
+        this.calculator.setExpression({
+          id: gifFolderId(prev),
+          type: 'folder',
+          hidden: true,
+          collapsed: true,
+        });
+      }
+      this.calculator.setExpression({
+        id: gifFolderId(index),
+        type: 'folder',
+        hidden: false,
+        collapsed: true,
+      });
+    } catch {
+      /* ignore */
+    }
   }
 
   private setSliderTime(timeSec: number): void {

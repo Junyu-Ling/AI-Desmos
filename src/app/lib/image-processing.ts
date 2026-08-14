@@ -2250,8 +2250,8 @@ export async function appendGifFrameToCalculator(
     const prepared = prepareFourierExpression(expr);
     if (folderId && !isSliderExpression(prepared) && !isFolderExpression(prepared)) {
       prepared.folderId = folderId;
+      prepared.secret = true;
       if (!isFillExpression(prepared) && !isOutlinePlotExpression(prepared)) {
-        prepared.secret = true;
         prepared.hidden = true;
       }
     }
@@ -2268,11 +2268,7 @@ export async function appendGifFrameToCalculator(
   let batchTick = 0;
   const yieldAfterBatch = async () => {
     batchTick += 1;
-    if (fastInject) {
-      if (batchTick % 2 === 0) await yieldQuick();
-      return;
-    }
-    if (batchTick % 3 === 0) await yieldToInteractive();
+    if (batchTick % 2 === 0) await yieldToInteractive();
     else await yieldQuick();
   };
 
