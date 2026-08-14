@@ -153,7 +153,7 @@ export class GifWindowedPlaybackManager {
     this.showFolder(initialIndex);
     this.bindSliderObserver();
 
-    if (options.autoplay !== false) {
+    if (options.autoplay === true) {
       this.startAutoplay();
     }
   }
@@ -172,6 +172,23 @@ export class GifWindowedPlaybackManager {
     this.sliderVar = sliderVar;
     this.followLatestDuringGeneration = false;
     void this.transitionToPlayback(initialIndex, options);
+  }
+
+  /** 刷新恢复：画板已有公式，只绑定滑块，不重新写入、不自动播放 */
+  attachForRestore(calculator: any, sliderVar = GIF_TIME_SLIDER): void {
+    if (this.calculator && this.calculator !== calculator) {
+      this.detach();
+    }
+    this.injectAbort = false;
+    this.calculator = calculator;
+    this.sliderVar = sliderVar;
+    this.followLatestDuringGeneration = false;
+    this.stopAutoplay();
+    for (const frame of this.archive.getOrderedFrames()) {
+      this.loadedFrames.set(frame.index, frame);
+      this.knownIds.add(gifFolderId(frame.index));
+    }
+    this.bindSliderObserver();
   }
 
   /** 按每帧真实时长推进 s；不每秒刷 60 次，避免卡死滑块 */
@@ -350,8 +367,12 @@ export async function migrateCalculatorToWindowedPlayback(
   archive: GifFrameArchive,
   sliderVar = GIF_TIME_SLIDER,
 ): Promise<GifWindowedPlaybackManager> {
+  if (activeManager) {
+    activeManager.detach();
+  }
   const manager = new GifWindowedPlaybackManager(archive);
-  manager.attach(calculator, sliderVar, 0);
+  manager.attachForRestore(calculator, sliderVar);
+  activeManager = manager;
   return manager;
 }
 
@@ -370,9 +391,9 @@ export async function attachGifWindowedPlayback(
   }
   activeManager = manager;
   if (fromGeneration) {
-    await manager.transitionToPlayback(initialIndex, { autoplay: true, ...options });
+    await manager.transitionToPlayback(initialIndex, { autoplay: false, ...options });
   } else {
-    manager.attach(calculator, sliderVar, initialIndex, { autoplay: true, ...options });
+    manager.attach(calculator, sliderVar, initialIndex, { autoplay: false, ...options });
   }
 }
 
