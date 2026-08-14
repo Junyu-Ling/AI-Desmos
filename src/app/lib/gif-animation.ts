@@ -438,7 +438,9 @@ export async function processGifToDesmosAnimation(
       timeEndSec: sf.timeEndSec,
       gifIsLastFrame: sf.fi === frameCount - 1,
       useAiPrepare: mode === 'both' && enableAi,
-      skipFrameRestriction: true,
+      maxFillPolygons: profile.maxFillPolygons,
+      outlineStyle,
+      skipFrameRestriction: false,
     };
   };
 
@@ -482,7 +484,7 @@ export async function processGifToDesmosAnimation(
         gifTimeEnd: sf.timeEndSec,
         gifIsLastFrame: sf.fi === frameCount - 1,
         idPrefix: `gif_f${frameSlot}_`,
-        skipFrameRestriction: true,
+        skipFrameRestriction: false,
       },
     );
     return expressions;

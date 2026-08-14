@@ -88,7 +88,7 @@ export class GifWindowedPlaybackManager {
             knownIds: this.knownIds,
             folderId,
             folderTitle: `帧 ${index + 1}`,
-            folderHidden: true,
+            folderHidden: false,
           },
         );
         this.loadedFrames.set(index, frame);
@@ -140,7 +140,7 @@ export class GifWindowedPlaybackManager {
           knownIds: this.knownIds,
           folderId,
           folderTitle: `帧 ${frame.index + 1}`,
-          folderHidden: true,
+          folderHidden: false,
         },
       );
       this.loadedFrames.set(frame.index, frame);
@@ -308,29 +308,9 @@ export class GifWindowedPlaybackManager {
     return frames[0].index;
   }
 
-  /** 只切换文件夹 hidden，一次 setExpression，滑块跟手 */
+  /** 定义域 {t0 ≤ s < t1} 负责显隐；不再靠隐藏文件夹，避免上一帧残留 */
   private showFolder(index: number): void {
-    if (!this.calculator || index < 0 || index === this.visibleIndex) return;
-    const prev = this.visibleIndex;
     this.visibleIndex = index;
-    try {
-      if (prev >= 0) {
-        this.calculator.setExpression({
-          id: gifFolderId(prev),
-          type: 'folder',
-          hidden: true,
-          collapsed: true,
-        });
-      }
-      this.calculator.setExpression({
-        id: gifFolderId(index),
-        type: 'folder',
-        hidden: false,
-        collapsed: true,
-      });
-    } catch {
-      /* ignore */
-    }
   }
 
   private setSliderTime(timeSec: number): void {

@@ -117,7 +117,7 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
         gifIsLastFrame: msg.gifIsLastFrame,
         idPrefix: `gif_f${msg.frameSlot}_`,
         outlineStyle: msg.outlineStyle,
-        skipFrameRestriction: msg.skipFrameRestriction ?? true,
+        skipFrameRestriction: msg.skipFrameRestriction ?? false,
       },
     );
 
