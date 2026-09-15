@@ -4,7 +4,17 @@
  */
 
 export const GIF_TIME_SLIDER = 's';
+/** 兜底步长；正常情况下按实际帧间隔计算（见 formatGifSliderStep） */
 export const GIF_SLIDER_STEP = '0.01';
+
+/**
+ * 滑块步长 = 一帧时长，拖一格正好换一帧。
+ * 固定 0.01 会让一帧横跨多格（拖动无反应）、且各帧格数不等（播放忽快忽慢）。
+ */
+export function formatGifSliderStep(frameIntervalSec: number): string {
+  const step = Math.max(0.001, Math.round(frameIntervalSec * 1000) / 1000);
+  return step.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+}
 
 export const GIF_PERFECT_MAX_DIM = 960;
 export const GIF_PERFECT_MAX_FILL = 480;

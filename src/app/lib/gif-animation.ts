@@ -29,6 +29,7 @@ import {
   getGifQualityProfile,
   GIF_TIME_SLIDER,
   GIF_SLIDER_STEP,
+  formatGifSliderStep,
   resolveGifWorkerCount,
   tuneGifProfileForAsset,
   type GifQualityTier,
@@ -156,15 +157,16 @@ class OrderedFrameStream {
 export function buildGifTimeSliderExpression(
   durationSec: number,
   sliderVar = GIF_TIME_SLIDER,
+  sliderStep = GIF_SLIDER_STEP,
 ): any {
-  const max = Math.max(0.1, Math.round(durationSec * 100) / 100);
+  const max = Math.max(0.001, Math.round(durationSec * 10000) / 10000);
   return {
     id: 'gif_time_slider',
     latex: `${sliderVar}=0`,
     sliderBounds: {
       min: '0',
       max: String(max),
-      step: GIF_SLIDER_STEP,
+      step: sliderStep,
     },
     hidden: false,
   };
@@ -301,7 +303,12 @@ const fetchBatchAiParallel = async (
 };
 
 const buildGifResult = (
-  timeline: { durationSec: number; keyframes: unknown[] },
+  timeline: {
+    durationSec: number;
+    keyframes: unknown[];
+    frameIntervalSec: number;
+    sliderMaxSec: number;
+  },
   scaledFrames: ScaledKeyframe[],
   frameExpressions: any[][],
   completedFrames: number,
@@ -327,6 +334,12 @@ const buildGifResult = (
     ? scaledFrames[completed - 1].timeEndSec
     : timeline.durationSec;
 
+  // 滑块上界取末帧刻度，拖到最右仍停在末帧（而不是越过末帧变空白）
+  const sliderStep = formatGifSliderStep(timeline.frameIntervalSec);
+  const sliderMax = partial && completed < totalFrames
+    ? scaledFrames[completed - 1].timeStartSec
+    : timeline.sliderMaxSec;
+
   const tierLabel = profile.tier === 'perfect'
     ? '完美定格'
     : profile.tier === 'cinema'
@@ -337,7 +350,7 @@ const buildGifResult = (
 
   return {
     expressions: streamed ? [] : [
-      buildGifTimeSliderExpression(durationSec),
+      buildGifTimeSliderExpression(sliderMax, GIF_TIME_SLIDER, sliderStep),
       ...frameExpressions.slice(0, completed).flat().filter(Boolean),
     ],
     frameCount: completed,
@@ -401,13 +414,16 @@ export async function processGifToDesmosAnimation(
   const needDataUrl = enableAi && mode === 'both';
   const workerCount = resolveGifWorkerCount(profile);
 
+  // 一格一帧：步长取实际帧间隔，滑块上界取末帧刻度
+  const sliderStep = formatGifSliderStep(timeline.frameIntervalSec);
+
   let streamInitialized = false;
   if (useStreaming) {
     initGifStreamCalculator(
       options.calculator,
-      timeline.durationSec,
+      timeline.sliderMaxSec,
       GIF_TIME_SLIDER,
-      GIF_SLIDER_STEP,
+      sliderStep,
     );
     streamInitialized = true;
   }
@@ -416,7 +432,7 @@ export async function processGifToDesmosAnimation(
 
   const ensureGenerationPlayback = () => {
     if (!playbackManager || !options.calculator || generationPlaybackReady) return;
-    playbackManager.attachForGeneration(options.calculator, GIF_TIME_SLIDER);
+    playbackManager.attachForGeneration(options.calculator, GIF_TIME_SLIDER, sliderStep);
     generationPlaybackReady = true;
   };
 
@@ -675,14 +691,15 @@ export async function processGifToDesmosAnimation(
   const partial = Boolean(options.signal?.aborted) || exprCompleted < frameCount;
 
   if (useStreaming && streamInitialized) {
-    const finalDuration = partial && exprCompleted > 0
-      ? timeline.keyframes[Math.min(exprCompleted - 1, frameCount - 1)].timeEndSec
-      : timeline.durationSec;
+    const finalMax = partial && exprCompleted > 0
+      ? timeline.keyframes[Math.min(exprCompleted - 1, frameCount - 1)].timeStartSec
+      : timeline.sliderMaxSec;
     updateGifStreamDuration(
       options.calculator,
-      finalDuration,
+      finalMax,
       GIF_TIME_SLIDER,
-      GIF_SLIDER_STEP,
+      sliderStep,
+      0,
     );
   }
 

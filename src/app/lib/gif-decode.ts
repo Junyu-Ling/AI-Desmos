@@ -29,6 +29,10 @@ export type DecodedGifTimeline = {
   height: number;
   durationSec: number;
   keyframes: DecodedGifKeyframe[];
+  /** 每帧固定时长（秒）；滑块步长取这个值，一格正好一帧 */
+  frameIntervalSec: number;
+  /** 滑块最大值 = 末帧刻度，保证拖到最右仍停在末帧 */
+  sliderMaxSec: number;
 };
 
 export type TimelineSampleOptions = {
@@ -44,6 +48,36 @@ export type TimelineSampleOptions = {
 
 const copyImageData = (src: ImageData): ImageData =>
   new ImageData(new Uint8ClampedArray(src.data), src.width, src.height);
+
+/** 时间一律对齐到 0.001 秒，避免浮点误差让帧区间错位 */
+const roundTimeSec = (sec: number): number => Math.round(sec * 1000) / 1000;
+
+/**
+ * 均匀化时间轴：原始 GIF 时间戳间隔不等，且不是滑块步长的整数倍，
+ * 会导致拖动时大量刻度停在同一帧、各帧停留时长忽长忽短。
+ * 这里重排成等距刻度，滑块步长取 frameIntervalSec，做到「一格一帧」。
+ */
+const applyUniformTimeline = (
+  keyframes: DecodedGifKeyframe[],
+  durationSec: number,
+): { frameIntervalSec: number; durationSec: number; sliderMaxSec: number } => {
+  const count = keyframes.length;
+  if (count === 0) {
+    return { frameIntervalSec: 0.05, durationSec, sliderMaxSec: 0 };
+  }
+
+  const interval = Math.max(0.02, roundTimeSec(durationSec / count));
+  keyframes.forEach((kf, i) => {
+    kf.timeStartSec = roundTimeSec(i * interval);
+    kf.timeEndSec = roundTimeSec((i + 1) * interval);
+  });
+
+  return {
+    frameIntervalSec: interval,
+    durationSec: roundTimeSec(count * interval),
+    sliderMaxSec: roundTimeSec((count - 1) * interval),
+  };
+};
 
 const blitPatch = (
   target: ImageData,
@@ -362,11 +396,15 @@ export async function decodeGifWithTimeline(
     }
   }
 
+  const uniform = applyUniformTimeline(keyframes, Math.max(durationSec, 0.1));
+
   return {
     width,
     height,
-    durationSec: Math.max(durationSec, 0.1),
+    durationSec: Math.max(uniform.durationSec, 0.1),
     keyframes,
+    frameIntervalSec: uniform.frameIntervalSec,
+    sliderMaxSec: uniform.sliderMaxSec,
   };
 }
 

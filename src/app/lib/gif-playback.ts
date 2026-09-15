@@ -2,7 +2,7 @@
  * GIF 全帧写入：每一帧公式都留在画板上（折叠文件夹），
  * 用定义域 {t0 ≤ s < t1} 换帧，上一帧不会叠成一团。
  */
-import { GIF_TIME_SLIDER, GIF_SLIDER_STEP } from './gif-quality';
+import { GIF_TIME_SLIDER, GIF_SLIDER_STEP, formatGifSliderStep } from './gif-quality';
 import {
   GifFrameArchive,
   type GifFrameVisibilitySet,
@@ -14,8 +14,9 @@ export type { GifFrameVisibilitySet } from './gif-frame-archive';
 export { classifyGifFrameExpressionIds } from './gif-frame-archive';
 
 const formatSliderTime = (sec: number): string => {
-  const rounded = Math.round(sec * 100) / 100;
-  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, '');
+  const rounded = Math.round(sec * 10000) / 10000;
+  if (Number.isInteger(rounded)) return String(rounded);
+  return rounded.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
 };
 
 export const gifFolderId = (frameIndex: number): string => `gif_folder_${frameIndex + 1}`;
@@ -30,6 +31,8 @@ export class GifWindowedPlaybackManager {
   private knownIds = new Set<string>(['gif_time_slider']);
   private calculator: any = null;
   private sliderVar = GIF_TIME_SLIDER;
+  /** 步长 = 一帧时长，拖一格换一帧 */
+  private sliderStep = GIF_SLIDER_STEP;
   private followLatestDuringGeneration = true;
   private injectAbort = false;
   private injectChain = Promise.resolve();
@@ -68,9 +71,9 @@ export class GifWindowedPlaybackManager {
         if (this.followLatestDuringGeneration) {
           updateGifStreamDuration(
             this.calculator,
-            frame.timeEnd,
+            frame.timeStart,
             this.sliderVar,
-            GIF_SLIDER_STEP,
+            this.sliderStep,
             frame.timeStart,
           );
           this.setSliderTime(frame.timeStart);
@@ -78,11 +81,16 @@ export class GifWindowedPlaybackManager {
       });
   }
 
-  attachForGeneration(calculator: any, sliderVar = GIF_TIME_SLIDER): void {
+  attachForGeneration(
+    calculator: any,
+    sliderVar = GIF_TIME_SLIDER,
+    sliderStep = GIF_SLIDER_STEP,
+  ): void {
     if (this.calculator && this.calculator !== calculator) this.detach();
     this.injectAbort = false;
     this.calculator = calculator;
     this.sliderVar = sliderVar;
+    this.sliderStep = sliderStep;
     this.followLatestDuringGeneration = true;
     this.generating = true;
     this.knownIds = new Set(['gif_time_slider']);
@@ -129,6 +137,7 @@ export class GifWindowedPlaybackManager {
     this.sliderVar = sliderVar;
     this.followLatestDuringGeneration = false;
     this.generating = false;
+    this.syncSliderStepFromArchive();
     for (const frame of this.archive.getOrderedFrames()) {
       this.loadedFrames.set(frame.index, frame);
       this.knownIds.add(gifFolderId(frame.index));
@@ -176,14 +185,23 @@ export class GifWindowedPlaybackManager {
     } catch { /* ignore */ }
   }
 
+  /** 归档里每帧跨度就是帧间隔，据此恢复「一格一帧」的步长 */
+  private syncSliderStepFromArchive(): void {
+    const ordered = this.archive.getOrderedFrames();
+    const sample = ordered.find(frame => frame.timeEnd > frame.timeStart);
+    if (!sample) return;
+    this.sliderStep = formatGifSliderStep(sample.timeEnd - sample.timeStart);
+  }
+
   private resetSliderToFrame(frameIndex: number): void {
     if (!this.calculator) return;
+    this.syncSliderStepFromArchive();
     const frame = this.archive.get(frameIndex);
     const time = frame?.timeStart ?? 0;
     const ordered = this.archive.getOrderedFrames();
     const last = ordered[ordered.length - 1];
-    const duration = last?.timeEnd ?? Math.max(time, 0.1);
-    updateGifStreamDuration(this.calculator, duration, this.sliderVar, GIF_SLIDER_STEP, time);
+    const sliderMax = last?.timeStart ?? Math.max(time, 0.1);
+    updateGifStreamDuration(this.calculator, sliderMax, this.sliderVar, this.sliderStep, time);
   }
 }
 

@@ -1330,9 +1330,11 @@ const extractColorFillPolygonsAtGrid = (
   return polys;
 };
 
+/** 帧间隔可能是 0.0335 这类值，必须留够小数位，否则区间会互相错位 */
 const formatDesmosTime = (sec: number): string => {
-  const rounded = Math.round(sec * 100) / 100;
-  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, '');
+  const rounded = Math.round(sec * 10000) / 10000;
+  if (Number.isInteger(rounded)) return String(rounded);
+  return rounded.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
 };
 
 const buildFrameVisibilityRestriction = (
@@ -1345,8 +1347,11 @@ const buildFrameVisibilityRestriction = (
   timeEndInclusive?: boolean,
 ): string => {
   if (timeBased && timeRange) {
-    const start = formatDesmosTime(timeRange.start);
-    const end = formatDesmosTime(timeRange.end);
+    // 区间以本帧刻度为中心（±半帧），滑块刻度落在区间正中，
+    // 浮点误差不会把某一格顶到相邻帧上，换帧节奏也就完全均匀。
+    const half = Math.max((timeRange.end - timeRange.start) / 2, 0.0005);
+    const start = formatDesmosTime(timeRange.start - half);
+    const end = formatDesmosTime(timeRange.start + half);
     const upperOp = timeEndInclusive ? '\\le' : '<';
     return `\\left\\{${start}\\le ${sliderVar}${upperOp}${end}\\right\\}`;
   }
@@ -2246,11 +2251,13 @@ export function initGifStreamCalculator(
 ): void {
   if (!calculator) return;
   calculator.setBlank();
-  const max = Math.max(0.1, Math.round(durationSec * 100) / 100);
+  const stepValue = parseFloat(sliderStep);
+  const minMax = Number.isFinite(stepValue) && stepValue > 0 ? stepValue : 0.001;
+  const max = Math.max(minMax, Math.round(durationSec * 10000) / 10000);
   pushExprBatch(calculator, [prepareFourierExpression({
     id: 'gif_time_slider',
     latex: `${sliderVar}=0`,
-    sliderBounds: { min: '0', max: String(max), step: sliderStep },
+    sliderBounds: { min: '0', max: formatDesmosTime(max), step: sliderStep },
     hidden: false,
   })]);
 }
@@ -2377,7 +2384,10 @@ export function updateGifStreamDuration(
   currentSec?: number,
 ): void {
   if (!calculator) return;
-  const max = Math.max(0.1, Math.round(durationSec * 100) / 100);
+  // 生成初期只有一两帧时上界可能小于步长，至少留一格，否则滑块范围非法
+  const stepValue = parseFloat(sliderStep);
+  const minMax = Number.isFinite(stepValue) && stepValue > 0 ? stepValue : 0.001;
+  const max = Math.max(minMax, Math.round(durationSec * 10000) / 10000);
   let value = currentSec;
   if (value == null || !Number.isFinite(value)) {
     for (const item of calculator.getState?.()?.expressions?.list ?? []) {
@@ -2392,14 +2402,10 @@ export function updateGifStreamDuration(
   }
   if (value == null || !Number.isFinite(value)) value = 0;
   value = Math.max(0, Math.min(value, max));
-  const rounded = Math.round(value * 100) / 100;
-  const latexValue = Number.isInteger(rounded)
-    ? String(rounded)
-    : rounded.toFixed(2).replace(/\.?0+$/, '');
   calculator.setExpression(prepareFourierExpression({
     id: 'gif_time_slider',
-    latex: `${sliderVar}=${latexValue}`,
-    sliderBounds: { min: '0', max: String(max), step: sliderStep },
+    latex: `${sliderVar}=${formatDesmosTime(value)}`,
+    sliderBounds: { min: '0', max: formatDesmosTime(max), step: sliderStep },
     hidden: false,
   }));
 }
