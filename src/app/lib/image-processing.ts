@@ -1337,7 +1337,8 @@ const formatDesmosTime = (sec: number): string => {
   return rounded.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
 };
 
-const buildFrameVisibilityRestriction = (
+/** 本帧可见条件（不含外层花括号），供「限制」与「门控」两种写法复用 */
+const buildFrameConditionLatex = (
   frameSlot: number,
   sliderVar: string,
   smooth: boolean,
@@ -1353,17 +1354,29 @@ const buildFrameVisibilityRestriction = (
     const start = formatDesmosTime(timeRange.start - half);
     const end = formatDesmosTime(timeRange.start + half);
     const upperOp = timeEndInclusive ? '\\le' : '<';
-    return `\\left\\{${start}\\le ${sliderVar}${upperOp}${end}\\right\\}`;
+    return `${start}\\le ${sliderVar}${upperOp}${end}`;
   }
   if (!smooth) {
-    return `\\left\\{${sliderVar}=${frameSlot}\\right\\}`;
+    return `${sliderVar}=${frameSlot}`;
   }
   const total = frameCount ?? frameSlot;
   if (frameSlot < total) {
-    return `\\left\\{${frameSlot}\\le ${sliderVar}<${frameSlot + 1}\\right\\}`;
+    return `${frameSlot}\\le ${sliderVar}<${frameSlot + 1}`;
   }
-  return `\\left\\{${frameSlot}\\le ${sliderVar}\\le ${frameSlot + 0.999}\\right\\}`;
+  return `${frameSlot}\\le ${sliderVar}\\le ${frameSlot + 0.999}`;
 };
+
+const buildFrameVisibilityRestriction = (
+  frameSlot: number,
+  sliderVar: string,
+  smooth: boolean,
+  frameCount?: number,
+  timeRange?: { start: number; end: number },
+  timeBased?: boolean,
+  timeEndInclusive?: boolean,
+): string => `\\left\\{${buildFrameConditionLatex(
+  frameSlot, sliderVar, smooth, frameCount, timeRange, timeBased, timeEndInclusive,
+)}\\right\\}`;
 
 const buildFillPolygonExpressions = (
   polys: FillPolygon[],
@@ -1515,21 +1528,28 @@ const generateFourierExpressions = (
   const idPrefix = options.idPrefix ?? (options.frameSlot ? `gif_f${options.frameSlot}_` : '');
   const frameSliderVar = options.frameSliderVar ?? 'f';
   const skipRestriction = options.skipFrameRestriction ?? false;
+  const frameVisibilityArgs = () => [
+    options.frameSlot!,
+    frameSliderVar,
+    options.gifSmoothSlider ?? false,
+    options.gifFrameCount,
+    options.gifTimeStart != null && options.gifTimeEnd != null
+      ? { start: options.gifTimeStart, end: options.gifTimeEnd }
+      : undefined,
+    options.gifTimeBasedSlider,
+    options.gifIsLastFrame,
+  ] as const;
+
   const restrictPlot = (latex: string) => (
     skipRestriction || options.frameSlot == null
       ? latex
-      : `${latex}${buildFrameVisibilityRestriction(
-        options.frameSlot,
-        frameSliderVar,
-        options.gifSmoothSlider ?? false,
-        options.gifFrameCount,
-        options.gifTimeStart != null && options.gifTimeEnd != null
-          ? { start: options.gifTimeStart, end: options.gifTimeEnd }
-          : undefined,
-        options.gifTimeBasedSlider,
-        options.gifIsLastFrame,
-      )}`
+      : `${latex}${buildFrameVisibilityRestriction(...frameVisibilityArgs())}`
   );
+
+  /** 折线门控：`{条件:1}`，条件不成立时为 undefined，乘上去即整条隐藏 */
+  const frameGateLatex = skipRestriction || options.frameSlot == null
+    ? null
+    : `\\left\\{${buildFrameConditionLatex(...frameVisibilityArgs())}:1\\right\\}`;
 
   let fillPolys: FillPolygon[] = [];
   let fillExpressions: any[] = [];
@@ -1750,60 +1770,74 @@ const generateFourierExpressions = (
     // ── 计算 DFT ──────────────────────────────────────────────────────────
     const coeffs = computeDFT(centeredPoints, K);
 
+    const index = idx;
+    const plotColor = colorSampleData
+      ? sampleContourColorFromData(colorSampleData, width, height, processedPoints)
+      : SMART_DRAW_OUTLINE_COLOR;
+
+    const lineWidth = fillPolys.length > 0 ? 2 : 2.5;
+
+    if (options.compactFourier) {
+      // GIF：级数在这里就展开成点列，Desmos 只连折线，重绘不再做三角函数。
+      // 点列直接内联，一条轮廓只占 1 行，也不会和单图的 X_n/Y_n 撞名。
+      const curve = sampleFourierCurvePoints(coeffs, resolveOutlineSampleCount(K));
+      const listX = `\\left[${curve.map(p => fmtDesmosNum(p.x)).join(',')}\\right]`;
+      const listY = `\\left[${curve.map(p => fmtDesmosNum(p.y)).join(',')}\\right]`;
+      // 用 {条件:1} 乘在坐标上做门控：条件不成立即 undefined，整条折线隐藏
+      const gate = frameGateLatex ? `\\cdot ${frameGateLatex}` : '';
+
+      contourExpressions.push({
+        id: `${idPrefix}dft_plot_${index}`,
+        latex: `\\left(${listX}${gate},${listY}${gate}\\right)`,
+        color: plotColor,
+        lines: true,
+        points: false,
+        lineWidth,
+        lineOpacity: 1,
+        hidden: false,
+      });
+      return;
+    }
+
     // 提取各频率的参数
     const L_freq = coeffs.map(c => c.freq);            // 频率列表：[0, 1, -1, 2, -2, ...]
     const L_real = coeffs.map(c => c.re.toFixed(5));   // 实部（保留5位小数，平衡精度和体积）
     const L_imag = coeffs.map(c => c.im.toFixed(5));   // 虚部
 
-    const index    = idx;
     // varNamespace = 帧序号（1-based）；第 1 帧从 F_0 起，第 2 帧从 F_64 起，互不冲突
-    const nameKey  = options.varNamespace !== undefined
+    const nameKey = options.varNamespace !== undefined
       ? (options.varNamespace - 1) * GIF_FOURIER_VAR_STRIDE + index
       : index;
-    const id_freq  = `F_{${nameKey}}`;
-    const id_re    = `R_{${nameKey}}`;
-    const id_im    = `I_{${nameKey}}`;
-    const func_X   = `X_{${nameKey}}`;
-    const func_Y   = `Y_{${nameKey}}`;
-
-    const plotColor = colorSampleData
-      ? sampleContourColorFromData(colorSampleData, width, height, processedPoints)
-      : SMART_DRAW_OUTLINE_COLOR;
-
-    const plotLatex = options.compactFourier
-      ? restrictPlot(
-        `(\\operatorname{total}(${id_re}\\cos(${id_freq}t)-${id_im}\\sin(${id_freq}t)),\\operatorname{total}(${id_re}\\sin(${id_freq}t)+${id_im}\\cos(${id_freq}t)))`,
-      )
-      : restrictPlot(`(${func_X}(t), ${func_Y}(t))`);
+    const id_freq = `F_{${nameKey}}`;
+    const id_re   = `R_{${nameKey}}`;
+    const id_im   = `I_{${nameKey}}`;
+    const func_X  = `X_{${nameKey}}`;
+    const func_Y  = `Y_{${nameKey}}`;
 
     contourExpressions.push(
       { id: `${idPrefix}dft_freq_${index}`, latex: `${id_freq} = [${L_freq.join(',')}]`, hidden: true },
       { id: `${idPrefix}dft_real_${index}`, latex: `${id_re} = [${L_real.join(',')}]`, hidden: true },
       { id: `${idPrefix}dft_imag_${index}`, latex: `${id_im} = [${L_imag.join(',')}]`, hidden: true },
+      {
+        id: `${idPrefix}dft_x_${index}`,
+        latex: `${func_X}(t) = \\operatorname{total}(${id_re}\\cos(${id_freq}t) - ${id_im}\\sin(${id_freq}t))`,
+        hidden: true,
+      },
+      {
+        id: `${idPrefix}dft_y_${index}`,
+        latex: `${func_Y}(t) = \\operatorname{total}(${id_re}\\sin(${id_freq}t) + ${id_im}\\cos(${id_freq}t))`,
+        hidden: true,
+      },
+      {
+        id: `${idPrefix}dft_plot_${index}`,
+        latex: restrictPlot(`(${func_X}(t), ${func_Y}(t))`),
+        color: plotColor,
+        lineWidth,
+        lineOpacity: 1,
+        hidden: false,
+        parametricDomain: { min: "0", max: "2\\pi" },
+      },
     );
-    if (!options.compactFourier) {
-      contourExpressions.push(
-        {
-          id: `${idPrefix}dft_x_${index}`,
-          latex: `${func_X}(t) = \\operatorname{total}(${id_re}\\cos(${id_freq}t) - ${id_im}\\sin(${id_freq}t))`,
-          hidden: true,
-        },
-        {
-          id: `${idPrefix}dft_y_${index}`,
-          latex: `${func_Y}(t) = \\operatorname{total}(${id_re}\\sin(${id_freq}t) + ${id_im}\\cos(${id_freq}t))`,
-          hidden: true,
-        },
-      );
-    }
-    contourExpressions.push({
-      id: `${idPrefix}dft_plot_${index}`,
-      latex: plotLatex,
-      color: plotColor,
-      lineWidth: fillPolys.length > 0 ? 2 : 2.5,
-      lineOpacity: 1,
-      hidden: false,
-      parametricDomain: { min: "0", max: "2\\pi" },
-    });
   });
 
   // both：列表顺序填色→轮廓（层叠线条置顶）；渐进动画先勾线再填色见 applyFourierExpressionsProgressively
@@ -1830,6 +1864,38 @@ const generateFourierExpressions = (
 
 /** 供 GIF 等多帧管线直接调用 */
 export const generateFourierExpressionsFromContext = generateFourierExpressions;
+
+/**
+ * 把傅里叶级数在生成阶段就算成点列。
+ *
+ * 参数曲线 (total(R cos Ft - I sin Ft), total(R sin Ft + I cos Ft)) 每次重绘
+ * 都要自适应采样上千个 t，每个 t 还要做 2K 次三角函数；GIF 每动一次滑块
+ * 全部帧的曲线都要重算，必然掉帧。折线只是一串定点，重绘几乎零成本。
+ */
+const sampleFourierCurvePoints = (
+  coeffs: { freq: number; re: number; im: number }[],
+  sampleCount: number,
+): Point[] => {
+  const pts: Point[] = [];
+  // i 取到 sampleCount（t=2π）与起点重合，闭合轮廓不留缺口
+  for (let i = 0; i <= sampleCount; i++) {
+    const t = (2 * Math.PI * i) / sampleCount;
+    let x = 0;
+    let y = 0;
+    for (const c of coeffs) {
+      const cos = Math.cos(c.freq * t);
+      const sin = Math.sin(c.freq * t);
+      x += c.re * cos - c.im * sin;
+      y += c.re * sin + c.im * cos;
+    }
+    pts.push({ x, y });
+  }
+  return pts;
+};
+
+/** K 个谐波用约 3K 个采样点即看不出折线感 */
+const resolveOutlineSampleCount = (K: number): number =>
+  Math.max(120, Math.min(300, K * 3));
 
 // ─── 公共导出函数 ─────────────────────────────────────────────────────────────
 
@@ -1869,7 +1935,9 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 const prepareFourierExpression = (expr: any): any => {
   const options = { ...expr };
   const id = String(expr.id || '');
-  if (/(?:^|_)dft_plot_\d+$/.test(id) || /(?:^|_)hd_plot_\d+$/.test(id)) {
+  // 折线轮廓（lines:true）不是参数曲线，不能带 parametricDomain
+  const isPolyline = expr?.lines === true;
+  if (!isPolyline && (/(?:^|_)dft_plot_\d+$/.test(id) || /(?:^|_)hd_plot_\d+$/.test(id))) {
     options.parametricDomain = { min: '0', max: '2\\pi' };
   }
   if (/(?:^|_)fill_poly_\d+$/.test(id)) {
