@@ -18,7 +18,12 @@ export function formatGifSliderStep(frameIntervalSec: number): string {
 
 export const GIF_PERFECT_MAX_DIM = 960;
 export const GIF_PERFECT_MAX_FILL = 480;
-export const GIF_PERFECT_MAX_CONTOURS = 22;
+/**
+ * 轮廓上限。轮廓改成预采样折线后每条只占 1 行（原先 4 行），
+ * 所以这里可以给得很宽——卡得太紧会让「手」这种排名临界的轮廓
+ * 在某些帧被砍掉、某些帧留下，看起来就是时有时无。
+ */
+export const GIF_PERFECT_MAX_CONTOURS = 48;
 export const GIF_PERFECT_FOURIER_K = 72;
 export const GIF_PERFECT_TARGET_POINTS = 280;
 
@@ -64,7 +69,7 @@ export const GIF_QUALITY_PROFILES: Record<GifQualityTier, GifQualityProfile> = {
     sceneChangeThreshold: 6,
     pipelineChunkSize: 10,
     maxFillPolygons: 260,
-    maxContours: 14,
+    maxContours: 24,
     fourierKCap: 56,
     targetPointCountCap: 220,
     preserveFineDetails: false,
@@ -86,7 +91,7 @@ export const GIF_QUALITY_PROFILES: Record<GifQualityTier, GifQualityProfile> = {
     sceneChangeThreshold: 4,
     pipelineChunkSize: 8,
     maxFillPolygons: 360,
-    maxContours: 18,
+    maxContours: 36,
     fourierKCap: 64,
     targetPointCountCap: 250,
     preserveFineDetails: true,
@@ -136,7 +141,6 @@ export function tuneGifProfileForAsset(
 
   if (mode === 'outline') {
     tuned.maxFillPolygons = 0;
-    tuned.maxContours = Math.min(tuned.maxContours, 24);
   } else if (mode === 'fill') {
     tuned.maxContours = Math.min(tuned.maxContours, 10);
   }

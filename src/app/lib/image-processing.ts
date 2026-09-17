@@ -1866,6 +1866,63 @@ const generateFourierExpressions = (
 export const generateFourierExpressionsFromContext = generateFourierExpressions;
 
 /**
+ * 匹配本模块生成的帧可见条件：
+ *   填色  `\left\{A\le s<B\right\}`
+ *   折线  `\left\{A\le s<B:1\right\}`
+ * 两种都由 buildFrameConditionLatex 产出，格式完全受控。
+ */
+const buildFrameConditionRegex = (sliderVar: string): RegExp => new RegExp(
+  `\\\\left\\\\\\{\\s*-?[\\d.]+\\s*\\\\le\\s*${sliderVar}\\s*(?:<|\\\\le)\\s*-?[\\d.]+\\s*(:1)?\\\\right\\\\\\}`,
+  'g',
+);
+
+/**
+ * 把某一帧的表达式改挂到另一个时间格上。
+ *
+ * 用途：某帧识别失败会没有任何表达式，那一格就是空白（看起来像丢帧、像卡顿）。
+ * 与其留空，不如把上一帧原样多停一格——观感是定格，而不是闪白。
+ */
+export function retimeGifFrameExpressions(
+  expressions: any[],
+  options: {
+    fromSlot: number;
+    toSlot: number;
+    timeStart: number;
+    timeEnd: number;
+    sliderVar?: string;
+    isLastFrame?: boolean;
+  },
+): any[] {
+  const sliderVar = options.sliderVar ?? 's';
+  const condition = buildFrameConditionLatex(
+    options.toSlot,
+    sliderVar,
+    false,
+    undefined,
+    { start: options.timeStart, end: options.timeEnd },
+    true,
+    options.isLastFrame,
+  );
+  const condRe = buildFrameConditionRegex(sliderVar);
+  const fromPrefix = `gif_f${options.fromSlot}_`;
+  const toPrefix = `gif_f${options.toSlot}_`;
+
+  return expressions.map(expr => {
+    const next = { ...expr };
+    if (typeof next.id === 'string' && next.id.startsWith(fromPrefix)) {
+      next.id = `${toPrefix}${next.id.slice(fromPrefix.length)}`;
+    }
+    if (typeof next.latex === 'string') {
+      next.latex = next.latex.replace(
+        condRe,
+        (_match, gate) => `\\left\\{${condition}${gate ?? ''}\\right\\}`,
+      );
+    }
+    return next;
+  });
+}
+
+/**
  * 把傅里叶级数在生成阶段就算成点列。
  *
  * 参数曲线 (total(R cos Ft - I sin Ft), total(R sin Ft + I cos Ft)) 每次重绘

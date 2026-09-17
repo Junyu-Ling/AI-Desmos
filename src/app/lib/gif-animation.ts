@@ -14,6 +14,7 @@ import {
 import {
   generateFourierExpressionsFromContext,
   initGifStreamCalculator,
+  retimeGifFrameExpressions,
   updateGifStreamDuration,
   yieldQuick,
   yieldToInteractive,
@@ -73,7 +74,9 @@ const mergeGifTuning = (
     preserveFineDetails: profile.preserveFineDetails,
     sharpenAmount: profile.sharpenAmount,
     edgeThresholdFactor: profile.edgeThresholdFactor,
-    strengthThresholdRatio: profile.preserveFineDetails ? 0.16 : 0.22,
+    // 门槛是相对本帧最强边缘算的，卡太高会让同一个部位（手、耳朵）
+    // 在动作模糊的帧掉出去、清晰的帧留下来，逐帧看就是忽有忽无
+    strengthThresholdRatio: profile.preserveFineDetails ? 0.10 : 0.18,
   };
   if (!aiResult) {
     return { tuning: defaults, contours: [] };
@@ -515,13 +518,44 @@ export async function processGifToDesmosAnimation(
     }
   };
 
-  const archiveFrame = (fi: number, expressions: any[]) => {
-    if (!frameArchive || expressions.length === 0) return;
+  /** 最近一帧成功的表达式，用于补空帧（宁可定格，也不要闪白） */
+  let lastGoodFrame: { slot: number; expressions: any[] } | null = null;
+  /** 开头就失败的帧：还没有可复用的帧，等结束后用首个成功帧回填 */
+  const framesAwaitingBackfill: number[] = [];
+
+  const commitFrame = (fi: number, expressions: any[]) => {
+    if (!frameArchive) return;
     const kf = timeline.keyframes[fi];
     if (!kf) return;
     frameArchive.add(fi, kf.timeStartSec, kf.timeEndSec, expressions);
     ensureGenerationPlayback();
     playbackManager?.onFrameArchived(fi);
+  };
+
+  const archiveFrame = (fi: number, expressions: any[]) => {
+    if (!frameArchive) return;
+    const kf = timeline.keyframes[fi];
+    if (!kf) return;
+
+    if (expressions.length > 0) {
+      lastGoodFrame = { slot: fi + 1, expressions };
+      commitFrame(fi, expressions);
+      return;
+    }
+
+    // 这一帧没识别出任何东西：沿用上一帧，避免时间轴上出现空白格
+    if (!lastGoodFrame) {
+      framesAwaitingBackfill.push(fi);
+      return;
+    }
+    commitFrame(fi, retimeGifFrameExpressions(lastGoodFrame.expressions, {
+      fromSlot: lastGoodFrame.slot,
+      toSlot: fi + 1,
+      timeStart: kf.timeStartSec,
+      timeEnd: kf.timeEndSec,
+      sliderVar: GIF_TIME_SLIDER,
+      isLastFrame: fi === frameCount - 1,
+    }));
   };
 
   const frameStream = useStreaming
@@ -673,6 +707,28 @@ export async function processGifToDesmosAnimation(
     }
   } finally {
     pool?.terminate();
+  }
+
+  // 开头几帧就失败时当时还没有可复用的帧，这里用首个成功帧回填，时间轴不留空格
+  if (frameArchive && framesAwaitingBackfill.length > 0) {
+    const firstGood = frameArchive.getOrderedFrames()[0];
+    if (firstGood) {
+      for (const fi of framesAwaitingBackfill) {
+        const kf = timeline.keyframes[fi];
+        if (!kf || frameArchive.has(fi)) continue;
+        frameArchive.add(fi, kf.timeStartSec, kf.timeEndSec, retimeGifFrameExpressions(
+          firstGood.expressions,
+          {
+            fromSlot: firstGood.index + 1,
+            toSlot: fi + 1,
+            timeStart: kf.timeStartSec,
+            timeEnd: kf.timeEndSec,
+            sliderVar: GIF_TIME_SLIDER,
+            isLastFrame: fi === frameCount - 1,
+          },
+        ));
+      }
+    }
   }
 
   if (frameArchive && frameArchive.size > 0) {
