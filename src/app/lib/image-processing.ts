@@ -1781,8 +1781,10 @@ const generateFourierExpressions = (
       // GIF：级数在这里就展开成点列，Desmos 只连折线，重绘不再做三角函数。
       // 点列直接内联，一条轮廓只占 1 行，也不会和单图的 X_n/Y_n 撞名。
       const curve = sampleFourierCurvePoints(coeffs, resolveOutlineSampleCount(K));
-      const listX = `\\left[${curve.map(p => fmtDesmosNum(p.x)).join(',')}\\right]`;
-      const listY = `\\left[${curve.map(p => fmtDesmosNum(p.y)).join(',')}\\right]`;
+      const xs = curve.map(p => fmtDesmosNum(p.x));
+      const ys = curve.map(p => fmtDesmosNum(p.y));
+      const listX = `\\left[${xs.join(',')}\\right]`;
+      const listY = `\\left[${ys.join(',')}\\right]`;
       // 用 {条件:1} 乘在坐标上做门控：条件不成立即 undefined，整条折线隐藏
       const gate = frameGateLatex ? `\\cdot ${frameGateLatex}` : '';
 
@@ -1795,6 +1797,9 @@ const generateFourierExpressions = (
         lineWidth,
         lineOpacity: 1,
         hidden: false,
+        // 播放阶段会把所有帧的点列拼成扁平列表、只切当前帧那一段，
+        // 这里留下原始点列，省得再去反解 latex。注入 Desmos 前会剥掉。
+        gifOutline: { x: xs, y: ys },
       });
       return;
     }
@@ -1950,9 +1955,13 @@ const sampleFourierCurvePoints = (
   return pts;
 };
 
-/** K 个谐波用约 3K 个采样点即看不出折线感 */
+/**
+ * K 个谐波用约 3K 个采样点即看不出折线感。
+ * 上限 200：表情包尺寸下再密也看不出差别，而播放开销与点数成正比
+ * （轮廓拉满 48 条时，300 点 17fps、200 点 20fps）。
+ */
 const resolveOutlineSampleCount = (K: number): number =>
-  Math.max(120, Math.min(300, K * 3));
+  Math.max(120, Math.min(200, K * 3));
 
 // ─── 公共导出函数 ─────────────────────────────────────────────────────────────
 
@@ -1992,6 +2001,8 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 const prepareFourierExpression = (expr: any): any => {
   const options = { ...expr };
   const id = String(expr.id || '');
+  // 自带的点列元数据只在生成/合并阶段用，Desmos 不认识
+  delete options.gifOutline;
   // 折线轮廓（lines:true）不是参数曲线，不能带 parametricDomain
   const isPolyline = expr?.lines === true;
   if (!isPolyline && (/(?:^|_)dft_plot_\d+$/.test(id) || /(?:^|_)hd_plot_\d+$/.test(id))) {
@@ -2010,7 +2021,8 @@ const isFillExpression = (expr: any): boolean =>
 
 const isOutlinePlotExpression = (expr: any): boolean =>
   /(?:^|_)dft_plot_\d+$/.test(String(expr?.id || ''))
-  || /(?:^|_)hd_plot_\d+$/.test(String(expr?.id || ''));
+  || /(?:^|_)hd_plot_\d+$/.test(String(expr?.id || ''))
+  || /^gif_flat_plot_\d+$/.test(String(expr?.id || ''));
 
 const toHiddenFillExpr = (expr: any) => ({
   ...prepareFourierExpression(expr),
