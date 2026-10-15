@@ -164,6 +164,8 @@ const findNearestFrameIndex = (frameTimesSec: number[], sec: number): number => 
 
 /** 均匀采样帧索引，保留首尾 */
 export function sampleFrameIndices(total: number, maxFrames: number): number[] {
+  if (total <= 0 || maxFrames <= 0) return [];
+  if (maxFrames === 1) return [0];
   if (total <= maxFrames) {
     return Array.from({ length: total }, (_, i) => i);
   }
@@ -406,6 +408,44 @@ export async function decodeGifWithTimeline(
     frameIntervalSec: uniform.frameIntervalSec,
     sliderMaxSec: uniform.sliderMaxSec,
   };
+}
+
+/**
+ * 只取 GIF / 表情包第一帧，导出为静态 PNG（走普通图片拟合管线）。
+ * 独立合成首帧，不走 sampleFrameIndices（避免 maxFrames=1 时的除零问题）。
+ */
+export async function extractGifFirstFrameAsPngFile(file: File): Promise<File> {
+  await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+  const buffer = new Uint8Array(await file.arrayBuffer());
+  const gif = parseGIF(buffer);
+  const rawFrames = decompressFrames(gif, true);
+  if (!rawFrames.length) throw new Error('GIF has no frames');
+
+  const width = gif.lsd.width;
+  const height = gif.lsd.height;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('GIF canvas unavailable');
+
+  // 白底合成：透明贴纸不会整图空白
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, width, height);
+  const composite = ctx.getImageData(0, 0, width, height);
+  blitPatch(composite, rawFrames[0].patch, rawFrames[0].dims, width);
+  ctx.putImageData(composite, 0, 0);
+
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (b) => (b ? resolve(b) : reject(new Error('PNG export failed'))),
+      'image/png',
+    );
+  });
+
+  const base = file.name.replace(/\.gif$/i, '') || 'gif-frame';
+  return new File([blob], `${base}-frame1.png`, { type: 'image/png' });
 }
 
 /** 解码 GIF 为完整合成帧序列（仅保留采样帧，减少内存） */

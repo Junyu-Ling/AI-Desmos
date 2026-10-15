@@ -464,6 +464,7 @@ const buildGifResult = (
 export type ProcessGifOptions = {
   mode?: SmartDrawMode;
   outlineStyle?: import('./smart-draw-repair').OutlineStyle;
+  fitMethod?: import('./smart-draw-repair').OutlineFitMethod;
   apiKey?: string;
   enableAiRepair?: boolean;
   quality?: GifQualityTier;
@@ -485,6 +486,7 @@ export async function processGifToDesmosAnimation(
   const outlineStyle = mode === 'both'
     ? 'mono'
     : (options.outlineStyle ?? 'color');
+  const fitMethod = options.fitMethod === 'bezier' ? 'bezier' : 'fourier';
   const enableAi = options.enableAiRepair === true && mode === 'both';
   const baseProfile = getGifQualityProfile(options.quality ?? 'perfect');
   const useStreaming = Boolean(
@@ -565,6 +567,7 @@ export async function processGifToDesmosAnimation(
       useAiPrepare: mode === 'both' && enableAi,
       maxFillPolygons: profile.maxFillPolygons,
       outlineStyle,
+      fitMethod,
       skipFrameRestriction: false,
       fillDetailMode: 'merged',
       compactFourier: true,
@@ -600,6 +603,7 @@ export async function processGifToDesmosAnimation(
       aiContours: prepared.aiContours,
       fillImageData,
       outlineStyle,
+      fitMethod,
       maxFillPolygons: profile.maxFillPolygons,
       varNamespace: frameSlot,
       frameSlot,

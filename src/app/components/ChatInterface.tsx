@@ -45,7 +45,7 @@ import React, { useState, useRef, useEffect } from 'react';
 // Pencil=铅笔  GraduationCap=学士帽（解题）  ChevronRight=右箭头  Lock=锁
 // Zap=闪电（试用）  ExternalLink=外部链接  ShieldCheck=盾牌+对勾（安全）
 // MousePointer2=鼠标指针（长手模式）  CloudOff=断网图标  RefreshCcw=刷新
-import { X, Send, Paperclip, Bot, User, Loader2, Trash2, Layers, HelpCircle, BookOpen, MessageSquareX, ScanEye, Share, Settings, Key, Globe, Pen, ImageIcon, Sigma, Eye, Upload, Lightbulb, Wrench, Pencil, GraduationCap, ChevronRight, Lock, Zap, ExternalLink, ShieldCheck, MousePointer2, CloudOff, RefreshCcw, Square, Check, Film, Sparkles } from 'lucide-react';
+import { X, Send, Paperclip, Bot, User, Loader2, Trash2, Layers, HelpCircle, BookOpen, MessageSquareX, ScanEye, Share, Settings, Key, Globe, Pen, ImageIcon, Sigma, Eye, Upload, Lightbulb, Wrench, Pencil, GraduationCap, ChevronRight, Lock, Zap, ExternalLink, ShieldCheck, MousePointer2, CloudOff, RefreshCcw, Square, Check } from 'lucide-react';
 
 // 工具函数：Desmos 流式注入
 import { processDesmosStreamChunk, createDesmosInjectState } from '../lib/utils';
@@ -63,8 +63,9 @@ import {
 } from '../lib/deepseek';
 
 // 图像处理：图片/Emoji → 傅里叶变换 → Desmos 表达式
-import { processImageToFourier, processEmojiToFourier, applyFourierExpressionsProgressively, type SmartDrawMode, type OutlineStyle } from '../lib/image-processing';
-import { processGifToDesmosAnimation, applyGifExpressionsToCalculator, detachGifPlayback, type GifQualityTier } from '../lib/gif-animation';
+import { processImageToFourier, processEmojiToFourier, applyFourierExpressionsProgressively, type SmartDrawMode, type OutlineStyle, type OutlineFitMethod } from '../lib/image-processing';
+import { detachGifPlayback } from '../lib/gif-animation';
+import { extractGifFirstFrameAsPngFile } from '../lib/gif-decode';
 import { getActiveWindowedPlayback } from '../lib/gif-playback';
 import {
   clearWorkspaceAsync,
@@ -681,13 +682,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
   const drawModeRef = useRef<SmartDrawMode>('both');
   const outlineStyleRef = useRef<OutlineStyle>('color');
   const [outlineStyle, setOutlineStyle] = useState<OutlineStyle>('color');
-
-  /** GIF 质量档位（标准 / 电影级） */
-  const gifQualityRef = useRef<GifQualityTier>('perfect');
-  const [gifQualityTier, setGifQualityTier] = useState<GifQualityTier>('perfect');
-  const [drawModeSheetIsGif, setDrawModeSheetIsGif] = useState(false);
-  const [showGifQualitySheet, setShowGifQualitySheet] = useState(false);
-  const pendingGifFileRef = useRef<{ file: File; mode: SmartDrawMode; outlineStyle: OutlineStyle } | null>(null);
+  const fitMethodRef = useRef<OutlineFitMethod>('bezier');
+  const [fitMethod, setFitMethod] = useState<OutlineFitMethod>('bezier');
 
   /** solveFileRef — 解题模式的隐藏文件选择器的引用 */
   const solveFileRef = useRef<HTMLInputElement>(null);
@@ -1044,6 +1040,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
 
     const result = await processEmojiToFourier(emoji, {
       mode,
+      fitMethod: fitMethodRef.current,
       outlineStyle: outlineStyleRef.current,
       apiKey: customApiKey,
       enableAiRepair: false,
@@ -1070,13 +1067,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     ));
   };
 
-  const openDrawModeSheet = (subtitle: string | null, isGif = false) => {
+  const openDrawModeSheet = (subtitle: string | null) => {
     setDrawModeSheetSubtitle(subtitle);
-    setDrawModeSheetIsGif(isGif);
-    if (isGif) {
-      setGifQualityTier('perfect');
-      gifQualityRef.current = 'perfect';
-    }
     setShowDrawModeSheet(true);
   };
 
@@ -1317,203 +1309,14 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     handleSendMessage(t('analyze_prompt'), { analyzeOnly: true });
   };
 
-  /**
-   * processFile — 处理上传的图片/GIF 文件（绘图模式）
-   */
+  /** GIF / 表情包一律只取第一帧，当作静态图处理 */
   const isGifFile = (file: File) =>
     file.type === 'image/gif' || file.name.toLowerCase().endsWith('.gif');
 
-  const processGifFile = async (
+  const processStaticImageFile = async (
     file: File,
     mode: SmartDrawMode = 'both',
-    quality: GifQualityTier = 'perfect',
-    outlineStyle: OutlineStyle = outlineStyleRef.current,
   ) => {
-    const imageUrl = URL.createObjectURL(file);
-
-    const userMsg: Message = {
-      id: Date.now().toString(),
-      role: 'user',
-      content: `[${t('upload_image')}: ${file.name}]`,
-      hasImage: true,
-      imageUrl,
-    };
-    setMessages(prev => [...prev, userMsg]);
-    setIsLoading(true);
-    const task = beginTask();
-    const progressMsgId = (Date.now() + 1).toString();
-
-    try {
-      setMessages(prev => [...prev, {
-        id: progressMsgId,
-        role: 'assistant',
-        content: t('gif_drawing_processing'),
-        translationKey: 'gif_drawing_processing',
-        drawingProgressPhase: 'processing',
-      }]);
-
-      let gifProgressRaf = 0;
-      let pendingGifProgress: {
-        current: number;
-        total: number;
-        phase: 'decode' | 'frame' | 'ai' | 'worker' | 'archive' | 'inject';
-      } | null = null;
-
-      const flushGifProgress = () => {
-        if (!pendingGifProgress) return;
-        const { current, total, phase } = pendingGifProgress;
-        pendingGifProgress = null;
-        const key = phase === 'decode'
-          ? 'gif_drawing_processing'
-          : phase === 'inject'
-            ? 'gif_drawing_inject'
-            : phase === 'archive'
-              ? 'gif_drawing_archive'
-              : phase === 'ai'
-              ? 'gif_drawing_ai'
-              : phase === 'worker'
-                ? 'gif_drawing_worker'
-                : 'gif_drawing_frame';
-        setMessages(prev => prev.map(m =>
-          m.id === progressMsgId
-            ? {
-                ...m,
-                content: t(key, {
-                  current: String(current),
-                  total: String(total),
-                }),
-                translationKey: key,
-                translationParams: {
-                  current: String(current),
-                  total: String(total),
-                },
-                drawingProgressPhase: 'processing',
-                drawingProgressCurrent: current,
-                drawingProgressTotal: total,
-              }
-            : m,
-        ));
-      };
-
-      const result = await processGifToDesmosAnimation(file, {
-        mode,
-        outlineStyle,
-        quality,
-        apiKey: customApiKey,
-        enableAiRepair: false,
-        signal: task.signal,
-        calculator: calculatorRef.current ?? undefined,
-        streamToCalculator: true,
-        onProgress: (current, total, phase) => {
-          pendingGifProgress = { current, total, phase };
-          if (gifProgressRaf) return;
-          gifProgressRaf = requestAnimationFrame(() => {
-            gifProgressRaf = 0;
-            flushGifProgress();
-          });
-        },
-      });
-      flushGifProgress();
-
-      const streamed = Boolean(result.streamed);
-      let injectPartial = false;
-
-      if (!streamed && calculatorRef.current && result.expressions.length > 0) {
-        let injectProgressRaf = 0;
-        let pendingInject: { done: number; total: number } | null = null;
-
-        const injectResult = await applyGifExpressionsToCalculator(
-          calculatorRef.current,
-          result.expressions,
-          {
-            commitPartialOnAbort: true,
-            onProgress: (done, total) => {
-              pendingInject = { done, total };
-              if (injectProgressRaf) return;
-              injectProgressRaf = requestAnimationFrame(() => {
-                injectProgressRaf = 0;
-                if (!pendingInject) return;
-                const { done: d, total: tot } = pendingInject;
-                pendingInject = null;
-                setMessages(prev => prev.map(m =>
-                  m.id === progressMsgId
-                    ? {
-                        ...m,
-                        content: t('gif_drawing_inject', {
-                          current: String(d),
-                          total: String(tot),
-                        }),
-                        translationKey: 'gif_drawing_inject',
-                        translationParams: {
-                          current: String(d),
-                          total: String(tot),
-                        },
-                        drawingProgressCurrent: d,
-                        drawingProgressTotal: tot,
-                      }
-                    : m,
-                ));
-              });
-            },
-          },
-        );
-        injectPartial = injectResult.partial;
-      }
-
-      if (streamed || result.expressions.length > 0) {
-        const partialDeliver = result.partial || injectPartial;
-        setMessages(prev => prev.map(m =>
-          m.id === progressMsgId ? {
-            ...m,
-            content: partialDeliver ? 'GIF partial' : 'GIF complete',
-            translationKey: partialDeliver ? 'gif_drawing_partial_complete' : 'gif_drawing_complete',
-            translationParams: partialDeliver ? {
-              current: String(result.completedFrames),
-              total: String(result.totalFrames),
-            } : undefined,
-            drawingProgressPhase: undefined,
-            drawingProgressCurrent: undefined,
-            drawingProgressTotal: undefined,
-          } : m,
-        ));
-      }
-    } catch (error) {
-      if (isAbortError(error)) {
-        setMessages(prev => prev.map(m =>
-          m.id === progressMsgId ? {
-            ...m,
-            content: 'Task cancelled',
-            translationKey: 'task_cancelled',
-            drawingProgressPhase: undefined,
-            drawingProgressCurrent: undefined,
-            drawingProgressTotal: undefined,
-          } : m,
-        ));
-        return;
-      }
-      setMessages(prev => [...prev, {
-        id: Date.now().toString(),
-        role: 'system',
-        content: 'GIF processing failed',
-        translationKey: 'gif_process_fail',
-      }]);
-      console.error('[GIF] processing failed:', error);
-    } finally {
-      endTask();
-      setIsLoading(false);
-      flushWorkspace();
-    }
-  };
-
-  const processFile = async (
-    file: File,
-    mode: SmartDrawMode = 'both',
-    quality: GifQualityTier = gifQualityRef.current,
-  ) => {
-    if (isGifFile(file)) {
-      await processGifFile(file, mode, quality);
-      return;
-    }
     // URL.createObjectURL 为文件创建一个临时本地 URL（blob:// 开头）
     // 可以直接用在 <img src={...}> 中显示图片，无需上传服务器
     const imageUrl = URL.createObjectURL(file);
@@ -1542,6 +1345,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
 
         const result = await processImageToFourier(file, {
             mode,
+            fitMethod: fitMethodRef.current,
             outlineStyle: outlineStyleRef.current,
             apiKey: customApiKey,
             enableAiRepair: false,
@@ -1607,6 +1411,34 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     }
   };
 
+  const processFile = async (
+    file: File,
+    mode: SmartDrawMode = 'both',
+  ) => {
+    if (isGifFile(file)) {
+      try {
+        const still = await extractGifFirstFrameAsPngFile(file);
+        await processStaticImageFile(still, mode);
+      } catch (error) {
+        if (isAbortError(error)) return;
+        // 解码失败时回退：浏览器加载 GIF 本身也会显示首帧
+        try {
+          await processStaticImageFile(file, mode);
+        } catch (fallbackError) {
+          if (isAbortError(fallbackError)) return;
+          setMessages(prev => [...prev, {
+            id: Date.now().toString(),
+            role: 'system',
+            content: 'Image processing failed',
+            translationKey: 'image_process_fail',
+          }]);
+        }
+      }
+      return;
+    }
+    await processStaticImageFile(file, mode);
+  };
+
   /**
    * handleFileUpload — 处理文件选择器的 onChange 事件
    *
@@ -1626,16 +1458,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
       setPendingFile(file);
       setShowSolveOptions(true);
     } else {
-      if (isGifFile(file)) {
-        pendingGifFileRef.current = {
-          file,
-          mode: drawModeRef.current,
-          outlineStyle: outlineStyleRef.current,
-        };
-        setShowGifQualitySheet(true);
-      } else {
-        await processFile(file, drawModeRef.current);
-      }
+      await processFile(file, drawModeRef.current);
     }
 
     e.target.value = ''; // 清空文件输入，允许再次选择同一文件
@@ -1752,29 +1575,14 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
   /** 打开智能绘图模式选择（粘贴图片路径） */
   const openDrawModeSheetForPaste = (file: File) => {
     pendingDrawFileRef.current = file;
-    openDrawModeSheet(file.name, isGifFile(file));
-  };
-
-  const startGifWithQuality = async (quality: GifQualityTier) => {
-    gifQualityRef.current = quality;
-    setGifQualityTier(quality);
-    setShowGifQualitySheet(false);
-
-    const pending = pendingGifFileRef.current;
-    if (pending) {
-      pendingGifFileRef.current = null;
-      await processGifFile(pending.file, pending.mode, quality, pending.outlineStyle);
-    }
-  };
-
-  const handleGifQualitySelect = (quality: GifQualityTier) => {
-    void startGifWithQuality(quality);
+    openDrawModeSheet(file.name);
   };
 
   /** 用户选定绘图模式后：Emoji / 文件 / 打开文件选择器 */
   const handleDrawModeSelect = async (mode: SmartDrawMode) => {
     drawModeRef.current = mode;
     outlineStyleRef.current = outlineStyle;
+    fitMethodRef.current = fitMethod;
     setShowDrawModeSheet(false);
     setDrawModeSheetSubtitle(null);
 
@@ -1804,7 +1612,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     const pendingFile = pendingDrawFileRef.current;
     if (pendingFile) {
       pendingDrawFileRef.current = null;
-      await processFile(pendingFile, mode, gifQualityRef.current);
+      await processFile(pendingFile, mode);
       return;
     }
 
@@ -2259,6 +2067,32 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
                     </div>
                     <div className="mt-4 pt-4 border-t border-gray-100">
                       <p className="text-xs text-gray-500 mb-2" style={{ fontWeight: 600 }}>
+                        {t('fit_method_title')}
+                      </p>
+                      <div className="grid grid-cols-2 gap-2">
+                        {([
+                          { id: 'bezier' as const, label: t('fit_method_bezier'), desc: t('fit_method_bezier_desc') },
+                          { id: 'fourier' as const, label: t('fit_method_fourier'), desc: t('fit_method_fourier_desc') },
+                        ]).map(opt => (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            onClick={() => setFitMethod(opt.id)}
+                            className={`px-3 py-2.5 rounded-xl border text-left transition-colors ${
+                              fitMethod === opt.id
+                                ? 'ring-2 ring-indigo-400 bg-indigo-50 border-indigo-200'
+                                : 'bg-gray-50 hover:bg-gray-100 border-gray-100'
+                            }`}
+                          >
+                            <p className="text-sm text-gray-800" style={{ fontWeight: 600 }}>{opt.label}</p>
+                            <p className="text-[11px] text-gray-500 mt-0.5">{opt.desc}</p>
+                          </button>
+                        ))}
+                      </div>
+                      <p className="text-[11px] text-gray-400 mt-2">{t('fit_method_hint')}</p>
+                    </div>
+                    <div className="mt-4 pt-4 border-t border-gray-100">
+                      <p className="text-xs text-gray-500 mb-2" style={{ fontWeight: 600 }}>
                         {t('outline_style_title')}
                       </p>
                       <div className="grid grid-cols-2 gap-2">
@@ -2282,124 +2116,6 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
                         ))}
                       </div>
                       <p className="text-[11px] text-gray-400 mt-2">{t('outline_style_hint')}</p>
-                    </div>
-                    {drawModeSheetIsGif && (
-                      <div className="mt-4 pt-4 border-t border-gray-100">
-                        <p className="text-xs text-gray-500 mb-2" style={{ fontWeight: 600 }}>
-                          {t('gif_quality_title')}
-                        </p>
-                        <div className="grid grid-cols-1 gap-2">
-                          {([
-                            {
-                              tier: 'perfect' as const,
-                              label: t('gif_quality_perfect'),
-                              desc: t('gif_quality_perfect_desc'),
-                              icon: <Sparkles size={15} className="text-rose-600" />,
-                              cls: gifQualityTier === 'perfect'
-                                ? 'ring-2 ring-rose-400 bg-rose-50'
-                                : 'bg-gray-50 hover:bg-gray-100',
-                            },
-                            {
-                              tier: 'cinema' as const,
-                              label: t('gif_quality_cinema'),
-                              desc: t('gif_quality_cinema_desc'),
-                              icon: <Film size={15} className="text-violet-600" />,
-                              cls: gifQualityTier === 'cinema'
-                                ? 'ring-2 ring-violet-400 bg-violet-50'
-                                : 'bg-gray-50 hover:bg-gray-100',
-                            },
-                            {
-                              tier: 'standard' as const,
-                              label: t('gif_quality_standard'),
-                              desc: t('gif_quality_standard_desc'),
-                              icon: <Zap size={15} className="text-amber-600" />,
-                              cls: gifQualityTier === 'standard'
-                                ? 'ring-2 ring-amber-400 bg-amber-50'
-                                : 'bg-gray-50 hover:bg-gray-100',
-                            },
-                          ]).map(opt => (
-                            <button
-                              key={opt.tier}
-                              type="button"
-                              onClick={() => {
-                                setGifQualityTier(opt.tier);
-                                gifQualityRef.current = opt.tier;
-                              }}
-                              className={`rounded-2xl p-3 text-left transition-all border border-transparent ${opt.cls}`}
-                            >
-                              <div className="flex items-center gap-1.5 mb-1">
-                                {opt.icon}
-                                <span className="text-sm text-gray-800" style={{ fontWeight: 600 }}>
-                                  {opt.label}
-                                </span>
-                              </div>
-                              <p className="text-[10px] text-gray-500 leading-snug">{opt.desc}</p>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                </div>
-            </div>
-        )}
-
-        {/* GIF Quality Sheet (file picker path) */}
-        {showGifQualitySheet && (
-            <div className="absolute inset-0 z-50 bg-black/30 flex items-end justify-center animate-in fade-in duration-150">
-                <div className="w-full bg-white rounded-t-3xl p-5 pb-8 shadow-2xl animate-in slide-in-from-bottom-4 duration-200">
-                    <div className="flex items-center justify-between mb-4">
-                        <div>
-                            <h3 className="text-gray-900" style={{fontWeight:700, fontSize:'1rem'}}>{t('gif_quality_title')}</h3>
-                            {pendingGifFileRef.current && (
-                              <p className="text-xs text-gray-400 mt-0.5 truncate max-w-[240px]">
-                                {pendingGifFileRef.current.file.name}
-                              </p>
-                            )}
-                        </div>
-                        <button
-                            onClick={() => { setShowGifQualitySheet(false); pendingGifFileRef.current = null; }}
-                            className="p-2 hover:bg-gray-100 rounded-full transition-colors"
-                        >
-                            <X size={20} />
-                        </button>
-                    </div>
-                    <div className="space-y-2">
-                        {([
-                            {
-                              tier: 'perfect' as const,
-                              label: t('gif_quality_perfect'),
-                              desc: t('gif_quality_perfect_desc'),
-                              cls: 'bg-rose-50 hover:bg-rose-100 border border-rose-100',
-                              icon: <Sparkles size={16} className="text-rose-600" />,
-                            },
-                            {
-                              tier: 'cinema' as const,
-                              label: t('gif_quality_cinema'),
-                              desc: t('gif_quality_cinema_desc'),
-                              cls: 'bg-violet-50 hover:bg-violet-100 border border-violet-100',
-                              icon: <Film size={16} className="text-violet-600" />,
-                            },
-                            {
-                              tier: 'standard' as const,
-                              label: t('gif_quality_standard'),
-                              desc: t('gif_quality_standard_desc'),
-                              cls: 'bg-amber-50 hover:bg-amber-100 border border-amber-100',
-                              icon: <Zap size={16} className="text-amber-600" />,
-                            },
-                        ]).map(opt => (
-                            <button
-                                key={opt.tier}
-                                onClick={() => handleGifQualitySelect(opt.tier)}
-                                className={`w-full flex items-center gap-3 px-4 py-3 rounded-2xl transition-colors text-left ${opt.cls}`}
-                            >
-                                <span className="shrink-0">{opt.icon}</span>
-                                <div className="min-w-0 flex-1">
-                                    <p className="text-sm text-gray-800" style={{fontWeight:600}}>{opt.label}</p>
-                                    <p className="text-xs text-gray-500 mt-0.5">{opt.desc}</p>
-                                </div>
-                                <ChevronRight size={15} className="text-gray-300 shrink-0" />
-                            </button>
-                        ))}
                     </div>
                 </div>
             </div>

@@ -13,6 +13,9 @@ export type SmartDrawMode = 'outline' | 'fill' | 'both';
 /** 轮廓：黑白统一线稿 / 沿边缘采样原图颜色（默认按原图取色） */
 export type OutlineStyle = 'mono' | 'color';
 
+/** 轮廓拟合：三次贝塞尔多段 / 傅里叶参数曲线 */
+export type OutlineFitMethod = 'bezier' | 'fourier';
+
 export type SmartDrawTuningParams = {
   contrastBoost: number;
   sharpenAmount: number;

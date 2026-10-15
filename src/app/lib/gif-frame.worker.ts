@@ -38,6 +38,7 @@ export type GifFrameWorkerInput = {
   skipFrameRestriction?: boolean;
   maxFillPolygons?: number;
   outlineStyle?: import('./smart-draw-repair').OutlineStyle;
+  fitMethod?: import('./smart-draw-repair').OutlineFitMethod;
   fillDetailMode?: 'row' | 'merged' | 'cell';
   compactFourier?: boolean;
   /** 全动画共用的轮廓门槛，保证同一细节在每帧的存活标准一致 */
@@ -118,6 +119,7 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
       gifIsLastFrame: msg.gifIsLastFrame,
       idPrefix: `gif_f${msg.frameSlot}_`,
       outlineStyle: msg.outlineStyle,
+      fitMethod: msg.fitMethod,
       skipFrameRestriction: false,
       compactFourier: true,
       sharedEdgeStrength: msg.sharedEdgeStrength,

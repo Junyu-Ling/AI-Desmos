@@ -11,7 +11,7 @@ import {
   type SmartDrawTuningParams,
 } from './smart-draw-repair';
 
-export type { SmartDrawMode, OutlineStyle } from './smart-draw-repair';
+export type { SmartDrawMode, OutlineStyle, OutlineFitMethod } from './smart-draw-repair';
 export type { SmartDrawTuningParams, SmartDrawRepairPhase, SmartDrawAIContour } from './smart-draw-repair';
 
 // ─── 类型定义 ────────────────────────────────────────────────────────────────
@@ -460,15 +460,16 @@ const extractContours = (
   let totalGrad = 0;     // 所有有效梯度值的总和（用于计算平均值）
   let nonZeroCount = 0;  // 有效梯度点的数量
 
-  const IGNORE_MARGIN = 16; // 忽略图像边缘 16 像素（边缘区域常有噪声）
+  // 小图（表情包）边距过大时可用区域几乎为零，按短边自适应
+  const IGNORE_MARGIN = Math.max(2, Math.min(16, Math.floor(Math.min(width, height) * 0.06)));
 
   for (let y = 1; y < height - 1; y++) {
     for (let x = 1; x < width - 1; x++) {
       const idx = y * width + x; // 当前像素索引
 
       // 忽略图像边缘区域
-      if (x < IGNORE_MARGIN || x > width - IGNORE_MARGIN ||
-          y < IGNORE_MARGIN || y > height - IGNORE_MARGIN) {
+      if (x < IGNORE_MARGIN || x > width - 1 - IGNORE_MARGIN ||
+          y < IGNORE_MARGIN || y > height - 1 - IGNORE_MARGIN) {
         gradientMap[idx] = 0;
         continue;
       }
@@ -672,6 +673,438 @@ const computeDFT = (points: Point[], numCoeffs: number) => {
   }
 
   return coeffs;
+};
+
+// ─── 三次贝塞尔高精度拟合（误差驱动自适应细分）──────────────────────────────
+
+type CubicBez = { p0: Point; p1: Point; p2: Point; p3: Point };
+
+const pointDist = (a: Point, b: Point): number =>
+  Math.hypot(b.x - a.x, b.y - a.y);
+
+/** 贝塞尔控制点用 7 位小数，显著压低量化锯齿 */
+const fmtDesmosNumBezier = (n: number): string => {
+  if (!Number.isFinite(n)) return '0';
+  const rounded = Math.round(n * 1e7) / 1e7;
+  return Object.is(rounded, -0) ? '0' : String(rounded);
+};
+
+const resampleByArcLength = (points: Point[], count: number): Point[] => {
+  if (points.length === 0) return [];
+  if (points.length === 1 || count <= 1) return [points[0]];
+  const lens: number[] = [0];
+  for (let i = 1; i < points.length; i++) {
+    lens.push(lens[i - 1] + pointDist(points[i - 1], points[i]));
+  }
+  const total = lens[lens.length - 1];
+  if (total <= 1e-9) return Array.from({ length: count }, () => ({ ...points[0] }));
+
+  const out: Point[] = [];
+  let j = 0;
+  for (let i = 0; i < count; i++) {
+    const target = (total * i) / (count - 1);
+    while (j < lens.length - 2 && lens[j + 1] < target) j++;
+    const a = lens[j];
+    const b = lens[j + 1];
+    const t = b > a ? (target - a) / (b - a) : 0;
+    const p0 = points[j];
+    const p1 = points[Math.min(j + 1, points.length - 1)];
+    out.push({
+      x: p0.x + (p1.x - p0.x) * t,
+      y: p0.y + (p1.y - p0.y) * t,
+    });
+  }
+  return out;
+};
+
+const normalizeVec = (x: number, y: number): Point => {
+  const len = Math.hypot(x, y);
+  if (len < 1e-12) return { x: 1, y: 0 };
+  return { x: x / len, y: y / len };
+};
+
+/** 折线各点单位切线（前向/后向差分） */
+const polylineTangents = (pts: Point[], closed: boolean): Point[] => {
+  const n = pts.length;
+  const out: Point[] = new Array(n);
+  for (let i = 0; i < n; i++) {
+    let prev: Point;
+    let next: Point;
+    if (closed) {
+      prev = pts[(i - 1 + n) % n];
+      next = pts[(i + 1) % n];
+    } else if (i === 0) {
+      prev = pts[0];
+      next = pts[Math.min(1, n - 1)];
+    } else if (i === n - 1) {
+      prev = pts[n - 2];
+      next = pts[n - 1];
+    } else {
+      prev = pts[i - 1];
+      next = pts[i + 1];
+    }
+    out[i] = normalizeVec(next.x - prev.x, next.y - prev.y);
+  }
+  return out;
+};
+
+/** 端点固定的 Hermite→三次贝塞尔（切线长度 ∝ 弦长/3） */
+const hermiteToCubic = (p0: Point, p3: Point, tIn: Point, tOut: Point): CubicBez => {
+  const chord = Math.max(pointDist(p0, p3), 1e-9);
+  const s = chord / 3;
+  return {
+    p0: { ...p0 },
+    p1: { x: p0.x + tIn.x * s, y: p0.y + tIn.y * s },
+    p2: { x: p3.x - tOut.x * s, y: p3.y - tOut.y * s },
+    p3: { ...p3 },
+  };
+};
+
+const evalCubicBez = (bez: CubicBez, t: number): Point => {
+  const u = 1 - t;
+  const uu = u * u;
+  const tt = t * t;
+  const a = uu * u;
+  const b = 3 * uu * t;
+  const c = 3 * u * tt;
+  const d = tt * t;
+  return {
+    x: a * bez.p0.x + b * bez.p1.x + c * bez.p2.x + d * bez.p3.x,
+    y: a * bez.p0.y + b * bez.p1.y + c * bez.p2.y + d * bez.p3.y,
+  };
+};
+
+/** 折线段相对贝塞尔的最大偏差（弦长参数化），返回误差与分裂下标 */
+const maxBezierDeviation = (
+  pts: Point[],
+  bez: CubicBez,
+): { err: number; splitAt: number } => {
+  if (pts.length <= 2) return { err: 0, splitAt: 0 };
+  const lens: number[] = [0];
+  for (let i = 1; i < pts.length; i++) {
+    lens.push(lens[i - 1] + pointDist(pts[i - 1], pts[i]));
+  }
+  const total = lens[lens.length - 1] || 1;
+  let bestErr = 0;
+  let bestIdx = Math.floor(pts.length / 2);
+  for (let i = 1; i < pts.length - 1; i++) {
+    const t = lens[i] / total;
+    const q = evalCubicBez(bez, t);
+    const e = pointDist(pts[i], q);
+    if (e > bestErr) {
+      bestErr = e;
+      bestIdx = i;
+    }
+  }
+  return { err: bestErr, splitAt: bestIdx };
+};
+
+/**
+ * 误差驱动递归细分：贴边精度由 maxErr（Desmos 坐标）控制。
+ * 弯角处自动多切段，直线处少切，兼顾行数与精度。
+ */
+const fitCubicBezierAdaptive = (
+  pts: Point[],
+  tans: Point[],
+  i0: number,
+  i1: number,
+  maxErr: number,
+  depth: number,
+  maxDepth: number,
+  out: CubicBez[],
+  segBudget: { left: number },
+): void => {
+  if (segBudget.left <= 0) return;
+  if (i1 <= i0) return;
+
+  if (i1 - i0 === 1) {
+    const a = pts[i0];
+    const b = pts[i1];
+    out.push(hermiteToCubic(a, b, tans[i0], tans[i1]));
+    segBudget.left -= 1;
+    return;
+  }
+
+  const slice = pts.slice(i0, i1 + 1);
+  const bez = hermiteToCubic(pts[i0], pts[i1], tans[i0], tans[i1]);
+  const { err, splitAt } = maxBezierDeviation(slice, bez);
+  const localSplit = i0 + splitAt;
+
+  const canSplit =
+    depth < maxDepth
+    && segBudget.left > 1
+    && err > maxErr
+    && localSplit > i0
+    && localSplit < i1;
+
+  if (!canSplit) {
+    out.push(bez);
+    segBudget.left -= 1;
+    return;
+  }
+
+  fitCubicBezierAdaptive(pts, tans, i0, localSplit, maxErr, depth + 1, maxDepth, out, segBudget);
+  fitCubicBezierAdaptive(pts, tans, localSplit, i1, maxErr, depth + 1, maxDepth, out, segBudget);
+};
+
+/**
+ * 折线 → 高精度三次贝塞尔链。
+ * - 先密采样保留细节
+ * - 尖角处强制打断
+ * - 再按最大几何误差自适应细分
+ */
+const fitCubicBezierChain = (
+  raw: Point[],
+  isClosed: boolean,
+  maxSegments: number,
+  options?: { maxErr?: number },
+): CubicBez[] => {
+  if (raw.length < 2) return [];
+  const segCap = Math.max(1, maxSegments);
+  /** Desmos 坐标系下最大允许偏差；越小越贴边 */
+  const maxErr = options?.maxErr ?? 0.012;
+
+  if (raw.length === 2) {
+    const [a, b] = raw;
+    const tan = normalizeVec(b.x - a.x, b.y - a.y);
+    return [hermiteToCubic(a, b, tan, tan)];
+  }
+
+  // 每段目标弧长更短 → 保留更多几何细节后再做误差细分
+  let pathLen = 0;
+  for (let i = 1; i < raw.length; i++) pathLen += pointDist(raw[i - 1], raw[i]);
+  if (isClosed) pathLen += pointDist(raw[raw.length - 1], raw[0]);
+
+  const targetSpacing = Math.max(0.04, Math.min(0.18, pathLen / (segCap * 2.5)));
+  const denseCount = Math.min(
+    2400,
+    Math.max(raw.length, Math.ceil(pathLen / targetSpacing) + 1),
+  );
+
+  let pts = resampleByArcLength(raw, denseCount);
+  if (pts.length < 2) return [];
+
+  // 闭合轮廓展开成「首点重复在末尾」的开路径，统一走自适应细分
+  if (isClosed && pointDist(pts[0], pts[pts.length - 1]) > 1e-9) {
+    pts = [...pts, pts[0]];
+  }
+
+  const tans = polylineTangents(
+    isClosed && pointDist(pts[0], pts[pts.length - 1]) < 1e-9
+      ? pts.slice(0, -1)
+      : pts,
+    isClosed,
+  );
+  // 展开后末点切线 = 起点切线
+  const pathTans: Point[] =
+    isClosed && pointDist(pts[0], pts[pts.length - 1]) < 1e-9
+      ? [...tans, tans[0]]
+      : tans;
+
+  const n = pts.length;
+  const anchors: number[] = [0];
+  const last = n - 1;
+  for (let i = 1; i < last; i++) {
+    const prev = pts[i - 1];
+    const cur = pts[i];
+    const next = pts[i + 1];
+    const ax = cur.x - prev.x;
+    const ay = cur.y - prev.y;
+    const bx = next.x - cur.x;
+    const by = next.y - cur.y;
+    const la = Math.hypot(ax, ay) || 1;
+    const lb = Math.hypot(bx, by) || 1;
+    const cos = (ax * bx + ay * by) / (la * lb);
+    if (cos < 0.15) anchors.push(i); // 仅很尖的角（≈>81°）才强制断点，避免碎成虚线
+  }
+  if (anchors[anchors.length - 1] !== last) anchors.push(last);
+
+  const uniqAnchors = [...new Set(anchors)].sort((a, b) => a - b);
+  const out: CubicBez[] = [];
+  const budget = { left: segCap };
+
+  for (let k = 0; k < uniqAnchors.length - 1; k++) {
+    if (budget.left <= 0) break;
+    fitCubicBezierAdaptive(
+      pts,
+      pathTans,
+      uniqAnchors[k],
+      uniqAnchors[k + 1],
+      maxErr,
+      0,
+      16,
+      out,
+      budget,
+    );
+  }
+
+  return out.length > 0
+    ? out
+    : [hermiteToCubic(pts[0], pts[last], pathTans[0], pathTans[pathTans.length - 1])];
+};
+
+/** 把贝塞尔链采样成折线（GIF 紧凑播放用） */
+const sampleBezierChainPoints = (segs: CubicBez[], samplesPerSeg: number): Point[] => {
+  if (segs.length === 0) return [];
+  const n = Math.max(2, samplesPerSeg);
+  const out: Point[] = [];
+  segs.forEach((bez, si) => {
+    const start = si === 0 ? 0 : 1;
+    for (let i = start; i < n; i++) {
+      out.push(evalCubicBez(bez, i / (n - 1)));
+    }
+  });
+  return out;
+};
+
+/**
+ * 内联三次贝塞尔参数式（不用 B_x 辅助函数）。
+ * 必须写 \\cdot，否则 Desmos 会把 tb / t^{2}c 解析成未定义变量，曲线整段消失只剩碎线。
+ */
+const buildCubicBezLatex = (bez: CubicBez): string => {
+  const x0 = fmtDesmosNumBezier(bez.p0.x);
+  const x1 = fmtDesmosNumBezier(bez.p1.x);
+  const x2 = fmtDesmosNumBezier(bez.p2.x);
+  const x3 = fmtDesmosNumBezier(bez.p3.x);
+  const y0 = fmtDesmosNumBezier(bez.p0.y);
+  const y1 = fmtDesmosNumBezier(bez.p1.y);
+  const y2 = fmtDesmosNumBezier(bez.p2.y);
+  const y3 = fmtDesmosNumBezier(bez.p3.y);
+  const bx =
+    `\\left(1-t\\right)^{3}\\cdot${x0}`
+    + `+3\\left(1-t\\right)^{2}\\cdot t\\cdot${x1}`
+    + `+3\\left(1-t\\right)\\cdot t^{2}\\cdot${x2}`
+    + `+t^{3}\\cdot${x3}`;
+  const by =
+    `\\left(1-t\\right)^{3}\\cdot${y0}`
+    + `+3\\left(1-t\\right)^{2}\\cdot t\\cdot${y1}`
+    + `+3\\left(1-t\\right)\\cdot t^{2}\\cdot${y2}`
+    + `+t^{3}\\cdot${y3}`;
+  return `\\left(${bx},${by}\\right)`;
+};
+
+/**
+ * 把端点接近的开放轮廓拼成更长的链（动漫线稿 Sobel 常碎成短段）。
+ * 拼接后贝塞尔/密点折线才能连成完整轮廓，精度才会压过傅里叶。
+ */
+const linkOpenContours = (
+  contours: Point[][],
+  closedFlags: boolean[],
+  maxGapPx: number,
+): { contours: Point[][]; closed: boolean[] } => {
+  const n = contours.length;
+  if (n <= 1) return { contours: contours.map(c => c.slice()), closed: closedFlags.slice() };
+
+  const used = new Array(n).fill(false);
+  const outC: Point[][] = [];
+  const outClosed: boolean[] = [];
+
+  const ends = contours.map((c, i) => ({
+    i,
+    closed: closedFlags[i],
+    start: c[0],
+    end: c[c.length - 1],
+    len: calculatePathLength(c),
+  }));
+
+  // 长轮廓优先作为种子
+  const order = ends.map(e => e.i).sort((a, b) => ends[b].len - ends[a].len);
+
+  for (const seed of order) {
+    if (used[seed]) continue;
+    used[seed] = true;
+    if (closedFlags[seed] || contours[seed].length < 2) {
+      outC.push(contours[seed].slice());
+      outClosed.push(closedFlags[seed]);
+      continue;
+    }
+
+    let chain = contours[seed].slice();
+    let guard = 0;
+    while (guard++ < n) {
+      const head = chain[0];
+      const tail = chain[chain.length - 1];
+      let bestJ = -1;
+      let bestDist = maxGapPx;
+      let mode: 'prepend' | 'prependRev' | 'append' | 'appendRev' | null = null;
+
+      for (let j = 0; j < n; j++) {
+        if (used[j] || closedFlags[j] || contours[j].length < 2) continue;
+        const s = contours[j][0];
+        const e = contours[j][contours[j].length - 1];
+        const dTailS = pointDist(tail, s);
+        const dTailE = pointDist(tail, e);
+        const dHeadS = pointDist(head, s);
+        const dHeadE = pointDist(head, e);
+        if (dTailS < bestDist) { bestDist = dTailS; bestJ = j; mode = 'append'; }
+        if (dTailE < bestDist) { bestDist = dTailE; bestJ = j; mode = 'appendRev'; }
+        if (dHeadE < bestDist) { bestDist = dHeadE; bestJ = j; mode = 'prepend'; }
+        if (dHeadS < bestDist) { bestDist = dHeadS; bestJ = j; mode = 'prependRev'; }
+      }
+      if (bestJ < 0 || !mode) break;
+      used[bestJ] = true;
+      const other = contours[bestJ];
+      if (mode === 'append') chain = chain.concat(other.slice(1));
+      else if (mode === 'appendRev') chain = chain.concat(other.slice(0, -1).reverse());
+      else if (mode === 'prepend') chain = other.slice(0, -1).concat(chain);
+      else chain = other.slice().reverse().slice(0, -1).concat(chain);
+    }
+
+    const gap = pointDist(chain[0], chain[chain.length - 1]);
+    const closed = gap < maxGapPx || gap < calculatePathLength(chain) * 0.02;
+    if (closed && gap > 1e-6) chain = [...chain, chain[0]];
+    outC.push(chain);
+    outClosed.push(closed);
+  }
+
+  return { contours: outC, closed: outClosed };
+};
+
+/** 贝塞尔高精度：密点折线写入表格（贴边远强于傅里叶截断） */
+const pushDensePolylineOutline = (
+  expressions: any[],
+  points: Point[],
+  opts: {
+    idPrefix: string;
+    index: number;
+    color: string;
+    lineWidth: number;
+    restrict: (latex: string) => string;
+    tableOrdinal: { n: number };
+  },
+): void => {
+  if (points.length < 2) return;
+  const MAX_POINTS = 1800;
+  let pts = points;
+  if (pts.length > MAX_POINTS) {
+    pts = resampleByArcLength(pts, MAX_POINTS);
+  }
+  const xs = pts.map(p => fmtDesmosNumBezier(p.x));
+  const ys = pts.map(p => fmtDesmosNumBezier(p.y));
+  const ord = opts.tableOrdinal.n++;
+  const xLatex = `x_{b${opts.index}t${ord}}`;
+  const yLatex = `y_{b${opts.index}t${ord}}`;
+  expressions.push({
+    id: `${opts.idPrefix}bez_table_${opts.index}_${ord}`,
+    type: 'table',
+    columns: [
+      // 表格默认会画散点；关掉点/线，只当数据源，真正描边交给下方折线式
+      { latex: xLatex, values: xs, points: false, lines: false, hidden: false },
+      { latex: yLatex, values: ys, points: false, lines: false, hidden: false },
+    ],
+  });
+  expressions.push({
+    id: `${opts.idPrefix}bez_plot_${opts.index}_${ord}`,
+    latex: opts.restrict(`\\left(${xLatex},${yLatex}\\right)`),
+    color: opts.color,
+    lines: true,
+    points: false,
+    pointOpacity: 0,
+    pointSize: 0,
+    lineWidth: opts.lineWidth,
+    lineOpacity: 1,
+    hidden: false,
+  });
 };
 
 // ─── 颜色填充区域（Smart Drawing — Desmos polygon 多块填色）──────────────────
@@ -1622,8 +2055,18 @@ const buildFillPolygonExpressions = (
         : `y_{f${tableOrdinal - 1}c${pair}}`;
 
       pendingTable.columns.push(
-        { latex: xLatex, values: poly.points.map(p => fmtDesmosNum(p.x)) },
-        { latex: yLatex, values: poly.points.map(p => fmtDesmosNum(p.y)) },
+        {
+          latex: xLatex,
+          values: poly.points.map(p => fmtDesmosNum(p.x)),
+          points: false,
+          lines: false,
+        },
+        {
+          latex: yLatex,
+          values: poly.points.map(p => fmtDesmosNum(p.y)),
+          points: false,
+          lines: false,
+        },
       );
       expressions.push({
         id: `${prefix}fill_poly_${i}`,
@@ -1684,6 +2127,8 @@ const createFillContext = (
 export type ImageFourierOptions = {
   /** 智能绘图模式：仅轮廓 / 仅涂色 / 轮廓+涂色，默认 both */
   mode?: import('./smart-draw-repair').SmartDrawMode;
+  /** 轮廓拟合：bezier=三次贝塞尔多段；fourier=傅里叶参数曲线（默认） */
+  fitMethod?: import('./smart-draw-repair').OutlineFitMethod;
   /** 仅轮廓：mono=黑色线稿，color=沿边缘采样原色 */
   outlineStyle?: import('./smart-draw-repair').OutlineStyle;
   /** AI/启发式修复后的拟合参数 */
@@ -1837,6 +2282,14 @@ const generateFourierExpressions = (
   );
   let closedHints: (boolean | null)[] = rawContours.map(() => null);
 
+  // 低对比 / 小表情包：Sobel 可能为空，用色块边界兜底
+  if (rawContours.length === 0) {
+    const fallback = extractSegmentationContours(ctx, width, height);
+    rawContours = fallback.contours;
+    strengths = fallback.strengths;
+    closedHints = rawContours.map(() => true);
+  }
+
   if (options.aiContours && options.aiContours.length > 0 && includeOutline) {
     const merged = mergeAIContoursWithEdge(options.aiContours, rawContours, strengths);
     rawContours = merged.contours;
@@ -1904,15 +2357,21 @@ const generateFourierExpressions = (
   // Set 是 JavaScript 中的集合，查找和删除都是 O(1) 复杂度
   const activeSet = new Set(meta.map(m => m.index));
 
+  const fitMethodEarly = options.fitMethod === 'bezier' ? 'bezier' : 'fourier';
+  // 贝塞尔高精度模式：大幅放宽过滤，尽量留住线稿细节（傅里叶可更狠地去噪）
+  const bezierHiFi = fitMethodEarly === 'bezier' && !options.compactFourier;
+
   // ── 过滤 A：强度过滤 ──────────────────────────────────────────────────────
-  const strengthRatio = tuning?.strengthThresholdRatio ?? 0.28;
+  const strengthRatio = bezierHiFi
+    ? Math.min(tuning?.strengthThresholdRatio ?? 0.28, 0.14)
+    : (tuning?.strengthThresholdRatio ?? 0.28);
   const sortedStrength = [...meta].map(m => m.averageStrength).sort((a, b) => b - a);
   // 门槛按「最强轮廓」的比例算。GIF 逐帧各算一次时，主体强弱一变门槛就跟着动，
   // 同一个部位会在一部分帧里被判成噪声——所以全动画共用一个基准。
   const topStrength = options.sharedContourStrength != null && options.sharedContourStrength > 0
     ? options.sharedContourStrength
     : (sortedStrength.length > 0 ? sortedStrength[0] : 10);
-  const strengthThreshold = Math.max(8, topStrength * strengthRatio);
+  const strengthThreshold = Math.max(bezierHiFi ? 4 : 8, topStrength * strengthRatio);
 
   meta.forEach(m => {
     if (m.averageStrength < strengthThreshold) {
@@ -1921,10 +2380,10 @@ const generateFourierExpressions = (
   });
 
   // ── 过滤 B：几何过滤（消除各种噪声类型）─────────────────────────────────
-  const preserveFine = tuning?.preserveFineDetails ?? false;
-  const minOpenLength = preserveFine ? 40 : 60;
-  const minClosedLength = preserveFine ? 20 : 30;
-  const minBlobSize = preserveFine ? 14 : 20;
+  const preserveFine = bezierHiFi ? true : (tuning?.preserveFineDetails ?? false);
+  const minOpenLength = bezierHiFi ? 12 : (preserveFine ? 40 : 60);
+  const minClosedLength = bezierHiFi ? 10 : (preserveFine ? 20 : 30);
+  const minBlobSize = bezierHiFi ? 8 : (preserveFine ? 14 : 20);
 
   meta.forEach(m => {
     if (!activeSet.has(m.index)) return;
@@ -1959,20 +2418,35 @@ const generateFourierExpressions = (
 
   // 从原始轮廓中筛选出幸存的轮廓
   let finalContours = rawContours.filter((_, i) => activeSet.has(i));
+  let finalClosed = finalContours.map(c => meta[rawContours.indexOf(c)]?.isClosed ?? false);
+
+  // 贝塞尔：先把碎开放轮廓拼成完整线，再拟合（关键提升线稿完整度）
+  if (bezierHiFi && finalContours.length > 1) {
+    const linked = linkOpenContours(finalContours, finalClosed, 10);
+    finalContours = linked.contours;
+    finalClosed = linked.closed;
+  }
 
   // ── 按优先级排序（路径长度 × 强度的乘积越大越重要）─────────────────────
-  finalContours.sort((a, b) => {
-    const mA = meta[rawContours.indexOf(a)];
-    const mB = meta[rawContours.indexOf(b)];
-    return (mB.pathLength * mB.averageStrength) - (mA.pathLength * mA.averageStrength);
-  });
+  const contourOrder = finalContours.map((c, i) => ({
+    c,
+    closed: finalClosed[i],
+    len: calculatePathLength(c),
+    strength: meta[rawContours.indexOf(c)]?.averageStrength ?? 1,
+  }));
+  contourOrder.sort((a, b) => (b.len * b.strength) - (a.len * a.strength));
+  finalContours = contourOrder.map(o => o.c);
+  finalClosed = contourOrder.map(o => o.closed);
 
   // GIF 不能按本帧重要性截断：主体动作大的帧多出十几条强轮廓，
   // 手、耳朵这类刚好过线的细节就被挤掉，看起来像无缘无故消失。
   // 播放开销由每帧点数预算封顶，不靠少画几条轮廓。
   if (!options.compactFourier) {
-    const maxContours = tuning?.maxContours ?? 50;
+    const maxContours = bezierHiFi
+      ? Math.max(tuning?.maxContours ?? 50, 140)
+      : (tuning?.maxContours ?? 50);
     finalContours = finalContours.slice(0, maxContours);
+    finalClosed = finalClosed.slice(0, maxContours);
   }
 
   const contourExpressions: any[] = [];
@@ -1980,45 +2454,44 @@ const generateFourierExpressions = (
     ? (options.fillImageData?.data ?? ctx.getImageData(0, 0, width, height).data)
     : null;
 
+  const fitMethod = fitMethodEarly;
+
+  /** 三次贝塞尔段预算（密点折线为主，贝塞尔作光滑补充） */
+  const BEZIER_SEG_BUDGET = options.compactFourier ? 220 : 480;
+  /** 约 0.7～1 像素误差（转 Desmos 坐标） */
+  const BEZIER_MAX_ERR = Math.max(0.008, desmosScale * (options.compactFourier ? 1.2 : 0.7));
+  let bezierSegsUsed = 0;
+  const bezierTableOrdinal = { n: 0 };
+
   finalContours.forEach((rawPoints, idx) => {
     const m = meta[rawContours.indexOf(rawPoints)];
-    let processedPoints = [...rawPoints]; // 复制一份（不修改原始数据）
+    const isClosed = finalClosed[idx] ?? m?.isClosed ?? false;
+    let processedPoints = [...rawPoints];
 
     // ── 开放轮廓处理：防止"回程线"─────────────────────────────────────────
-    // 开放轮廓（首尾不接）的参数方程结束时会画一条直线回起点，很难看。
-    // 解决方案：让轮廓走到终点后，原路返回，形成"去而复返"的完整路径。
-    // 这样 DFT 不会看到突变，也就不会产生难看的"Gibbs 过冲"（高频振铃）。
-    if (!m.isClosed) {
-      // 把轮廓反转（从终点走回起点），去掉首尾避免重复
+    // 仅傅里叶需要「去而复返」；贝塞尔按真实开/闭路径分段即可
+    if (fitMethod === 'fourier' && !isClosed) {
       const reversed = [...processedPoints].reverse().slice(1, -1);
-
-      // 在转折点添加"暂停"点（重复3次）：让 DFT 平滑处理转折
-      const tip = processedPoints[processedPoints.length - 1]; // 终点
-      const root = processedPoints[0];                          // 起点
-      const pauseTip  = [tip, tip, tip];   // 终点暂停
-      const pauseRoot = [root, root, root]; // 起点暂停
-
-      // 最终路径：起点→终点→暂停→原路返回→暂停→(回到起点，首尾相连)
+      const tip = processedPoints[processedPoints.length - 1];
+      const root = processedPoints[0];
+      const pauseTip  = [tip, tip, tip];
+      const pauseRoot = [root, root, root];
       processedPoints = [...processedPoints, ...pauseTip, ...reversed, ...pauseRoot];
     }
 
-    const targetCount = tuning?.targetPointCount ?? 400;
-    const step = Math.max(1, Math.floor(processedPoints.length / targetCount));
-    // 每隔 step 个点取一个（i % step === 0 时保留）
+    // 贝塞尔高精度：几乎不降采样；傅里叶仍按 targetPointCount
+    const targetCount = fitMethod === 'bezier'
+      ? Math.max(processedPoints.length, 1200)
+      : (tuning?.targetPointCount ?? 400);
+    const step = fitMethod === 'bezier'
+      ? 1
+      : Math.max(1, Math.floor(processedPoints.length / targetCount));
     const points = processedPoints.filter((_, i) => i % step === 0);
 
-    // ── 坐标系转换 ────────────────────────────────────────────────────────
     const centeredPoints = points.map(p => ({
-      x: (p.x - offsetX) * desmosScale,  // 中心化 + 缩放
-      y: -(p.y - offsetY) * desmosScale   // 中心化 + 缩放 + 翻转 Y 轴（Canvas Y 向下，Desmos Y 向上）
+      x: (p.x - offsetX) * desmosScale,
+      y: -(p.y - offsetY) * desmosScale,
     }));
-
-    const fourierCap = tuning?.fourierK ?? 100;
-    let K = Math.min(fourierCap, Math.floor((points.length - 1) / 2));
-    if (K < 5) K = 5; // 至少 5 个频率（否则图形太粗糙）
-
-    // ── 计算 DFT ──────────────────────────────────────────────────────────
-    const coeffs = computeDFT(centeredPoints, K);
 
     const index = idx;
     const plotColor = colorSampleData
@@ -2027,10 +2500,82 @@ const generateFourierExpressions = (
 
     const lineWidth = fillPolys.length > 0 ? 2 : 2.5;
 
+    // ── 贝塞尔高精度：密点折线贴边（主）+ 三次贝塞尔光滑段（辅）──────────
+    if (fitMethod === 'bezier') {
+      // 图像空间 ~1.2px 重采样 → Desmos 密点折线，细节远超傅里叶截断
+      const spacingPx = options.compactFourier ? 2.2 : 1.15;
+      const pathLenPx = calculatePathLength(points);
+      const denseCount = Math.min(
+        1800,
+        Math.max(points.length, Math.ceil(pathLenPx / spacingPx) + 1),
+      );
+      const denseImg = resampleByArcLength(points, denseCount);
+      const denseDesmos = denseImg.map(p => ({
+        x: (p.x - offsetX) * desmosScale,
+        y: -(p.y - offsetY) * desmosScale,
+      }));
+
+      if (options.compactFourier) {
+        const xs = denseDesmos.map(p => fmtDesmosNumBezier(p.x));
+        const ys = denseDesmos.map(p => fmtDesmosNumBezier(p.y));
+        const gate = frameGateLatex ? `\\cdot ${frameGateLatex}` : '';
+        contourExpressions.push({
+          id: `${idPrefix}dft_plot_${index}`,
+          latex: `\\left(\\left[${xs.join(',')}\\right]${gate},\\left[${ys.join(',')}\\right]${gate}\\right)`,
+          color: plotColor,
+          lines: true,
+          points: false,
+          lineWidth,
+          lineOpacity: 1,
+          hidden: false,
+          gifOutline: { x: xs, y: ys },
+        });
+        return;
+      }
+
+      // 主视觉：表格密点折线（精度高于任何傅里叶谐波截断）
+      pushDensePolylineOutline(contourExpressions, denseDesmos, {
+        idPrefix,
+        index,
+        color: plotColor,
+        lineWidth,
+        restrict: restrictPlot,
+        tableOrdinal: bezierTableOrdinal,
+      });
+
+      // 辅：长轮廓再叠一层三次贝塞尔（比赛可见参数方程，且贴边）
+      const remain = Math.max(0, BEZIER_SEG_BUDGET - bezierSegsUsed);
+      if (remain >= 4 && pathLenPx > 80) {
+        const perContourCap = Math.min(80, remain, Math.max(6, Math.round(pathLenPx / 25)));
+        const segs = fitCubicBezierChain(denseDesmos, isClosed, perContourCap, {
+          maxErr: BEZIER_MAX_ERR,
+        });
+        bezierSegsUsed += segs.length;
+        let segEmit = 0;
+        for (const bez of segs) {
+          if (pointDist(bez.p0, bez.p3) < 0.015) continue;
+          contourExpressions.push({
+            id: `${idPrefix}bez_curve_${index}_${segEmit++}`,
+            latex: restrictPlot(buildCubicBezLatex(bez)),
+            color: plotColor,
+            lineWidth: Math.max(1, lineWidth - 0.5),
+            lineOpacity: 0.85,
+            hidden: false,
+            parametricDomain: { min: '0', max: '1' },
+          });
+        }
+      }
+      return;
+    }
+
+    // ── 傅里叶拟合（默认）────────────────────────────────────────────────
+    const fourierCap = tuning?.fourierK ?? 100;
+    let K = Math.min(fourierCap, Math.floor((points.length - 1) / 2));
+    if (K < 5) K = 5;
+
+    const coeffs = computeDFT(centeredPoints, K);
+
     if (options.compactFourier) {
-      // GIF：级数在这里就展开成点列，Desmos 只连折线，重绘不再做三角函数。
-      // 点列直接内联，一条轮廓只占 1 行，也不会和单图的 X_n/Y_n 撞名。
-      // （预览/合并依赖 latex 自包含；填色才用表格减行）
       const curve = sampleFourierCurvePoints(
         coeffs,
         resolveGifOutlineSampleCount(K, finalContours.length),
@@ -2039,7 +2584,6 @@ const generateFourierExpressions = (
       const ys = curve.map(p => fmtDesmosNum(p.y));
       const listX = `\\left[${xs.join(',')}\\right]`;
       const listY = `\\left[${ys.join(',')}\\right]`;
-      // 用 {条件:1} 乘在坐标上做门控：条件不成立即 undefined，整条折线隐藏
       const gate = frameGateLatex ? `\\cdot ${frameGateLatex}` : '';
 
       contourExpressions.push({
@@ -2051,19 +2595,15 @@ const generateFourierExpressions = (
         lineWidth,
         lineOpacity: 1,
         hidden: false,
-        // 播放阶段会把所有帧的点列拼成扁平列表、只切当前帧那一段，
-        // 这里留下原始点列，省得再去反解 latex。注入 Desmos 前会剥掉。
         gifOutline: { x: xs, y: ys },
       });
       return;
     }
 
-    // 提取各频率的参数
-    const L_freq = coeffs.map(c => c.freq);            // 频率列表：[0, 1, -1, 2, -2, ...]
-    const L_real = coeffs.map(c => c.re.toFixed(5));   // 实部（保留5位小数，平衡精度和体积）
-    const L_imag = coeffs.map(c => c.im.toFixed(5));   // 虚部
+    const L_freq = coeffs.map(c => c.freq);
+    const L_real = coeffs.map(c => c.re.toFixed(5));
+    const L_imag = coeffs.map(c => c.im.toFixed(5));
 
-    // varNamespace = 帧序号（1-based）；第 1 帧从 F_0 起，第 2 帧从 F_64 起，互不冲突
     const nameKey = options.varNamespace !== undefined
       ? (options.varNamespace - 1) * GIF_FOURIER_VAR_STRIDE + index
       : index;
@@ -2108,16 +2648,17 @@ const generateFourierExpressions = (
   const outlineNote = aiUsed
     ? `（AI 精确轮廓 ${Math.min(options.aiContours!.length, finalContours.length)} 条 + 边缘检测补充）`
     : '';
+  const fitNote = fitMethod === 'bezier' ? '，贝塞尔拟合' : '，傅里叶拟合';
 
   return {
     expressions,
     explanation: includeFill && fillPolys.length > 0
-      ? `绘画已完成（${fillPolys.length} 个色块 + ${finalContours.length} 条黑色轮廓${outlineNote}）。`
+      ? `绘画已完成（${fillPolys.length} 个色块 + ${finalContours.length} 条轮廓${fitNote}${outlineNote}）。`
       : includeFill
         ? '绘画已完成。'
         : useColorOutline
-          ? `绘画已完成（${finalContours.length} 条彩色轮廓${outlineNote}，仅勾线）。`
-          : `绘画已完成（${finalContours.length} 条黑色轮廓${outlineNote}，仅勾线）。`,
+          ? `绘画已完成（${finalContours.length} 条彩色轮廓${fitNote}${outlineNote}，仅勾线）。`
+          : `绘画已完成（${finalContours.length} 条黑色轮廓${fitNote}${outlineNote}，仅勾线）。`,
   };
 };
 
@@ -2347,11 +2888,31 @@ const prepareFourierExpression = (expr: any): any => {
   const id = String(expr.id || '');
   // 自带的点列元数据只在生成/合并阶段用，Desmos 不认识
   delete options.gifOutline;
-  if (options.type === 'table') return options;
+  if (options.type === 'table') {
+    // 表格列默认散点：统一关掉，只保留后续折线/polygon 描边
+    if (Array.isArray(options.columns)) {
+      options.columns = options.columns.map((col: any) => ({
+        ...col,
+        points: false,
+        lines: false,
+      }));
+    }
+    return options;
+  }
   // 折线轮廓（lines:true）不是参数曲线，不能带 parametricDomain
   const isPolyline = expr?.lines === true;
-  if (!isPolyline && (/(?:^|_)dft_plot_\d+$/.test(id) || /(?:^|_)hd_plot_\d+$/.test(id))) {
+  if (isPolyline) {
+    options.points = false;
+    options.pointOpacity = 0;
+    if (options.pointSize == null) options.pointSize = 0;
+  }
+  if (!isPolyline && /(?:^|_)bez_curve_\d+_\d+$/.test(id)) {
+    if (!options.parametricDomain) options.parametricDomain = { min: '0', max: '1' };
+    options.points = false;
+    options.pointOpacity = 0;
+  } else if (!isPolyline && (/(?:^|_)dft_plot_\d+$/.test(id) || /(?:^|_)hd_plot_\d+$/.test(id))) {
     options.parametricDomain = { min: '0', max: '2\\pi' };
+    options.points = false;
   }
   if (/(?:^|_)fill_poly_\d+$/.test(id)) {
     if (options.fill === undefined) options.fill = true;
@@ -2365,12 +2926,18 @@ const isFillExpression = (expr: any): boolean =>
   /(?:^|_)fill_poly_\d+$/.test(String(expr.id || ''));
 
 const isTableExpression = (expr: any): boolean =>
-  expr?.type === 'table' || /(?:^|_)fill_table_\d+$/.test(String(expr?.id || ''));
+  expr?.type === 'table'
+  || /(?:^|_)(?:fill_table|bez_table)_\d+/.test(String(expr?.id || ''));
 
 const isOutlinePlotExpression = (expr: any): boolean =>
   /(?:^|_)dft_plot_\d+$/.test(String(expr?.id || ''))
+  || /(?:^|_)bez_plot_\d+_\d+$/.test(String(expr?.id || ''))
+  || /(?:^|_)bez_curve_\d+_\d+$/.test(String(expr?.id || ''))
   || /(?:^|_)hd_plot_\d+$/.test(String(expr?.id || ''))
   || /^gif_flat_plot_\d+$/.test(String(expr?.id || ''));
+
+const isBezierHelperExpression = (expr: any): boolean =>
+  /(?:^|_)bez_b[xy]$/.test(String(expr?.id || ''));
 
 const toHiddenFillExpr = (expr: any) => ({
   ...prepareFourierExpression(expr),
@@ -2390,6 +2957,8 @@ const getContourGroupKey = (expr: any): string | null => {
   const id = String(expr.id || '');
   const dft = id.match(/^(.*)dft_(?:plot|freq|real|imag|x|y)_(\d+)$/);
   if (dft) return `${dft[1]}dft_${dft[2]}`;
+  const bez = id.match(/^(.*)bez_(?:plot|curve)_(\d+)_\d+$/);
+  if (bez) return `${bez[1]}bez_${bez[2]}`;
   const hd = id.match(/^(.*)hd_(?:plot|freq|real|imag|x|y)_(\d+)$/);
   if (hd) return `${hd[1]}hd_${hd[2]}`;
   return null;
@@ -2425,7 +2994,12 @@ const partitionExpressions = (expressions: any[]) => {
   const fills: any[] = [];
   const contours: any[] = [];
   for (const expr of expressions) {
-    if (isSliderExpression(expr) || isFolderExpression(expr) || isTableExpression(expr)) {
+    if (
+      isSliderExpression(expr)
+      || isFolderExpression(expr)
+      || isTableExpression(expr)
+      || isBezierHelperExpression(expr)
+    ) {
       meta.push(expr);
     } else if (isFillExpression(expr)) fills.push(expr);
     else contours.push(expr);
