@@ -1,6 +1,8 @@
 /**
- * 浏览器端 API 调用辅助（DeepSeek / Gemini 等同源代理，避免 CORS）
+ * 浏览器端 API 调用辅助（DeepSeek / Gemini / 其它 OpenAI 兼容同源代理，避免 CORS）
  */
+
+import { getCompatProxyUrl, OPENAI_COMPAT_PROXY_ENDPOINTS } from './api-compat-allowlist';
 
 export const DEEPSEEK_PROXY_BASE = '/api/deepseek';
 export const GEMINI_PROXY_BASE = '/api/gemini';
@@ -30,12 +32,19 @@ export const buildProviderRequest = (
   if (providerId === 'google') {
     return { url: getGeminiChatCompletionsUrl(), headers: buildBearerHeaders(apiKey) };
   }
+  // OpenAI / Groq / 国内兼容接口等：走同源代理，避免浏览器 CORS 拦截自定义 Key
+  if (providerId in OPENAI_COMPAT_PROXY_ENDPOINTS) {
+    return {
+      url: getCompatProxyUrl(providerId),
+      headers: {
+        ...buildBearerHeaders(apiKey),
+        'X-Desmos-Provider': providerId,
+      },
+    };
+  }
   return {
     url: endpoint,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
+    headers: buildBearerHeaders(apiKey),
   };
 };
 

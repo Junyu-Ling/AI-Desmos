@@ -72,14 +72,47 @@ function readStoredApiKey(): string {
   );
 }
 
-export const getApiConfig = (): { provider: ApiProviderId; key: string; model: string } => {
-  const storedKey = readStoredApiKey();
+export type ApiConfigOverrides = {
+  provider?: ApiProviderId | string;
+  model?: string;
+  key?: string;
+};
+
+/** 把当前 UI 里的 Key/服务商立刻写入 localStorage，保证 getApiConfig 与界面一致 */
+export const persistApiConfig = (key: string, provider: string, model: string): void => {
+  try {
+    const trimmed = key.trim();
+    if (!trimmed) return;
+    localStorage.setItem('desmos_api_key', trimmed);
+    localStorage.setItem('desmos_api_provider', provider);
+    localStorage.setItem('desmos_api_model', model);
+    localStorage.removeItem('deepseek_api_key');
+    localStorage.removeItem('claude_api_key');
+  } catch {
+    /* private mode */
+  }
+};
+
+export const getApiConfig = (
+  overrides?: ApiConfigOverrides,
+): { provider: ApiProviderId; key: string; model: string } => {
+  const storedKey = (overrides?.key !== undefined ? overrides.key : readStoredApiKey()).trim();
   const savedProvider = localStorage.getItem('desmos_api_provider');
   const detected = storedKey ? detectProviderFromKey(storedKey) : null;
-  let provider = (detected?.id || savedProvider || 'deepseek') as ApiProviderId;
+  // 覆盖 > 明确识别 > 用户已保存 > 默认 DeepSeek
+  // （避免未点「保存」时仍按旧 provider 发请求）
+  let provider = (
+    overrides?.provider
+    || detected?.id
+    || savedProvider
+    || 'deepseek'
+  ) as ApiProviderId;
   if (!storedKey && provider === 'google') provider = 'deepseek';
   const providerConfig = resolveProviderConfig(provider);
-  let model = localStorage.getItem('desmos_api_model') || providerConfig.defaultModel;
+  let model =
+    overrides?.model
+    || localStorage.getItem('desmos_api_model')
+    || providerConfig.defaultModel;
   if (!storedKey && model.includes('gemini')) model = providerConfig.defaultModel;
   return { provider, key: storedKey, model };
 };
@@ -178,10 +211,14 @@ const DESMOS_OFFICIAL_SYNTAX_ZH: string[] = [
   '- 导数：<DESMOS>\\\\frac{d}{dx}(f(x))</DESMOS> 或 f^{\\\\prime}(x)；可画导函数曲线。',
   '- 无穷限：<DESMOS>\\\\int_{1}^{\\\\infty} \\\\frac{1}{x^2} dx</DESMOS>（infinity/infty）。',
   '',
-  '【列表与回归 Lists & Regressions】',
+  '【列表 / 表格与回归 Lists, Tables & Regressions】',
   '- 列表 [1,2,3]、[1...10]；可一次画多条曲线。',
+  '- **密集点图 / 折线艺术（强烈推荐）**：用列表存坐标再引用，少占表达式行、精度更高。',
+  '  例：<DESMOS>x_{1}=[0,1,2,1.5]</DESMOS><DESMOS>y_{1}=[0,2,0,1]</DESMOS><DESMOS>\\\\operatorname{polygon}(x_{1},y_{1})</DESMOS>',
+  '  或折线：<DESMOS>\\\\left(x_{1},y_{1}\\\\right)</DESMOS>（需先定义 x_{1},y_{1} 列表，并打开 lines）。',
   '- 回归 **必须用 ~**：<DESMOS>y_1 ~ ax_1^2+c</DESMOS>（**不是 =**）；数据列 x_1,y_1。',
   '- 列表推导 (x,y) for x=[1...10], y=[1...10]（Desmos 关键字 for）。',
+  '- **禁止**把几十个点全部写成超长 (x,y),(x,y),... 内联；点数 ≥8 时优先列表。',
   '',
   '【变量命名与乘法】',
   '- **下标变量**：数字必须写成下标形式 a_{1}、x_{1}、y_{1}，**严禁** a1、x1 等直接粘连写法（Desmos 不认识）。',
@@ -244,10 +281,14 @@ const DESMOS_OFFICIAL_SYNTAX_EN: string[] = [
   '- Derivatives: <DESMOS>\\\\frac{d}{dx}(f(x))</DESMOS> or f^{\\\\prime}(x).',
   '- Infinite limits: \\\\int_{1}^{\\\\infty} ... dx.',
   '',
-  '【Lists & Regressions】',
+  '【Lists, Tables & Regressions】',
   '- Lists [1,2,3], [1...10]; plot many curves at once.',
+  '- **Dense point art (strongly preferred)**: store coords in lists, then reference — fewer rows, higher precision.',
+  '  Example: <DESMOS>x_{1}=[0,1,2,1.5]</DESMOS><DESMOS>y_{1}=[0,2,0,1]</DESMOS><DESMOS>\\\\operatorname{polygon}(x_{1},y_{1})</DESMOS>',
+  '  Or polyline: <DESMOS>\\\\left(x_{1},y_{1}\\\\right)</DESMOS> after defining list columns (enable lines).',
   '- Regression **must use ~**: <DESMOS>y_1 ~ ax_1^2+c</DESMOS> (**not =**); columns x_1, y_1.',
   '- Comprehension: (x,y) for x=[1...10], y=[1...10].',
+  '- **Never** inline dozens of (x,y) points; if ≥8 points, prefer lists.',
   '',
   '【Variable naming & multiplication】',
   '- **Subscript variables**: digits must be subscripts — a_{1}, x_{1}, y_{1}. **Never** a1, x1 (Desmos rejects bare letter+digit names).',
@@ -382,6 +423,10 @@ const PROMPT_ZH = [
   '    - 用户指定颜色时，说明可在表达式行左侧色块修改；公式内不写颜色关键字。',
   '    - 极坐标「上色」：改 x-y 不等式，或只画 r=f(\\\\theta) 曲线不填色。',
   '',
+  '6.  **点阵/多边形艺术（减行 + 提精度）**：',
+  '    - 复杂图形优先用列表坐标 + polygon / 折线，避免几十条独立点表达式。',
+  '    - 坐标保留 4~5 位小数；点数 ≥8 时：先 <DESMOS>x_{1}=[...]</DESMOS><DESMOS>y_{1}=[...]</DESMOS>，再 polygon(x_{1},y_{1})。',
+  '',
 ].join('\n'); // 把数组的每个字符串用换行符连接成一个完整的字符串
 
 // ── 英文系统提示词 ────────────────────────────────────────────────────────────
@@ -474,6 +519,10 @@ const PROMPT_EN = [
   '    - User can change fill color via the expression color swatch.',
   '    - Polar coloring: convert to x-y inequalities, or use r=f(\\\\theta) curve without fill.',
   '',
+  '6.  **Point-art / polygons (fewer rows, higher precision)**:',
+  '    - Prefer list coords + polygon / polyline over dozens of separate point rows.',
+  '    - Keep 4–5 decimal places; if ≥8 points: define x_{1}=[...], y_{1}=[...] then polygon(x_{1},y_{1}).',
+  '',
 ].join('\n');
 
 // ── 语言 → 提示词映射 ─────────────────────────────────────────────────────────
@@ -507,8 +556,14 @@ export const getSystemPrompt = (lang: string = 'zh') => {
  * @param lang     - 语言（'zh' 或 'en'），用于选择系统提示词
  * @returns AI 的完整回复字符串
  */
-export const callDeepSeek = async (messages: ChatMessage[], apiKey?: string, lang: string = 'zh', systemOverride?: string) => {
-  const cfg = getApiConfig();
+export const callDeepSeek = async (
+  messages: ChatMessage[],
+  apiKey?: string,
+  lang: string = 'zh',
+  systemOverride?: string,
+  configOverrides?: ApiConfigOverrides,
+) => {
+  const cfg = getApiConfig({ ...configOverrides, key: apiKey ?? configOverrides?.key });
   const providerConfig = resolveProviderConfig(cfg.provider);
   const systemPrompt = systemOverride ?? getSystemPrompt(lang);
 
@@ -620,9 +675,13 @@ export const callDeepSeekStream = async (
   apiKey?: string,
   lang: string = 'zh',
   claudeKey?: string,
-  useComputerUse: boolean = false   // 默认不启用长手模式
+  useComputerUse: boolean = false,   // 默认不启用长手模式
+  configOverrides?: ApiConfigOverrides,
 ) => {
-  const cfg = getApiConfig();
+  const cfg = getApiConfig({
+    ...configOverrides,
+    key: apiKey ?? configOverrides?.key,
+  });
   const providerConfig = resolveProviderConfig(cfg.provider);
 
   if (providerConfig.format === 'anthropic') {
@@ -1147,9 +1206,13 @@ export const callDeepSeekSolveStream = async (
   onChunk: (chunk: string) => void,
   apiKey?: string,
   lang: string = 'zh',
-  onProgress?: (stage: 'ocr' | 'analyzing') => void
+  onProgress?: (stage: 'ocr' | 'analyzing') => void,
+  configOverrides?: ApiConfigOverrides,
 ): Promise<void> => {
-  const cfg = getApiConfig();
+  const cfg = getApiConfig({
+    ...configOverrides,
+    key: apiKey ?? configOverrides?.key,
+  });
   const providerConfig = resolveProviderConfig(cfg.provider);
   const key = getEffectiveApiKey(apiKey);
   const l = (lang === 'en' ? 'en' : 'zh') as 'zh' | 'en';

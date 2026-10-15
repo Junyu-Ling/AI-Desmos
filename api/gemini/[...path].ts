@@ -2,8 +2,16 @@
  * Gemini API 服务端代理（Vercel Serverless）
  * - 密钥保存在服务端环境变量 GEMINI_API_KEY，不暴露给浏览器
  * - OpenAI 兼容端点使用 Authorization: Bearer；客户端可传该头覆盖为用户自配 Key
+ * - 支持 SSE 流式转发
  */
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+
+export const config = {
+  api: {
+    bodyParser: true,
+    responseLimit: false,
+  },
+};
 
 function extractBearerKey(authHeader: string | string[] | undefined): string {
   const raw = Array.isArray(authHeader) ? authHeader[0] : authHeader;
@@ -50,6 +58,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const contentType = upstream.headers.get('content-type');
   if (contentType) res.setHeader('Content-Type', contentType);
 
-  const text = await upstream.text();
-  res.send(text);
+  const body = upstream.body;
+  if (body && typeof (body as ReadableStream<Uint8Array>).getReader === 'function') {
+    const reader = (body as ReadableStream<Uint8Array>).getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) res.write(Buffer.from(value));
+      }
+      res.end();
+      return;
+    } catch {
+      /* fall through */
+    }
+  }
+
+  res.send(await upstream.text());
 }

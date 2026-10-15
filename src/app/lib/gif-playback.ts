@@ -188,6 +188,7 @@ export class GifWindowedPlaybackManager {
           folderId,
           folderTitle: `帧 ${frame.index + 1}`,
           folderHidden: false,
+          fastInject: true,
         },
       );
       this.knownIds.add(folderId);
@@ -279,6 +280,8 @@ export class GifWindowedPlaybackManager {
         folderId: FLAT_OUTLINE_FOLDER_ID,
         folderTitle: '轮廓（全帧合并）',
         folderHidden: false,
+        folderCollapsed: false,
+        fastInject: true,
       },
     );
     this.knownIds.add(FLAT_OUTLINE_FOLDER_ID);

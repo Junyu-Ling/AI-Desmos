@@ -108,10 +108,99 @@ export default defineConfig(({ mode }) => {
     if (key) proxyReq.setHeader('Authorization', `Bearer ${key}`);
   };
 
+  const openaiCompatDevProxy = () => ({
+    name: 'openai-compat-dev-proxy',
+    configureServer(server: import('vite').ViteDevServer) {
+      server.middlewares.use(async (req, res, next) => {
+        if (!req.url?.startsWith('/api/compat')) {
+          next();
+          return;
+        }
+
+        try {
+          const { OPENAI_COMPAT_PROXY_ENDPOINTS } = await import('./src/app/lib/api-compat-allowlist');
+          const url = new URL(req.url, 'http://localhost');
+          const providerId = (
+            url.searchParams.get('provider')
+            || (typeof req.headers['x-desmos-provider'] === 'string' ? req.headers['x-desmos-provider'] : '')
+            || ''
+          ).trim().toLowerCase();
+          const targetUrl = OPENAI_COMPAT_PROXY_ENDPOINTS[providerId];
+          if (!targetUrl) {
+            res.statusCode = 400;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: `Unsupported provider: ${providerId || '(missing)'}` }));
+            return;
+          }
+
+          const auth = req.headers.authorization;
+          const bearerMatch = typeof auth === 'string' && auth.match(/^Bearer\s+(.+)$/i);
+          const apiKey = bearerMatch?.[1]?.trim() || '';
+          if (!apiKey) {
+            res.statusCode = 401;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'Missing Authorization Bearer API key' }));
+            return;
+          }
+
+          const chunks: Buffer[] = [];
+          await new Promise<void>((resolve, reject) => {
+            req.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+            req.on('end', () => resolve());
+            req.on('error', reject);
+          });
+          const bodyBuf = Buffer.concat(chunks);
+
+          const upstreamHeaders: Record<string, string> = {
+            'Content-Type': req.headers['content-type'] || 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          };
+          if (providerId === 'openrouter') {
+            upstreamHeaders['HTTP-Referer'] = 'http://localhost:5173';
+            upstreamHeaders['X-Title'] = 'AI Desmos';
+          }
+
+          const upstream = await fetch(targetUrl, {
+            method: req.method || 'POST',
+            headers: upstreamHeaders,
+            body: req.method !== 'GET' && req.method !== 'HEAD' ? bodyBuf : undefined,
+          });
+
+          res.statusCode = upstream.status;
+          const contentType = upstream.headers.get('content-type');
+          if (contentType) res.setHeader('Content-Type', contentType);
+
+          if (!upstream.body) {
+            res.end(await upstream.text());
+            return;
+          }
+
+          const reader = upstream.body.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) res.write(Buffer.from(value));
+          }
+          res.end();
+        } catch (err) {
+          console.error('[openai-compat-dev-proxy]', err);
+          if (!res.headersSent) {
+            res.statusCode = 502;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'Compat proxy failed' }));
+          } else {
+            res.end();
+          }
+        }
+      });
+    },
+  });
+
   return {
   plugins: [
     stripPackageVersion(), // 自定义：解析 package@version 导入
     figmaAssetResolver(), // 自定义：解析 figma:asset/ 资源路径
+    openaiCompatDevProxy(),
 
     // The React and Tailwind plugins are both required for Make, even if
     // Tailwind is not being actively used – do not remove them

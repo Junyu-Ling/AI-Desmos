@@ -135,12 +135,12 @@ export const translations = {
     smart_draw_mode_title: '选择绘图方式',
     smart_draw_mode_outline: '仅轮廓',
     smart_draw_mode_outline_desc: 'Sobel 边缘检测勾线，可选黑白或彩色',
-    outline_style_title: '轮廓颜色（「仅轮廓」模式）',
+    outline_style_title: '轮廓颜色',
     outline_style_mono: '黑白线稿',
     outline_style_mono_desc: '统一黑色轮廓',
-    outline_style_color: '彩色轮廓',
-    outline_style_color_desc: '沿边缘采样原图颜色',
-    outline_style_hint: '「轮廓+涂色」模式忽略此项，始终勾线+填色。',
+    outline_style_color: '按原图取色',
+    outline_style_color_desc: '沿边缘采样图片颜色',
+    outline_style_hint: '「仅轮廓」默认按原图取色；「轮廓+涂色」固定黑线，填色负责颜色。',
     smart_draw_mode_fill: '仅涂色',
     smart_draw_mode_fill_desc: '只用色块还原颜色，不勾线',
     smart_draw_mode_both: '轮廓 + 涂色',
@@ -316,10 +316,9 @@ export const translations = {
     // ── AI 智能纠错 ────────────────────────────────────────────────────────────
     // 纠错按钮上显示的文字
     ai_fix_btn: 'AI 智能纠错',
-    // 点击纠错按钮后，发给 AI 的查询消息模板
-    // {latex} 会被替换成出错的公式，{error} 会被替换成错误信息
     ai_fix_query: '我的公式 `{latex}` 报错了：{error}。请分析错误原因，给出修正后的正确公式（用 <DESMOS> 标签包裹输出），并简要说明改了什么。',
     ai_fix_no_id: '无法定位出错公式，请先点击该公式后再试。',
+    ai_auto_fix_toast: '检测到语法错误，正在自动修复…',
 
     draw_mode_btn: '手绘',
     draw_mode_exit: '退出手绘',
@@ -589,12 +588,12 @@ export const translations = {
     smart_draw_mode_title: 'Choose drawing mode',
     smart_draw_mode_outline: 'Outline only',
     smart_draw_mode_outline_desc: 'Sobel edge outlines — mono or color',
-    outline_style_title: 'Outline color (outline-only mode)',
+    outline_style_title: 'Outline color',
     outline_style_mono: 'Black & white',
     outline_style_mono_desc: 'Uniform black strokes',
-    outline_style_color: 'Color outlines',
+    outline_style_color: 'From image',
     outline_style_color_desc: 'Sample colors along edges',
-    outline_style_hint: 'Ignored in fill+both mode.',
+    outline_style_hint: 'Outline-only defaults to image colors. Outline+fill always uses black strokes; fill carries the color.',
     smart_draw_mode_fill: 'Fill only',
     smart_draw_mode_fill_desc: 'Color blocks only, no outlines',
     smart_draw_mode_both: 'Outline + fill',
@@ -763,6 +762,7 @@ export const translations = {
     ai_fix_btn: 'AI Smart Fix',
     ai_fix_query: 'My formula `{latex}` has an error: {error}. Please analyze the issue, provide the corrected formula in <DESMOS> tags, and briefly explain what was changed.',
     ai_fix_no_id: 'Could not locate the errored expression. Click it first, then try again.',
+    ai_auto_fix_toast: 'Syntax error detected — auto-fixing…',
 
     draw_mode_btn: 'Draw',
     draw_mode_exit: 'Exit Draw',

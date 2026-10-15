@@ -47,6 +47,11 @@ import { Onboarding } from './components/Onboarding';               // 首次使
 
 // 导入工具函数：自动纠正中文标点
 import { autoCorrectInput } from './lib/utils';
+import {
+  DesmosAutoRepairController,
+  collectDesmosErrors,
+  isAutoRepairCandidate,
+} from './lib/desmos-auto-repair';
 
 // re-resizable 是一个让 div 可以拖拽调整大小的库
 // Resizable 组件包裹右侧聊天栏，使其左边缘可拖拽
@@ -153,6 +158,9 @@ function App() {
    * 直接替换画板上对应 ID 的那条公式，而不是清空整个画板重画。
    */
   const [externalCorrectionExprId, setExternalCorrectionExprId] = useState('');
+  const autoRepairRef = useRef(new DesmosAutoRepairController(2));
+  const autoRepairTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoRepairAiBusyRef = useRef(false);
 
   /**
    * desmosStatus — Desmos 计算器的加载状态
@@ -434,6 +442,33 @@ function App() {
         return;
       }
 
+      // AI 注入的公式出错：先本地修，修不掉再自动开 AI 纠错（无需用户点按钮）
+      const aiErrors = errors.filter(e => isAutoRepairCandidate(e.id));
+      if (aiErrors.length > 0 && calculator && !autoRepairAiBusyRef.current) {
+        if (autoRepairTimerRef.current) clearTimeout(autoRepairTimerRef.current);
+        autoRepairTimerRef.current = setTimeout(() => {
+          const latest = collectDesmosErrors(calculator).filter(e => isAutoRepairCandidate(e.id));
+          if (latest.length === 0) return;
+          const { needAi } = autoRepairRef.current.process(calculator, latest);
+          const next = needAi[0];
+          if (!next || autoRepairAiBusyRef.current) {
+            needAi.forEach(e => autoRepairRef.current.releaseAi(e.id));
+            return;
+          }
+          autoRepairAiBusyRef.current = true;
+          setIsChatOpen(true);
+          setExternalCorrectionExprId(next.id);
+          setExternalQuery(t('ai_fix_query', { latex: next.latex, error: next.error }));
+          setActiveError(null);
+          toast.message(t('ai_auto_fix_toast'));
+          // 等 AI 流式写回后再放开；期间避免连环开多轮纠错
+          window.setTimeout(() => {
+            autoRepairRef.current.releaseAi(next.id);
+            autoRepairAiBusyRef.current = false;
+          }, 14000);
+        }, 900);
+      }
+
       const target = (focusedExprId && errors.find(e => e.id === focusedExprId)) || errors[0];
       const exprItem = target.id !== 'unknown' ? findExprItemById(target.id) : focusedExprItem;
 
@@ -487,8 +522,9 @@ function App() {
       container.removeEventListener('click', checkErrorState, true);
       clearInterval(interval);
       unsubscribeChange?.();
+      if (autoRepairTimerRef.current) clearTimeout(autoRepairTimerRef.current);
     };
-  }, [calculator]); // 依赖 calculator：calculator 就绪后才开始监测
+  }, [calculator, t]); // t：自动纠错文案随语言切换
 
   useEffect(() => {
     if (calculator) {

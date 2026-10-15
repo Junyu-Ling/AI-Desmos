@@ -57,6 +57,7 @@ import {
   ChatMessage,
   ApiProvider,
   getApiConfig,
+  persistApiConfig,
   detectProviderFromKey,
   getProviderById,
 } from '../lib/deepseek';
@@ -581,10 +582,36 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
 
   const handleApiKeyChange = (value: string) => {
     setCustomApiKey(value);
-    const detected = detectProviderFromKey(value);
+    const trimmed = value.trim();
+
+    if (!trimmed) {
+      setApiProvider('deepseek');
+      setApiModel('deepseek-chat');
+      try {
+        localStorage.removeItem('desmos_api_key');
+        localStorage.removeItem('desmos_api_provider');
+        localStorage.removeItem('desmos_api_model');
+      } catch { /* private mode */ }
+      return;
+    }
+
+    // 明确识别优先；否则 sk- 默认 DeepSeek（本应用最常见）
+    const detected =
+      detectProviderFromKey(value)
+      || (/^sk-/i.test(trimmed) ? getProviderById('deepseek') : null);
+
+    let nextProvider = apiProvider;
+    let nextModel = apiModel;
     if (detected) {
-      setApiProvider(detected.id);
-      setApiModel(prev => detected.models.includes(prev) ? prev : detected.defaultModel);
+      nextProvider = detected.id;
+      nextModel = detected.models.includes(apiModel) ? apiModel : detected.defaultModel;
+      setApiProvider(nextProvider);
+      setApiModel(nextModel);
+    }
+
+    // 粘贴后立刻持久化，避免「没点保存 / 关闭面板」导致仍走旧服务商或试用 Key
+    if (trimmed.length >= 8) {
+      persistApiConfig(trimmed, nextProvider, nextModel);
     }
   };
 
@@ -652,8 +679,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
 
   /** drawModeRef — 用户选定的绘图模式，供文件选择器回调使用 */
   const drawModeRef = useRef<SmartDrawMode>('both');
-  const outlineStyleRef = useRef<OutlineStyle>('mono');
-  const [outlineStyle, setOutlineStyle] = useState<OutlineStyle>('mono');
+  const outlineStyleRef = useRef<OutlineStyle>('color');
+  const [outlineStyle, setOutlineStyle] = useState<OutlineStyle>('color');
 
   /** GIF 质量档位（标准 / 电影级） */
   const gifQualityRef = useRef<GifQualityTier>('perfect');
@@ -692,12 +719,16 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
    * 关闭设置面板并弹出成功提示。
    */
   const handleSaveSettings = () => {
-    localStorage.setItem('desmos_api_key', customApiKey.trim());
-    localStorage.setItem('desmos_api_provider', apiProvider);
-    localStorage.setItem('desmos_api_model', apiModel);
+    if (customApiKey.trim()) {
+      persistApiConfig(customApiKey, apiProvider, apiModel);
+    } else {
+      localStorage.removeItem('desmos_api_key');
+      localStorage.removeItem('desmos_api_provider');
+      localStorage.removeItem('desmos_api_model');
+      localStorage.removeItem('deepseek_api_key');
+      localStorage.removeItem('claude_api_key');
+    }
     localStorage.setItem('claude_long_hand', claudeLongHand ? '1' : '0');
-    localStorage.removeItem('deepseek_api_key');
-    localStorage.removeItem('claude_api_key');
     setShowSettings(false);
     alert(t('settings_saved_ok'));
   };
@@ -1015,7 +1046,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
       mode,
       outlineStyle: outlineStyleRef.current,
       apiKey: customApiKey,
-      enableAiRepair: mode === 'both',
+      enableAiRepair: false,
       onRepairProgress: (phase) => {
         const key = phase === 'ai_analyze' ? 'drawing_ai_repair' : 'drawing_local_repair';
         setMessages(prev => prev.map(m =>
@@ -1129,7 +1160,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
         if (correctionExprId) {
             history.push({
                 role: 'system',
-                content: "SYSTEM ALERT: You are in 'Correction Mode'. The user has a formula with a syntax error. You MUST: 1) Output EXACTLY ONE corrected formula wrapped in <DESMOS> tags. 2) Keep the formula semantically close to what the user intended. 3) Briefly explain what was wrong and what you changed. 4) Do NOT output multiple <DESMOS> blocks. 5) Do NOT add or remove other canvas expressions."
+                content: "SYSTEM ALERT: You are in 'Correction Mode'. The user has a formula with a syntax error. You MUST: 1) Output EXACTLY ONE corrected formula wrapped in <DESMOS> tags. 2) Keep the formula semantically close to what the user intended. 3) Briefly explain what was wrong and what you changed. 4) Do NOT output multiple <DESMOS> blocks. 5) Do NOT add or remove other canvas expressions. Common fixes: subscripts a_{1} not a1; \\left|x\\right| not |x|; no semicolon; no comma before \\left\\{; implicit multiply ax not a*x."
             });
         } else {
             history.push({
@@ -1179,7 +1210,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
       }
       // ────────────────────────────────────────────────────────────────────
 
-      await callDeepSeekStream(history, (chunk) => {
+      await callDeepSeekStream(
+        history,
+        (chunk) => {
           fullRawContent += chunk;
           const displayContent = processDesmosStreamChunk(
             fullRawContent,
@@ -1190,7 +1223,13 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
           setMessages(prev => prev.map(m =>
               m.id === aiMsgId ? { ...m, content: displayContent, rawContent: fullRawContent } : m
           ));
-      }, customApiKey, requestLang, customApiKey, claudeLongHand); 
+        },
+        customApiKey,
+        requestLang,
+        customApiKey,
+        claudeLongHand,
+        { provider: apiProvider, model: apiModel, key: customApiKey },
+      ); 
       
     } catch (error: any) {
       if (isAbortError(error)) return;
@@ -1505,7 +1544,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
             mode,
             outlineStyle: outlineStyleRef.current,
             apiKey: customApiKey,
-            enableAiRepair: mode === 'both',
+            enableAiRepair: false,
             onRepairProgress: (phase) => {
                 const key = phase === 'ai_analyze' ? 'drawing_ai_repair' : 'drawing_local_repair';
                 setMessages(prev => prev.map(m =>
@@ -1675,7 +1714,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
           setMessages(prev => prev.map(m =>
             m.id === aiMsgId ? { ...m, content: stageMsg } : m
           ));
-        }
+        },
+        { provider: apiProvider, model: apiModel, key: customApiKey },
       );
 
     } catch (error: any) {
@@ -2637,7 +2677,12 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
                                         {currentProviderConfig.models.map(m => (
                                             <button
                                                 key={m}
-                                                onClick={() => setApiModel(m)}
+                                                onClick={() => {
+                                                  setApiModel(m);
+                                                  if (customApiKey.trim()) {
+                                                    persistApiConfig(customApiKey, apiProvider, m);
+                                                  }
+                                                }}
                                                 className={`px-3 py-1.5 rounded-lg border text-xs font-mono font-medium transition-all ${
                                                     apiModel === m
                                                         ? 'bg-gray-900 border-gray-900 text-white'

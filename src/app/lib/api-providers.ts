@@ -130,7 +130,7 @@ export const API_PROVIDERS: ProviderConfig[] = [
     endpoint: 'https://api.openai.com/v1/chat/completions',
     defaultModel: 'gpt-4o-mini',
     models: ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini', 'o3-mini'],
-    keyPatterns: [/^sk-proj-/i, /^sk-live-/i],
+    keyPatterns: [/^sk-proj-/i, /^sk-svcacct-/i, /^sk-live-/i, /T3BlbkFJ/],
     format: 'openai',
     docsUrl: 'https://platform.openai.com',
   },
@@ -329,10 +329,12 @@ export function detectProviderFromKey(apiKey: string): ProviderConfig | null {
     }
   }
 
-  if (/^sk-/i.test(key)) {
+  // DeepSeek 经典 Key：sk- + 32 位十六进制
+  if (/^sk-[a-f0-9]{32}$/i.test(key)) {
     return getProviderById('deepseek') ?? null;
   }
 
+  // 其它 sk- 过短或格式不明：不强制判定，交给已保存的 provider / UI 状态
   return null;
 }
 

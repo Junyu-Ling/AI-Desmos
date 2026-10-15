@@ -10,7 +10,8 @@ export type GifFrameVisibilitySet = {
 };
 
 const isFillId = (id: string) => /(?:^|_)fill_poly_\d+$/.test(id);
-const isPlotId = (id: string) => /(?:^|_)dft_plot_\d+$/.test(id) || /(?:^|_)hd_plot_\d+$/.test(id);
+const isPlotId = (id: string) =>
+  /(?:^|_)dft_plot_(?:hold_\d+_)?\d+$/.test(id) || /(?:^|_)hd_plot_\d+$/.test(id);
 
 /** 从单帧表达式中拆分「需显示」与「辅助（始终隐藏）」id */
 export function classifyGifFrameExpressionIds(expressions: any[]): Omit<GifFrameVisibilitySet, 'timeStart' | 'timeEnd'> {
@@ -64,6 +65,13 @@ export class GifFrameArchive {
       visibleIds: ids.visibleIds,
       auxIds: ids.auxIds,
     });
+  }
+
+  /** 覆盖已有帧的表达式（用于补回跨帧闪掉的轮廓） */
+  replace(index: number, expressions: any[]): void {
+    const existing = this.frames.get(index);
+    if (!existing) return;
+    this.add(index, existing.timeStart, existing.timeEnd, expressions);
   }
 
   get(index: number): StoredGifFrame | undefined {

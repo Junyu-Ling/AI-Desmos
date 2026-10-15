@@ -26,7 +26,7 @@ import React, { useState } from 'react';
 
 // 导入国际化 Hook（中英双语支持）
 import { useLanguage } from '../lib/i18n';
-import { detectProviderFromKey } from '../lib/api-providers';
+import { detectProviderFromKey, getProviderById } from '../lib/api-providers';
 
 // 从 lucide-react 图标库导入所需图标
 // ChevronRight — 向右的箭头（"下一步"按钮）
@@ -113,14 +113,19 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
    */
   const handleFinish = () => {
     if (apiKeyMode === 'custom' && customKey) {
-      localStorage.setItem('desmos_api_key', customKey);
-      const detected = detectProviderFromKey(customKey);
-      if (detected) {
-        localStorage.setItem('desmos_api_provider', detected.id);
-        localStorage.setItem('desmos_api_model', detected.defaultModel);
-      }
+      const detected =
+        detectProviderFromKey(customKey)
+        || (/^sk-/i.test(customKey.trim()) ? getProviderById('deepseek') : null)
+        || getProviderById('deepseek')!;
+      localStorage.setItem('desmos_api_key', customKey.trim());
+      localStorage.setItem('desmos_api_provider', detected.id);
+      localStorage.setItem('desmos_api_model', detected.defaultModel);
+      localStorage.removeItem('deepseek_api_key');
+      localStorage.removeItem('claude_api_key');
     } else {
       localStorage.removeItem('desmos_api_key');
+      localStorage.removeItem('desmos_api_provider');
+      localStorage.removeItem('desmos_api_model');
       localStorage.removeItem('deepseek_api_key');
     }
 

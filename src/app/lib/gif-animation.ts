@@ -14,13 +14,19 @@ import {
 import {
   generateFourierExpressionsFromContext,
   initGifStreamCalculator,
+  measureOutlineCalibration,
+  mergeOutlineCalibrations,
   retimeGifFrameExpressions,
   updateGifStreamDuration,
   yieldQuick,
   yieldToInteractive,
+  type OutlineCalibration,
 } from './image-processing';
 import {
   analyzeSmartDrawBatchWithAI,
+  applyLocalImageRepair,
+  analyzeImageHeuristically,
+  mergeSmartDrawTuning,
   prepareSmartDrawFromAiResult,
   type SmartDrawMode,
   type SmartDrawAIContour,
@@ -43,6 +49,7 @@ import {
   GifWindowedPlaybackManager,
 } from './gif-playback';
 import { GifFrameArchive } from './gif-frame-archive';
+import { stabilizeGifOutlineArchive } from './gif-outline-stabilize';
 import type { GifQualityProfile } from './gif-quality';
 
 export { GIF_TIME_SLIDER, GIF_SLIDER_STEP };
@@ -62,10 +69,11 @@ const releaseTimelineKeyframe = (kf: DecodedGifKeyframe) => {
 const isAbortError = (error: unknown) =>
   error instanceof DOMException && error.name === 'AbortError';
 
-/** 合并 AI / 档位 tuning：高保真档强制保留细节 */
+/** 合并 AI / 档位 tuning：高保真档强制保留细节，预处理参数全动画锁死 */
 const mergeGifTuning = (
   aiResult: { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] } | undefined,
   profile: GifQualityProfile,
+  calibration?: OutlineCalibration | null,
 ): { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] } | undefined => {
   const defaults: Partial<SmartDrawTuningParams> = {
     maxContours: profile.maxContours,
@@ -77,6 +85,9 @@ const mergeGifTuning = (
     // 门槛是相对本帧最强边缘算的，卡太高会让同一个部位（手、耳朵）
     // 在动作模糊的帧掉出去、清晰的帧留下来，逐帧看就是忽有忽无
     strengthThresholdRatio: profile.preserveFineDetails ? 0.10 : 0.18,
+    invertColors: calibration?.invertColors ?? false,
+    contrastBoost: calibration?.contrastBoost ?? 1.35,
+    blurPasses: calibration?.blurPasses ?? 1,
   };
   if (!aiResult) {
     return { tuning: defaults, contours: [] };
@@ -85,6 +96,14 @@ const mergeGifTuning = (
     tuning: {
       ...defaults,
       ...aiResult.tuning,
+      // 这些必须全动画一致：AI / 启发式是逐帧分析的，让它们改这里
+      // 就等于每帧换一套预处理和判噪声标准，同一个部位会闪掉
+      edgeThresholdFactor: defaults.edgeThresholdFactor,
+      strengthThresholdRatio: defaults.strengthThresholdRatio,
+      sharpenAmount: defaults.sharpenAmount,
+      invertColors: defaults.invertColors,
+      contrastBoost: defaults.contrastBoost,
+      blurPasses: defaults.blurPasses,
       // 档位上限优先：不允许 AI 把保真参数压低
       maxContours: Math.max(defaults.maxContours ?? 0, aiResult.tuning.maxContours ?? 0),
       fourierK: Math.max(defaults.fourierK ?? 0, aiResult.tuning.fourierK ?? 0),
@@ -213,6 +232,80 @@ const buildScaledKeyframe = (
     timeEndSec: keyframe.timeEndSec,
     dataUrl,
   };
+};
+
+/** 标定采样帧数：3 帧足够锁门槛，两遍 6 帧会无谓拖长开头 */
+const CALIBRATION_SAMPLE_COUNT = 3;
+
+/**
+ * 标定全动画共用的轮廓阈值和预处理参数。
+ *
+ * 边缘检测的两个门槛、以及反色/对比度/模糊，原本每帧各算一次，于是同一个部位
+ * 存活与否取决于它当帧的邻居有多强、或者当帧要不要反色：主体动作大的帧门槛被
+ * 抬高，手、耳朵这类弱边缘整批掉出去，播起来忽有忽无。
+ * 先在若干帧上投票锁死预处理，再在修复后的画面上量边缘门槛，之后每帧都用同一套。
+ */
+const calibrateOutlineThresholds = async (
+  timeline: DecodedGifTimeline,
+  maxDim: number,
+  profile: GifQualityProfile,
+  mode: SmartDrawMode,
+  signal?: AbortSignal,
+): Promise<OutlineCalibration | null> => {
+  const count = timeline.keyframes.length;
+  if (count === 0) return null;
+
+  const canvas = document.createElement('canvas');
+  const step = Math.max(1, Math.floor(count / CALIBRATION_SAMPLE_COUNT));
+  const sampleIndexes: number[] = [];
+  for (let fi = 0; fi < count; fi += step) sampleIndexes.push(fi);
+
+  const firstKeyframe = timeline.keyframes[sampleIndexes[0]];
+  if (!firstKeyframe) return null;
+  const firstScaled = scaleGifFrame(firstKeyframe.imageData, timeline.width, timeline.height, maxDim);
+  canvas.width = firstScaled.width;
+  canvas.height = firstScaled.height;
+  const firstCtx = canvas.getContext('2d');
+  if (!firstCtx) return null;
+  firstCtx.putImageData(firstScaled.imageData, 0, 0);
+  const firstHeuristic = analyzeImageHeuristically(firstCtx, firstScaled.width, firstScaled.height, mode);
+  const invertColors = firstHeuristic.invertColors;
+  const contrastBoost = firstHeuristic.contrastBoost;
+  const blurPasses = firstHeuristic.blurPasses;
+
+  const lockedTuning = mergeSmartDrawTuning({
+    ...mergeGifTuning(undefined, profile)?.tuning,
+    invertColors,
+    contrastBoost,
+    blurPasses,
+    sharpenAmount: profile.sharpenAmount,
+    edgeThresholdFactor: profile.edgeThresholdFactor,
+  });
+
+  const samples: OutlineCalibration[] = [];
+  for (const fi of sampleIndexes) {
+    if (signal?.aborted) break;
+    const keyframe = timeline.keyframes[fi];
+    if (!keyframe) continue;
+    const scaled = fi === sampleIndexes[0]
+      ? firstScaled
+      : scaleGifFrame(keyframe.imageData, timeline.width, timeline.height, maxDim);
+    canvas.width = scaled.width;
+    canvas.height = scaled.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) break;
+    ctx.putImageData(scaled.imageData, 0, 0);
+    applyLocalImageRepair(ctx, scaled.width, scaled.height, lockedTuning);
+    try {
+      const measured = measureOutlineCalibration(ctx, scaled.width, scaled.height, lockedTuning);
+      samples.push({ ...measured, invertColors, contrastBoost, blurPasses });
+    } catch {
+      // 单帧量不出来不影响整体，继续
+    }
+    await yieldQuick();
+  }
+
+  return mergeOutlineCalibrations(samples);
 };
 
 const scaleChunkParallel = async (
@@ -389,7 +482,9 @@ export async function processGifToDesmosAnimation(
   options: ProcessGifOptions = {},
 ): Promise<ProcessGifResult> {
   const mode = options.mode ?? 'both';
-  const outlineStyle = options.outlineStyle ?? 'mono';
+  const outlineStyle = mode === 'both'
+    ? 'mono'
+    : (options.outlineStyle ?? 'color');
   const enableAi = options.enableAiRepair === true && mode === 'both';
   const baseProfile = getGifQualityProfile(options.quality ?? 'perfect');
   const useStreaming = Boolean(
@@ -420,6 +515,17 @@ export async function processGifToDesmosAnimation(
   // 一格一帧：步长取实际帧间隔，滑块上界取末帧刻度
   const sliderStep = formatGifSliderStep(timeline.frameIntervalSec);
 
+  // 全动画共用一组轮廓门槛，同一个细节不会在部分帧被判成噪声
+  const calibration = mode === 'fill'
+    ? null
+    : await calibrateOutlineThresholds(
+      timeline,
+      maxDim,
+      profile,
+      mode,
+      options.signal,
+    );
+
   let streamInitialized = false;
   if (useStreaming) {
     initGifStreamCalculator(
@@ -443,7 +549,7 @@ export async function processGifToDesmosAnimation(
     sf: ScaledKeyframe,
     aiResult?: { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] },
   ): GifFrameWorkerInput => {
-    const capped = mergeGifTuning(aiResult, profile);
+    const capped = mergeGifTuning(aiResult, profile, calibration);
     return {
       taskId: `f${sf.fi}`,
       pixels: new Uint8ClampedArray(sf.pixels),
@@ -462,6 +568,8 @@ export async function processGifToDesmosAnimation(
       skipFrameRestriction: false,
       fillDetailMode: 'merged',
       compactFourier: true,
+      sharedEdgeStrength: calibration?.edgeStrength,
+      sharedContourStrength: calibration?.contourStrength,
     };
   };
 
@@ -469,7 +577,7 @@ export async function processGifToDesmosAnimation(
     sf: ScaledKeyframe,
     aiResult?: { tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] },
   ): any[] => {
-    const capped = mergeGifTuning(aiResult, profile);
+    const capped = mergeGifTuning(aiResult, profile, calibration);
     const canvas = document.createElement('canvas');
     canvas.width = sf.width;
     canvas.height = sf.height;
@@ -503,6 +611,8 @@ export async function processGifToDesmosAnimation(
       idPrefix: `gif_f${frameSlot}_`,
       skipFrameRestriction: false,
       compactFourier: true,
+      sharedEdgeStrength: calibration?.edgeStrength,
+      sharedContourStrength: calibration?.contourStrength,
     };
     try {
       return generateFourierExpressionsFromContext(ctx, sf.width, sf.height, {
@@ -729,6 +839,11 @@ export async function processGifToDesmosAnimation(
         ));
       }
     }
+  }
+
+  // 短间隙里消失的轮廓补回来（必须在合并扁平列表之前）
+  if (frameArchive && frameArchive.size > 0 && mode !== 'fill') {
+    stabilizeGifOutlineArchive(frameArchive);
   }
 
   if (frameArchive && frameArchive.size > 0) {

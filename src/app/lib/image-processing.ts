@@ -262,8 +262,8 @@ const colorDistance = (
   b: { r: number; g: number; b: number },
 ): number => Math.abs(a.r - b.r) + Math.abs(a.g - b.g) + Math.abs(a.b - b.b);
 
-/** 抗锯齿边缘允许小幅偏差；收紧以减少跨色块合并 */
-const FILL_COLOR_TOLERANCE = 22;
+/** 抗锯齿边缘允许小幅偏差；过宽会把腮红、高光并进大色块 */
+const FILL_COLOR_TOLERANCE = 10;
 
 const colorsSimilarForFill = (
   a: { r: number; g: number; b: number },
@@ -330,17 +330,36 @@ const sampleContourColorFromData = (
   points: Point[],
 ): string => {
   const samples: { r: number; g: number; b: number }[] = [];
-  const step = Math.max(1, Math.floor(points.length / 24));
+  const step = Math.max(1, Math.floor(points.length / 32));
+  let cx = 0, cy = 0;
+  for (const p of points) {
+    cx += p.x;
+    cy += p.y;
+  }
+  cx /= Math.max(1, points.length);
+  cy /= Math.max(1, points.length);
 
-  for (let i = 0; i < points.length; i += step) {
-    const x = Math.round(points[i].x);
-    const y = Math.round(points[i].y);
-    if (x < 0 || x >= width || y < 0 || y >= height) continue;
+  const pushSample = (x: number, y: number) => {
+    if (x < 0 || x >= width || y < 0 || y >= height) return;
     const idx = (y * width + x) * 4;
     const r = data[idx];
     const g = data[idx + 1];
     const b = data[idx + 2];
-    if (!isCanvasBackground(r, g, b)) samples.push({ r, g, b });
+    if (isCanvasBackground(r, g, b)) return;
+    samples.push({ r, g, b });
+  };
+
+  for (let i = 0; i < points.length; i += step) {
+    const x = Math.round(points[i].x);
+    const y = Math.round(points[i].y);
+    pushSample(x, y);
+    // 边缘像素常落在两种颜色交界、容易采成发灰的黑。往轮廓内侧偏 1px，更接近物体本身的颜色。
+    const dx = cx - x;
+    const dy = cy - y;
+    const dist = Math.hypot(dx, dy);
+    if (dist > 1) {
+      pushSample(Math.round(x + dx / dist), Math.round(y + dy / dist));
+    }
   }
 
   if (samples.length === 0) return '#000000';
@@ -350,11 +369,15 @@ const sampleContourColorFromData = (
     return sorted[Math.floor(sorted.length / 2)];
   };
 
-  return rgbToHex(
-    median(samples.map(s => s.r)),
-    median(samples.map(s => s.g)),
-    median(samples.map(s => s.b)),
-  );
+  const r = median(samples.map(s => s.r));
+  const g = median(samples.map(s => s.g));
+  const b = median(samples.map(s => s.b));
+  const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+  // 真正的黑线（头发、墨线）保持纯黑，避免抗锯齿采成脏棕
+  if (lum < 28) return '#000000';
+
+  const quantize = (v: number) => Math.max(0, Math.min(255, Math.round(v / 24) * 24));
+  return rgbToHex(quantize(r), quantize(g), quantize(b));
 };
 
 const sampleContourColor = (
@@ -390,7 +413,9 @@ const extractContours = (
   width: number,
   height: number,
   tuning?: SmartDrawTuningParams,
-): { contours: Point[][], strengths: number[] } => {
+  /** GIF：全动画共用的平均边缘强度，替掉逐帧自适应值 */
+  sharedAvgStrength?: number,
+): { contours: Point[][], strengths: number[], avgStrength: number } => {
 
   // 读取 canvas 上所有像素的 RGBA 数据
   // imageData.data 是一个平坦数组：[R0, G0, B0, A0, R1, G1, B1, A1, ...]
@@ -469,7 +494,12 @@ const extractContours = (
 
   // ── 步骤 4：计算自适应阈值 ─────────────────────────────────────────────
   // 全局平均梯度强度（边缘的"平均水平"）
-  const globalAvgStrength = nonZeroCount > 0 ? (totalGrad / nonZeroCount) : 10;
+  const frameAvgStrength = nonZeroCount > 0 ? (totalGrad / nonZeroCount) : 10;
+  // GIF 逐帧各算一次的话，主体一变强，阈值跟着抬高，弱细节（手、耳朵）
+  // 就会在某些帧整批掉出去。全动画共用一个值，某个细节留不留只取决于它自己。
+  const globalAvgStrength = sharedAvgStrength != null && sharedAvgStrength > 0
+    ? sharedAvgStrength
+    : frameAvgStrength;
 
   /**
    * getThresholdAt — 根据位置动态计算启动阈值
@@ -587,7 +617,7 @@ const extractContours = (
     }
   }
 
-  return { contours, strengths };
+  return { contours, strengths, avgStrength: frameAvgStrength };
 };
 
 // ─── DFT（离散傅里叶变换）────────────────────────────────────────────────────
@@ -658,7 +688,8 @@ type FillPolygon = {
 
 const fmtDesmosNum = (n: number): string => {
   if (!Number.isFinite(n)) return '0';
-  const rounded = Math.round(n * 10000) / 10000;
+  // 5 位小数：填色/轮廓贴边更准，表格单元格也扛得住
+  const rounded = Math.round(n * 100000) / 100000;
   return Object.is(rounded, -0) ? '0' : String(rounded);
 };
 
@@ -931,6 +962,134 @@ const labelToCellRects = (
   return rects;
 };
 
+/**
+ * 把连通色块的外轮廓描成一条 polygon（代替成堆小矩形）。
+ * 格子更密 → 轮廓点更多 → 精度更高；表达式却只有 1 条（再加一张表）。
+ */
+const labelToRegionOutlinePolygon = (
+  label: number,
+  labels: Int32Array,
+  gw: number,
+  gh: number,
+  width: number,
+  height: number,
+  offsetX: number,
+  offsetY: number,
+  desmosScale: number,
+  src: Uint8ClampedArray,
+): FillPolygon | null => {
+  const has = (gx: number, gy: number) =>
+    gx >= 0 && gy >= 0 && gx < gw && gy < gh && labels[gy * gw + gx] === label;
+
+  type Edge = { a: Point; b: Point };
+  const edges: Edge[] = [];
+  for (let gy = 0; gy < gh; gy++) {
+    for (let gx = 0; gx <= gw; gx++) {
+      if (has(gx - 1, gy) === has(gx, gy)) continue;
+      const x = (gx * width) / gw;
+      edges.push({
+        a: { x, y: (gy * height) / gh },
+        b: { x, y: ((gy + 1) * height) / gh },
+      });
+    }
+  }
+  for (let gy = 0; gy <= gh; gy++) {
+    for (let gx = 0; gx < gw; gx++) {
+      if (has(gx, gy - 1) === has(gx, gy)) continue;
+      const y = (gy * height) / gh;
+      edges.push({
+        a: { x: (gx * width) / gw, y },
+        b: { x: ((gx + 1) * width) / gw, y },
+      });
+    }
+  }
+  if (edges.length < 3) return null;
+
+  const key = (p: Point) => `${Math.round(p.x * 64)}:${Math.round(p.y * 64)}`;
+  const adj = new Map<string, { to: Point; edgeId: number }[]>();
+  edges.forEach((edge, edgeId) => {
+    const push = (from: Point, to: Point) => {
+      const k = key(from);
+      if (!adj.has(k)) adj.set(k, []);
+      adj.get(k)!.push({ to, edgeId });
+    };
+    push(edge.a, edge.b);
+    push(edge.b, edge.a);
+  });
+
+  const used = new Set<number>();
+  let bestLoop: Point[] = [];
+  for (let startId = 0; startId < edges.length; startId++) {
+    if (used.has(startId)) continue;
+    const start = edges[startId];
+    const startK = key(start.a);
+    const loop: Point[] = [{ ...start.a }];
+    used.add(startId);
+    let cur = { ...start.b };
+    for (let guard = 0; guard <= edges.length; guard++) {
+      loop.push({ ...cur });
+      const options = (adj.get(key(cur)) || []).filter(e => !used.has(e.edgeId));
+      if (options.length === 0) break;
+      const close = options.find(e => key(e.to) === startK);
+      const next = close ?? options[0];
+      used.add(next.edgeId);
+      cur = { ...next.to };
+      if (close && loop.length >= 4) break;
+    }
+    if (loop.length >= 4 && loop.length > bestLoop.length) {
+      bestLoop = loop;
+      if (key(bestLoop[bestLoop.length - 1]) === startK) bestLoop.pop();
+    }
+  }
+  if (bestLoop.length < 3) return null;
+
+  // 边长中点插值：默认一圈；轮廓较短时再插一圈，点数约 ×4，贴边更圆滑
+  let densified: Point[] = bestLoop;
+  const densifyPasses = bestLoop.length < 80 ? 2 : 1;
+  for (let pass = 0; pass < densifyPasses; pass++) {
+    const next: Point[] = [];
+    for (let i = 0; i < densified.length; i++) {
+      const a = densified[i];
+      const b = densified[(i + 1) % densified.length];
+      next.push(a, { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+    }
+    densified = next;
+  }
+
+  const desmosPts = densified.map(p => ({
+    x: (p.x - offsetX) * desmosScale,
+    y: -(p.y - offsetY) * desmosScale,
+  }));
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  let sx = 0, sy = 0, n = 0;
+  for (let gy = 0; gy < gh; gy++) {
+    for (let gx = 0; gx < gw; gx++) {
+      if (labels[gy * gw + gx] !== label) continue;
+      const cx = ((gx + 0.5) * width) / gw;
+      const cy = ((gy + 0.5) * height) / gh;
+      minX = Math.min(minX, (gx * width) / gw);
+      maxX = Math.max(maxX, ((gx + 1) * width) / gw);
+      minY = Math.min(minY, (gy * height) / gh);
+      maxY = Math.max(maxY, ((gy + 1) * height) / gh);
+      sx += cx;
+      sy += cy;
+      n++;
+    }
+  }
+  if (n === 0) return null;
+  const { r, g, b } = sampleAreaMedianRgb(
+    src, width, height,
+    sx / n - 0.5, sy / n - 0.5, sx / n + 0.5, sy / n + 0.5,
+  );
+
+  return {
+    color: rgbToHex(r, g, b),
+    points: desmosPts,
+    area: Math.max(1, (maxX - minX) * (maxY - minY)),
+  };
+};
+
 const buildRegionFillPolygons = (
   raw: { label: number },
   labels: Int32Array,
@@ -947,6 +1106,13 @@ const buildRegionFillPolygons = (
   const common = [raw.label, labels, gw, gh, width, height, offsetX, offsetY, desmosScale] as const;
   if (mode === 'cell') {
     return rectsToFillPolygons(src, width, height, labelToCellRects(...common));
+  }
+  if (mode === 'merged') {
+    // 连通域一条外轮廓：行数少、点数多，边缘跟得上勾线
+    const outline = labelToRegionOutlinePolygon(
+      raw.label, labels, gw, gh, width, height, offsetX, offsetY, desmosScale, src,
+    );
+    if (outline && outline.points.length >= 3) return [outline];
   }
   const rowRects = labelToRowRects(...common);
   if (mode === 'row') {
@@ -976,9 +1142,9 @@ const detectBorderBackgroundKey = (
 };
 
 /**
- * 提取填色 polygon：逐格取原图中位数颜色，尽量 1:1 还原
+ * 提取填色 polygon：更密的颜色网格，尽量贴齐勾线精度
  */
-const MAX_FILL_POLYGONS = 3600;
+const MAX_FILL_POLYGONS = 7200;
 
 /** 单张图片 / GIF 每帧共用的最高分辨率与填色精度 */
 export const SINGLE_IMAGE_MAX_DIM = 1280;
@@ -986,8 +1152,8 @@ export const SINGLE_IMAGE_MAX_FILL_POLYGONS = MAX_FILL_POLYGONS;
 
 const computeOptimalFillGrid = (width: number, height: number, maxCells = MAX_FILL_POLYGONS): number => {
   let lo = 96;
-  let hi = Math.min(720, Math.max(width, height));
-  let best = 128;
+  let hi = Math.min(1024, Math.max(width, height));
+  let best = 160;
 
   while (lo <= hi) {
     const mid = Math.floor((lo + hi) / 2);
@@ -1284,11 +1450,11 @@ const extractColorFillPolygons = (
     );
   }
 
-  // 更密的采样网格再合并：边缘更齐，最终矩形更少
+  // 采样网格远密于最终矩形数：先细切再同色合并，边缘才跟得上勾线
   const gridMax = computeOptimalFillGrid(
     width,
     height,
-    Math.min(MAX_FILL_POLYGONS, Math.max(maxFillPolygons * 8, 1600)),
+    Math.min(MAX_FILL_POLYGONS, Math.max(maxFillPolygons * 12, 2800)),
   );
   let polys = extractColorFillPolygonsAtGrid(
     ctx, width, height, offsetX, offsetY, desmosScale, gridMax, detailMode,
@@ -1406,7 +1572,71 @@ const buildFillPolygonExpressions = (
     return latex;
   };
 
+  /**
+   * 点数够多时用表格存坐标：左侧只占 1 行表 + 1 行 polygon(x,y)，
+   * 单元格里可以塞更密的点，比赛时也能展开看数据。
+   * 少于 8 个点的小矩形仍内联，避免表格爆炸。
+   */
+  const TABLE_POINT_THRESHOLD = 8;
+  /** 一张表最多挂多少对列，超出再开新表 */
+  const MAX_COLS_PER_TABLE = 24;
+
+  let tableOrdinal = 0;
+  let colPairInTable = 0;
+  let pendingTable: {
+    id: string;
+    type: 'table';
+    columns: { latex: string; values: string[] }[];
+  } | null = null;
+
+  const flushTable = () => {
+    if (!pendingTable || pendingTable.columns.length === 0) {
+      pendingTable = null;
+      colPairInTable = 0;
+      return;
+    }
+    expressions.push(pendingTable);
+    pendingTable = null;
+    colPairInTable = 0;
+  };
+
   polys.forEach((poly, i) => {
+    if (poly.points.length < 3) return;
+
+    if (poly.points.length >= TABLE_POINT_THRESHOLD) {
+      if (!pendingTable || colPairInTable >= MAX_COLS_PER_TABLE) {
+        flushTable();
+        pendingTable = {
+          id: `${prefix}fill_table_${tableOrdinal++}`,
+          type: 'table',
+          columns: [],
+        };
+      }
+      const pair = colPairInTable++;
+      const slot = options.frameSlot ?? 0;
+      const xLatex = options.frameSlot != null
+        ? `x_{g${slot}t${tableOrdinal - 1}c${pair}}`
+        : `x_{f${tableOrdinal - 1}c${pair}}`;
+      const yLatex = options.frameSlot != null
+        ? `y_{g${slot}t${tableOrdinal - 1}c${pair}}`
+        : `y_{f${tableOrdinal - 1}c${pair}}`;
+
+      pendingTable.columns.push(
+        { latex: xLatex, values: poly.points.map(p => fmtDesmosNum(p.x)) },
+        { latex: yLatex, values: poly.points.map(p => fmtDesmosNum(p.y)) },
+      );
+      expressions.push({
+        id: `${prefix}fill_poly_${i}`,
+        latex: restrict(`\\operatorname{polygon}\\left(${xLatex},${yLatex}\\right)`),
+        color: poly.color,
+        fill: true,
+        fillOpacity: 1,
+        lineOpacity: 0,
+        hidden: false,
+      });
+      return;
+    }
+
     const latex = buildPolygonLatex(poly.points);
     if (!latex) return;
     expressions.push({
@@ -1419,6 +1649,8 @@ const buildFillPolygonExpressions = (
       hidden: false,
     });
   });
+
+  flushTable();
   return expressions;
 };
 
@@ -1489,6 +1721,12 @@ export type ImageFourierOptions = {
   compactFourier?: boolean;
   /** 播放管理器控制可见性时，不在 latex 上附加时间限制 */
   skipFrameRestriction?: boolean;
+  /**
+   * GIF：全动画共用的边缘统计（由 measureOutlineCalibration 标定）。
+   * 不传就退回逐帧自适应——那样同一个细节会在部分帧被算掉。
+   */
+  sharedEdgeStrength?: number;
+  sharedContourStrength?: number;
 };
 
 /**
@@ -1553,10 +1791,12 @@ const generateFourierExpressions = (
 
   let fillPolys: FillPolygon[] = [];
   let fillExpressions: any[] = [];
+  const useColorOutline = includeOutline && !includeFill && (options.outlineStyle ?? 'color') === 'color';
 
   if (includeFill) {
     const fillCtx = createFillContext(width, height, options.fillImageData, ctx);
-    const skipOutlineBlackFills = includeOutline;
+    // 黑色勾线时，纯黑格已由轮廓表达，不必再填；彩色勾线时黑发/黑眼必须留下色块
+    const skipOutlineBlackFills = includeOutline && !useColorOutline;
     fillPolys = extractColorFillPolygons(
       fillCtx, width, height, offsetX, offsetY, desmosScale, options.maxFillPolygons,
       skipOutlineBlackFills,
@@ -1592,7 +1832,9 @@ const generateFourierExpressions = (
   }
 
   // 第一步：Sobel 边缘检测提取线稿轮廓
-  let { contours: rawContours, strengths } = extractContours(ctx, width, height, tuning);
+  let { contours: rawContours, strengths } = extractContours(
+    ctx, width, height, tuning, options.sharedEdgeStrength,
+  );
   let closedHints: (boolean | null)[] = rawContours.map(() => null);
 
   if (options.aiContours && options.aiContours.length > 0 && includeOutline) {
@@ -1665,7 +1907,11 @@ const generateFourierExpressions = (
   // ── 过滤 A：强度过滤 ──────────────────────────────────────────────────────
   const strengthRatio = tuning?.strengthThresholdRatio ?? 0.28;
   const sortedStrength = [...meta].map(m => m.averageStrength).sort((a, b) => b - a);
-  const topStrength = sortedStrength.length > 0 ? sortedStrength[0] : 10;
+  // 门槛按「最强轮廓」的比例算。GIF 逐帧各算一次时，主体强弱一变门槛就跟着动，
+  // 同一个部位会在一部分帧里被判成噪声——所以全动画共用一个基准。
+  const topStrength = options.sharedContourStrength != null && options.sharedContourStrength > 0
+    ? options.sharedContourStrength
+    : (sortedStrength.length > 0 ? sortedStrength[0] : 10);
   const strengthThreshold = Math.max(8, topStrength * strengthRatio);
 
   meta.forEach(m => {
@@ -1721,11 +1967,15 @@ const generateFourierExpressions = (
     return (mB.pathLength * mB.averageStrength) - (mA.pathLength * mA.averageStrength);
   });
 
-  const maxContours = tuning?.maxContours ?? 50;
-  finalContours = finalContours.slice(0, maxContours);
+  // GIF 不能按本帧重要性截断：主体动作大的帧多出十几条强轮廓，
+  // 手、耳朵这类刚好过线的细节就被挤掉，看起来像无缘无故消失。
+  // 播放开销由每帧点数预算封顶，不靠少画几条轮廓。
+  if (!options.compactFourier) {
+    const maxContours = tuning?.maxContours ?? 50;
+    finalContours = finalContours.slice(0, maxContours);
+  }
 
   const contourExpressions: any[] = [];
-  const useColorOutline = !includeFill && (options.outlineStyle ?? 'mono') === 'color';
   const colorSampleData = useColorOutline
     ? (options.fillImageData?.data ?? ctx.getImageData(0, 0, width, height).data)
     : null;
@@ -1780,7 +2030,11 @@ const generateFourierExpressions = (
     if (options.compactFourier) {
       // GIF：级数在这里就展开成点列，Desmos 只连折线，重绘不再做三角函数。
       // 点列直接内联，一条轮廓只占 1 行，也不会和单图的 X_n/Y_n 撞名。
-      const curve = sampleFourierCurvePoints(coeffs, resolveOutlineSampleCount(K));
+      // （预览/合并依赖 latex 自包含；填色才用表格减行）
+      const curve = sampleFourierCurvePoints(
+        coeffs,
+        resolveGifOutlineSampleCount(K, finalContours.length),
+      );
       const xs = curve.map(p => fmtDesmosNum(p.x));
       const ys = curve.map(p => fmtDesmosNum(p.y));
       const listX = `\\left[${xs.join(',')}\\right]`;
@@ -1870,6 +2124,76 @@ const generateFourierExpressions = (
 /** 供 GIF 等多帧管线直接调用 */
 export const generateFourierExpressionsFromContext = generateFourierExpressions;
 
+export type OutlineCalibration = {
+  /** 平均边缘强度，决定「哪些像素算边缘」 */
+  edgeStrength: number;
+  /** 最强轮廓的平均强度，决定「哪些轮廓算噪声」 */
+  contourStrength: number;
+  /** 预处理也必须全动画一致，否则同一部位有的帧被反色/锐化、有的没有 */
+  invertColors: boolean;
+  contrastBoost: number;
+  blurPasses: number;
+};
+
+/**
+ * 量一帧的边缘统计，供 GIF 标定全动画共用阈值。
+ *
+ * 这两个值原本每帧各算一次，于是同一个细节的存活与否要看它当帧的「邻居」有多强：
+ * 主体动作幅度大的帧阈值被抬高，手、耳朵这类弱边缘就整批掉出去，播起来忽有忽无。
+ * 先在若干帧上量出来取中位数，再让每帧都用同一组阈值，细节存活就只取决于它自己。
+ */
+export function measureOutlineCalibration(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  tuning?: SmartDrawTuningParams,
+): OutlineCalibration {
+  const { strengths, avgStrength } = extractContours(ctx, width, height, tuning);
+  let top = 0;
+  for (const s of strengths) if (s > top) top = s;
+  return {
+    edgeStrength: avgStrength,
+    contourStrength: top,
+    invertColors: false,
+    contrastBoost: 1.35,
+    blurPasses: 1,
+  };
+}
+
+/**
+ * 合并多帧标定值，取最低的那一档。
+ *
+ * 取最低而不是取平均：只要某个细节在任意一帧够格被画出来，就让它在每帧都够格。
+ * 取中位数会被动作幅度大的帧拉高，弱细节反而在所有帧都被判成噪声（实测那只手
+ * 从「7/24 帧出现」变成「0/24 帧出现」——一致了，但整个细节没了）。
+ *
+ * 下限压在中位数的一半：个别近乎空白的帧算出来的门槛极低，直接采用会让所有帧
+ * 一起冒噪声。
+ */
+export function mergeOutlineCalibrations(
+  samples: OutlineCalibration[],
+): OutlineCalibration | null {
+  const edges = samples.map(s => s.edgeStrength).filter(v => v > 0).sort((a, b) => a - b);
+  const contours = samples.map(s => s.contourStrength).filter(v => v > 0).sort((a, b) => a - b);
+  if (edges.length === 0 || contours.length === 0) return null;
+  const lowestSane = (list: number[]) => {
+    const mid = list[Math.floor(list.length / 2)];
+    return Math.max(list[0], mid * 0.5);
+  };
+  const midOf = (list: number[], fallback: number) => {
+    if (list.length === 0) return fallback;
+    const sorted = [...list].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)];
+  };
+  return {
+    edgeStrength: lowestSane(edges),
+    contourStrength: lowestSane(contours),
+    invertColors: samples.filter(s => s.invertColors).length * 2 >= samples.length,
+    contrastBoost: midOf(samples.map(s => s.contrastBoost).filter(v => v > 0), 1.35),
+    blurPasses: Math.round(midOf(samples.map(s => s.blurPasses), 1)),
+  };
+}
+
 /**
  * 匹配本模块生成的帧可见条件：
  *   填色  `\left\{A\le s<B\right\}`
@@ -1958,10 +2282,30 @@ const sampleFourierCurvePoints = (
 /**
  * K 个谐波用约 3K 个采样点即看不出折线感。
  * 上限 200：表情包尺寸下再密也看不出差别，而播放开销与点数成正比
- * （轮廓拉满 48 条时，300 点 17fps、200 点 20fps）。
+ * （轮廓拉满时，每条 300 点只有 17fps、200 点能到 20fps）。
  */
 const resolveOutlineSampleCount = (K: number): number =>
   Math.max(120, Math.min(200, K * 3));
+
+/**
+ * GIF 每帧的折线点数预算（≈20fps 的实测水位）。
+ *
+ * 原来的做法是限制轮廓条数，但那会让轮廓互相抢名额：主体动作大的帧多出十几条
+ * 强轮廓，就把手、耳朵这类弱细节挤出榜外，同一个细节于是忽有忽无。
+ * 改成限制总点数后，轮廓多的帧只是每条画得疏一点，不会有细节被整条丢掉，
+ * 而播放开销（正比于点数）依然是封顶的。
+ */
+const GIF_OUTLINE_POINT_BUDGET = 12000;
+
+/** 再疏也要 64 个点，否则小轮廓会看出棱角 */
+const GIF_OUTLINE_MIN_SAMPLES = 64;
+
+const resolveGifOutlineSampleCount = (K: number, contourCount: number): number => {
+  const share = Math.floor(GIF_OUTLINE_POINT_BUDGET / Math.max(1, contourCount));
+  const budgeted = Math.max(GIF_OUTLINE_MIN_SAMPLES, Math.min(240, share));
+  // 谐波数摆在那，采样再密也变不出细节
+  return Math.min(budgeted, Math.max(GIF_OUTLINE_MIN_SAMPLES, K * 3));
+};
 
 // ─── 公共导出函数 ─────────────────────────────────────────────────────────────
 
@@ -2003,6 +2347,7 @@ const prepareFourierExpression = (expr: any): any => {
   const id = String(expr.id || '');
   // 自带的点列元数据只在生成/合并阶段用，Desmos 不认识
   delete options.gifOutline;
+  if (options.type === 'table') return options;
   // 折线轮廓（lines:true）不是参数曲线，不能带 parametricDomain
   const isPolyline = expr?.lines === true;
   if (!isPolyline && (/(?:^|_)dft_plot_\d+$/.test(id) || /(?:^|_)hd_plot_\d+$/.test(id))) {
@@ -2018,6 +2363,9 @@ const prepareFourierExpression = (expr: any): any => {
 
 const isFillExpression = (expr: any): boolean =>
   /(?:^|_)fill_poly_\d+$/.test(String(expr.id || ''));
+
+const isTableExpression = (expr: any): boolean =>
+  expr?.type === 'table' || /(?:^|_)fill_table_\d+$/.test(String(expr?.id || ''));
 
 const isOutlinePlotExpression = (expr: any): boolean =>
   /(?:^|_)dft_plot_\d+$/.test(String(expr?.id || ''))
@@ -2077,8 +2425,9 @@ const partitionExpressions = (expressions: any[]) => {
   const fills: any[] = [];
   const contours: any[] = [];
   for (const expr of expressions) {
-    if (isSliderExpression(expr) || isFolderExpression(expr)) meta.push(expr);
-    else if (isFillExpression(expr)) fills.push(expr);
+    if (isSliderExpression(expr) || isFolderExpression(expr) || isTableExpression(expr)) {
+      meta.push(expr);
+    } else if (isFillExpression(expr)) fills.push(expr);
     else contours.push(expr);
   }
   return { meta, fills, contours };
@@ -2205,7 +2554,8 @@ export async function applyFourierExpressionsProgressively(
 
   if (clearFirst) calculator.setBlank();
 
-  const { fills: rawFills, contours: rawContours } = partitionExpressions(expressions);
+  const { meta: rawMeta, fills: rawFills, contours: rawContours } = partitionExpressions(expressions);
+  const meta = rawMeta.map(prepareFourierExpression);
   const fills = rawFills.map(prepareFourierExpression);
   const contours = rawContours.map(prepareFourierExpression);
   const contourGroups = groupContourExpressions(contours);
@@ -2215,6 +2565,13 @@ export async function applyFourierExpressionsProgressively(
   const totalSteps = bothMode
     ? outlineStepCount + fillBatchCount
     : outlineStepCount + fillBatchCount;
+
+  // 表格列必须先于 polygon(x_i,y_i) 存在
+  if (meta.length > 0) {
+    for (let i = 0; i < meta.length; i += DESMOS_EXPR_BATCH) {
+      pushExprBatch(calculator, meta.slice(i, i + DESMOS_EXPR_BATCH));
+    }
+  }
 
   let step = 0;
   const bump = (phase: ProgressiveDrawPhase, phaseDone: number, phaseTotal: number) => {
@@ -2264,7 +2621,7 @@ export async function applyFourierExpressionsProgressively(
         if (signal?.aborted) break;
         pushExprBatch(calculator, contourGroups[i]);
         bump('outline', i + 1, outlineStepCount);
-        await yieldQuick();
+        if (i % 3 === 2) await yieldQuick();
       }
     }
 
@@ -2275,7 +2632,7 @@ export async function applyFourierExpressionsProgressively(
         const batch = fills.slice(i, i + DESMOS_EXPR_BATCH);
         pushVisibleFillBatch(calculator, batch);
         bump('fill', Math.min(i + batch.length, fills.length), fills.length);
-        await yieldQuick();
+        if ((i / DESMOS_EXPR_BATCH) % 2 === 1) await yieldQuick();
       }
       bringOutlinePlotsToFront(calculator, contours);
     }
@@ -2285,13 +2642,13 @@ export async function applyFourierExpressionsProgressively(
       if (signal?.aborted) break;
       pushExprBatch(calculator, contourGroups[i]);
       bump('outline', i + 1, outlineStepCount || totalSteps);
-      await yieldQuick();
+      if (i % 3 === 2) await yieldQuick();
     }
     for (let i = 0; i < fills.length; i += DESMOS_EXPR_BATCH) {
       if (signal?.aborted) break;
       pushExprBatch(calculator, fills.slice(i, i + DESMOS_EXPR_BATCH));
       bump('fill', Math.min(i + DESMOS_EXPR_BATCH, fills.length), fills.length);
-      await yieldQuick();
+      if ((i / DESMOS_EXPR_BATCH) % 2 === 1) await yieldQuick();
     }
   }
 
@@ -2374,10 +2731,10 @@ export async function applyGifExpressionsToCalculator(
   return { committed: total, total, partial: false };
 }
 
-const GIF_STREAM_FILL_BATCH = 16;
-const GIF_STREAM_FILL_BATCH_FAST = 24;
-const GIF_STREAM_CONTOUR_BATCH = 8;
-const GIF_STREAM_CONTOUR_BATCH_FAST = 12;
+const GIF_STREAM_FILL_BATCH = 40;
+const GIF_STREAM_FILL_BATCH_FAST = 64;
+const GIF_STREAM_CONTOUR_BATCH = 20;
+const GIF_STREAM_CONTOUR_BATCH_FAST = 32;
 
 /** 流式注入：写入时间滑块（首次 setBlank） */
 export function initGifStreamCalculator(
@@ -2409,6 +2766,8 @@ export type AppendGifFrameOptions = {
   folderId?: string;
   folderTitle?: string;
   folderHidden?: boolean;
+  /** 比赛需要能展开看公式；默认折叠以免列表一次撑爆 */
+  folderCollapsed?: boolean;
 };
 
 /** 流式/批量注入单帧：小批次 + 让出主线程，避免列表一次性暴涨卡死 */
@@ -2426,6 +2785,7 @@ export async function appendGifFrameToCalculator(
   const knownIds = options?.knownIds;
   const folderId = options?.folderId;
   const folderHidden = options?.folderHidden ?? false;
+  const folderCollapsed = options?.folderCollapsed ?? true;
   const pushBatch = appendOnly
     ? (batch: any[]) => pushExprBatchAppend(calculator, batch, knownIds)
     : (batch: any[]) => { pushExprBatch(calculator, batch); return batch.length; };
@@ -2433,8 +2793,12 @@ export async function appendGifFrameToCalculator(
     const prepared = prepareFourierExpression(expr);
     if (folderId && !isSliderExpression(prepared) && !isFolderExpression(prepared)) {
       prepared.folderId = folderId;
-      prepared.secret = true;
-      if (!isFillExpression(prepared) && !isOutlinePlotExpression(prepared)) {
+      // 表格、填色、轮廓都要在列表里可见；只有纯辅助行才 hidden
+      if (
+        !isFillExpression(prepared)
+        && !isOutlinePlotExpression(prepared)
+        && !isTableExpression(prepared)
+      ) {
         prepared.hidden = true;
       }
     }
@@ -2451,8 +2815,7 @@ export async function appendGifFrameToCalculator(
   let batchTick = 0;
   const yieldAfterBatch = async () => {
     batchTick += 1;
-    if (batchTick % 2 === 0) await yieldToInteractive();
-    else await yieldQuick();
+    if (batchTick % 4 === 0) await yieldQuick();
   };
 
   if (folderId) {
@@ -2460,18 +2823,25 @@ export async function appendGifFrameToCalculator(
       id: folderId,
       type: 'folder',
       title: options?.folderTitle || folderId,
-      collapsed: true,
+      collapsed: folderCollapsed,
       hidden: folderHidden,
       secret: false,
     }]);
     await yieldAfterBatch();
   }
 
-  const { fills, contours } = partitionExpressions(frameExpressions);
+  const { meta, fills, contours } = partitionExpressions(frameExpressions);
   const fillBatch = fastInject ? GIF_STREAM_FILL_BATCH_FAST : GIF_STREAM_FILL_BATCH;
   const contourBatch = fastInject ? GIF_STREAM_CONTOUR_BATCH_FAST : GIF_STREAM_CONTOUR_BATCH;
   const bothMode = outlineFirst && !deferVisibility && fills.length > 0 && contours.length > 0;
   const contourGroups = bothMode ? groupContourExpressions(contours.map(stamp)) : [];
+
+  // 表格必须先于 polygon(x,y) 写入，否则列名还不存在
+  for (let i = 0; i < meta.length; i += 8) {
+    const batch = meta.slice(i, i + 8).map(e => stamp(e));
+    added += pushBatch(batch);
+    await yieldAfterBatch();
+  }
 
   if (bothMode) {
     for (let i = 0; i < fills.length; i += fillBatch) {

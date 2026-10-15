@@ -10,7 +10,7 @@ import { buildProviderRequest, compressImageDataUrl } from './gemini-api';
 
 export type SmartDrawMode = 'outline' | 'fill' | 'both';
 
-/** 仅轮廓模式：黑白统一线稿 / 沿边缘采样原图颜色 */
+/** 轮廓：黑白统一线稿 / 沿边缘采样原图颜色（默认按原图取色） */
 export type OutlineStyle = 'mono' | 'color';
 
 export type SmartDrawTuningParams = {
@@ -410,7 +410,7 @@ export async function analyzeSmartDrawBatchWithAI(
   if (frames.length === 0 || mode === 'fill') return result;
   if (signal?.aborted) return result;
 
-  const cfg = getApiConfig();
+  const cfg = getApiConfig(apiKey ? { key: apiKey } : undefined);
   const key = getEffectiveApiKey(apiKey);
   const provider = getProviderById(cfg.provider);
   if (!provider) return result;
@@ -611,7 +611,7 @@ export async function analyzeSmartDrawWithAI(
 ): Promise<{ tuning: Partial<SmartDrawTuningParams>; contours: SmartDrawAIContour[] } | null> {
   if (mode === 'fill') return null;
 
-  const cfg = getApiConfig();
+  const cfg = getApiConfig(apiKey ? { key: apiKey } : undefined);
   const key = getEffectiveApiKey(apiKey);
   const provider = getProviderById(cfg.provider);
   if (!provider) return null;

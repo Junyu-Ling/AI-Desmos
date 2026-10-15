@@ -40,6 +40,9 @@ export type GifFrameWorkerInput = {
   outlineStyle?: import('./smart-draw-repair').OutlineStyle;
   fillDetailMode?: 'row' | 'merged' | 'cell';
   compactFourier?: boolean;
+  /** 全动画共用的轮廓门槛，保证同一细节在每帧的存活标准一致 */
+  sharedEdgeStrength?: number;
+  sharedContourStrength?: number;
 };
 
 export type GifFrameWorkerOutput = {
@@ -105,7 +108,7 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
       tuning,
       aiContours,
       fillImageData,
-      maxFillPolygons: msg.maxFillPolygons ?? 480,
+      maxFillPolygons: msg.maxFillPolygons ?? 960,
       varNamespace: msg.frameSlot,
       frameSlot: msg.frameSlot,
       frameSliderVar: GIF_TIME_SLIDER,
@@ -117,6 +120,8 @@ self.onmessage = (event: MessageEvent<GifFrameWorkerInput>) => {
       outlineStyle: msg.outlineStyle,
       skipFrameRestriction: false,
       compactFourier: true,
+      sharedEdgeStrength: msg.sharedEdgeStrength,
+      sharedContourStrength: msg.sharedContourStrength,
     };
 
     let expressions: any[] = [];

@@ -1,6 +1,6 @@
 /**
  * GIF 定格质量：密采样 + 同色合并，用更少公式接近原图。
- * 单图仍用 1280 / 3600，互不影响。
+ * 单图仍用 1280 / 7200，互不影响。
  */
 
 export const GIF_TIME_SLIDER = 's';
@@ -17,13 +17,15 @@ export function formatGifSliderStep(frameIntervalSec: number): string {
 }
 
 export const GIF_PERFECT_MAX_DIM = 960;
-export const GIF_PERFECT_MAX_FILL = 480;
+export const GIF_PERFECT_MAX_FILL = 960;
 /**
- * 轮廓上限。轮廓改成预采样折线后每条只占 1 行（原先 4 行），
- * 所以这里可以给得很宽——卡得太紧会让「手」这种排名临界的轮廓
- * 在某些帧被砍掉、某些帧留下，看起来就是时有时无。
+ * 轮廓上限。这个数字卡多少都会有副作用：它是按「本帧重要性排名」截断的，
+ * 主体动作大的帧多出十几条强轮廓，就把手、耳朵这类临界轮廓挤出榜外，
+ * 同一个细节于是忽有忽无（实测 48 条时 28 个恒定细节有 13 个在闪）。
+ * 所以给到 clamp 允许的上限、让它基本不生效，播放开销改由每帧点数预算封顶
+ * （见 image-processing 的 GIF_OUTLINE_POINT_BUDGET）。
  */
-export const GIF_PERFECT_MAX_CONTOURS = 48;
+export const GIF_PERFECT_MAX_CONTOURS = 90;
 export const GIF_PERFECT_FOURIER_K = 72;
 export const GIF_PERFECT_TARGET_POINTS = 280;
 
@@ -62,14 +64,14 @@ export const GIF_QUALITY_PROFILES: Record<GifQualityTier, GifQualityProfile> = {
     maxDim: 720,
     aiBatchSize: 6,
     aiParallelBatches: 2,
-    localPrepareConcurrency: 3,
-    workerCount: 2,
-    scaleConcurrency: 3,
+    localPrepareConcurrency: 4,
+    workerCount: 4,
+    scaleConcurrency: 4,
     jpegQuality: 0.86,
     sceneChangeThreshold: 6,
     pipelineChunkSize: 10,
-    maxFillPolygons: 260,
-    maxContours: 24,
+    maxFillPolygons: 420,
+    maxContours: 60,
     fourierKCap: 56,
     targetPointCountCap: 220,
     preserveFineDetails: false,
@@ -84,14 +86,14 @@ export const GIF_QUALITY_PROFILES: Record<GifQualityTier, GifQualityProfile> = {
     maxDim: 880,
     aiBatchSize: 4,
     aiParallelBatches: 2,
-    localPrepareConcurrency: 3,
-    workerCount: 2,
-    scaleConcurrency: 3,
+    localPrepareConcurrency: 4,
+    workerCount: 4,
+    scaleConcurrency: 4,
     jpegQuality: 0.9,
     sceneChangeThreshold: 4,
     pipelineChunkSize: 8,
-    maxFillPolygons: 360,
-    maxContours: 36,
+    maxFillPolygons: 720,
+    maxContours: 75,
     fourierKCap: 64,
     targetPointCountCap: 250,
     preserveFineDetails: true,
@@ -106,12 +108,12 @@ export const GIF_QUALITY_PROFILES: Record<GifQualityTier, GifQualityProfile> = {
     maxDim: GIF_PERFECT_MAX_DIM,
     aiBatchSize: 4,
     aiParallelBatches: 2,
-    localPrepareConcurrency: 2,
-    workerCount: 2,
-    scaleConcurrency: 2,
+    localPrepareConcurrency: 3,
+    workerCount: 4,
+    scaleConcurrency: 3,
     jpegQuality: 0.93,
     sceneChangeThreshold: 2,
-    pipelineChunkSize: 6,
+    pipelineChunkSize: 8,
     maxFillPolygons: GIF_PERFECT_MAX_FILL,
     maxContours: GIF_PERFECT_MAX_CONTOURS,
     fourierKCap: GIF_PERFECT_FOURIER_K,
@@ -160,5 +162,5 @@ export function tuneGifProfileForAsset(
 export function resolveGifWorkerCount(profile: GifQualityProfile): number {
   const hw = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency : 0;
   const cores = hw && hw > 0 ? hw : 4;
-  return Math.max(1, Math.min(profile.workerCount, 2, Math.max(1, Math.floor(cores / 2))));
+  return Math.max(1, Math.min(profile.workerCount, 4, Math.max(1, Math.floor(cores / 2))));
 }
