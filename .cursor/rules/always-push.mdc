@@ -1,0 +1,14 @@
+---
+description: After finishing a coding task, commit and push to GitHub
+alwaysApply: true
+---
+
+# Always push when done
+
+When a user-requested coding task is finished (feature, fix, or requested change):
+
+1. Commit relevant source changes with a concise message (use `git -c user.name=... -c user.email=...` if repo has no user identity).
+2. Push to `origin` on the current branch (`git push origin HEAD`) without asking again.
+3. Do this every time unless the user explicitly says not to push/commit.
+
+Do not commit secrets, `.env`, or unrelated `dist/` / `node_modules` noise.

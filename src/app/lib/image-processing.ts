@@ -1121,7 +1121,7 @@ const pushDensePolylineOutline = (
   },
 ): void => {
   if (points.length < 2) return;
-  const MAX_POINTS = 720;
+  const MAX_POINTS = 640;
   let pts = points;
   if (pts.length > MAX_POINTS) {
     pts = resampleByArcLength(pts, MAX_POINTS);
@@ -1626,9 +1626,38 @@ const detectBorderBackgroundKey = (
  */
 const MAX_FILL_POLYGONS = 7200;
 
+/** 单张图片：最长边低于此值则等比例放大，减少小图像素锯齿导致的过密描边 */
+export const SINGLE_IMAGE_MIN_DIM = 960;
 /** 单张图片 / GIF 每帧共用的最高分辨率与填色精度 */
 export const SINGLE_IMAGE_MAX_DIM = 1280;
 export const SINGLE_IMAGE_MAX_FILL_POLYGONS = MAX_FILL_POLYGONS;
+/** 放大上限，避免低清图被拉得糊成一片 */
+const SINGLE_IMAGE_MAX_UPSCALE = 4;
+
+/**
+ * 等比例缩放：小图放大到 MIN_DIM，大图缩小到 MAX_DIM。
+ * 放大后可用更大的像素间距采样，Desmos 里线条不会显得过密。
+ */
+export const resolveSmartDrawCanvasSize = (
+  srcW: number,
+  srcH: number,
+): { width: number; height: number; scale: number } => {
+  const w = Math.max(1, srcW);
+  const h = Math.max(1, srcH);
+  const maxSide = Math.max(w, h);
+  let scale = 1;
+  if (maxSide < SINGLE_IMAGE_MIN_DIM) {
+    scale = Math.min(SINGLE_IMAGE_MAX_UPSCALE, SINGLE_IMAGE_MIN_DIM / maxSide);
+  }
+  if (maxSide * scale > SINGLE_IMAGE_MAX_DIM) {
+    scale = SINGLE_IMAGE_MAX_DIM / maxSide;
+  }
+  return {
+    width: Math.max(1, Math.round(w * scale)),
+    height: Math.max(1, Math.round(h * scale)),
+    scale,
+  };
+};
 
 const computeOptimalFillGrid = (width: number, height: number, maxCells = MAX_FILL_POLYGONS): number => {
   let lo = 96;
@@ -2526,13 +2555,17 @@ const generateFourierExpressions = (
       processedPoints = [...processedPoints, ...pauseTip, ...reversed, ...pauseRoot];
     }
 
-    // 贝塞尔：按曲率自适应稀疏，避免直边也像素级堆点；傅里叶仍按 targetPointCount
+    // 贝塞尔：间距随画布尺寸放大（小图放大后不必再按原像素间距堆点）；傅里叶仍按 targetCount
     const targetCount = tuning?.targetPointCount ?? 400;
     const step = fitMethod === 'bezier'
       ? 1
       : Math.max(1, Math.floor(processedPoints.length / targetCount));
+    // 目标约 0.11～0.24 Desmos 单位一段：画布越大，像素间距越大 → 视觉密度稳定且不过密
+    const bezierMinSp = Math.max(1.8, 0.11 / desmosScale);
+    const bezierMaxSp = Math.max(bezierMinSp + 0.6, 0.24 / desmosScale);
+    const bezierMaxPts = Math.min(640, Math.max(96, Math.round(12 / desmosScale)));
     const points = fitMethod === 'bezier'
-      ? resampleAdaptiveByCurvature(processedPoints, 1.6, 3.4, 720)
+      ? resampleAdaptiveByCurvature(processedPoints, bezierMinSp, bezierMaxSp, bezierMaxPts)
       : processedPoints.filter((_, i) => i % step === 0);
 
     const centeredPoints = points.map(p => ({
@@ -2552,7 +2585,12 @@ const generateFourierExpressions = (
       const pathLenPx = calculatePathLength(points);
       // 已按曲率稀疏；compact 再略抽一点，避免时间轴帧过重
       const denseImg = options.compactFourier
-        ? resampleAdaptiveByCurvature(points, 2.2, 4.2, 480)
+        ? resampleAdaptiveByCurvature(
+          points,
+          Math.max(2.4, 0.16 / desmosScale),
+          Math.max(4.0, 0.32 / desmosScale),
+          400,
+        )
         : points;
       const denseDesmos = denseImg.map(p => ({
         x: (p.x - offsetX) * desmosScale,
@@ -3565,16 +3603,18 @@ export const processImageToFourier = (
       img.onload = async () => {
         try {
           const canvas = document.createElement('canvas');
-          const MAX_DIM = 1280;
-          const scale = Math.min(1, MAX_DIM / Math.max(img.width, img.height));
-          canvas.width = img.width * scale;
-          canvas.height = img.height * scale;
+          const sized = resolveSmartDrawCanvasSize(img.width, img.height);
+          canvas.width = sized.width;
+          canvas.height = sized.height;
 
           const ctx = canvas.getContext('2d');
           if (!ctx) { reject('No ctx'); return; }
 
           ctx.fillStyle = 'white';
           ctx.fillRect(0, 0, canvas.width, canvas.height);
+          // 放大时开高质量插值，减轻锯齿；缩小时同样平滑
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
           const fillImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
