@@ -704,7 +704,14 @@ const extractContours = (
       if (nmsMap[idx] > startThresh) {
         const result = traceContour(x, y);
         if (result.points.length > 12) {
-          contours.push(smoothPointsPasses(result.points, 2));
+          const pts = result.points;
+          const gap = Math.hypot(
+            pts[0].x - pts[pts.length - 1].x,
+            pts[0].y - pts[pts.length - 1].y,
+          );
+          // 闭环被 visited 挡住时首尾只差一两格；补上起点，后续才能按圆拟合
+          if (gap > 1e-6 && gap <= 6 && pts.length > 16) pts.push({ ...pts[0] });
+          contours.push(smoothPointsPasses(pts, 2));
           strengths.push(result.avgStrength);
         }
       }
@@ -853,7 +860,7 @@ const outlineSpacingForCanvas = (width: number, height: number): { min: number; 
 const fitCircleToPoints = (
   pts: Point[],
 ): { h: number; k: number; r: number; rms: number } | null => {
-  if (pts.length < 10) return null;
+  if (pts.length < 8) return null;
   let sumX = 0;
   let sumY = 0;
   let sumX2 = 0;
@@ -898,6 +905,266 @@ const fitCircleToPoints = (
     sse += d * d;
   }
   return { h, k, r, rms: Math.sqrt(sse / n) };
+};
+
+/** 三点定圆；共线则失败 */
+const circleFrom3Points = (
+  a: Point,
+  b: Point,
+  c: Point,
+): { h: number; k: number; r: number } | null => {
+  const d = 2 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+  if (Math.abs(d) < 1e-10) return null;
+  const a2 = a.x * a.x + a.y * a.y;
+  const b2 = b.x * b.x + b.y * b.y;
+  const c2 = c.x * c.x + c.y * c.y;
+  const h = (a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d;
+  const k = (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d;
+  const r = Math.hypot(a.x - h, a.y - k);
+  if (!(r > 1e-4)) return null;
+  return { h, k, r };
+};
+
+/** 点绕圆心的最大角度缺口（弧度）。近圆 ≈ 0，短弧 ≈ 接近 2π */
+const largestAngularGap = (pts: Point[], h: number, k: number): number => {
+  const angs: number[] = [];
+  for (const p of pts) angs.push(Math.atan2(p.y - k, p.x - h));
+  angs.sort((x, y) => x - y);
+  if (angs.length < 3) return Math.PI * 2;
+  let maxGap = 0;
+  for (let i = 1; i < angs.length; i++) {
+    const g = angs[i] - angs[i - 1];
+    if (g > maxGap) maxGap = g;
+  }
+  const wrap = angs[0] + Math.PI * 2 - angs[angs.length - 1];
+  return wrap > maxGap ? wrap : maxGap;
+};
+
+/**
+ * 描边常在 NMS 弱处断开，眼睛/镜头会留下一小段缺口。
+ * 缺口不到路径长度约 1/4 时补上闭合点，按闭环做面积/圆拟合。
+ */
+const virtuallyClosePoints = (pts: Point[]): Point[] => {
+  if (pts.length < 3) return pts;
+  const gap = pointDist(pts[0], pts[pts.length - 1]);
+  if (gap < 1e-8) return pts;
+  const len = calculatePathLength(pts);
+  if (gap <= Math.max(len * 0.28, 1e-4)) return [...pts, { ...pts[0] }];
+  return pts;
+};
+
+type DetectedCircle = {
+  h: number;
+  k: number;
+  r: number;
+  rms: number;
+  inliers: boolean[];
+  inlierRatio: number;
+};
+
+const circleInlierStats = (
+  pts: Point[],
+  h: number,
+  k: number,
+  r: number,
+  tol: number,
+): { mask: boolean[]; count: number; rms: number; coverage: number } => {
+  const mask: boolean[] = new Array(pts.length);
+  let count = 0;
+  let sse = 0;
+  const inlierPts: Point[] = [];
+  for (let i = 0; i < pts.length; i++) {
+    const d = Math.abs(Math.hypot(pts[i].x - h, pts[i].y - k) - r);
+    const ok = d <= tol;
+    mask[i] = ok;
+    if (ok) {
+      count++;
+      sse += d * d;
+      inlierPts.push(pts[i]);
+    }
+  }
+  const rms = count > 0 ? Math.sqrt(sse / count) : Infinity;
+  const coverage = inlierPts.length >= 3
+    ? 1 - largestAngularGap(inlierPts, h, k) / (Math.PI * 2)
+    : 0;
+  return { mask, count, rms, coverage };
+};
+
+/**
+ * 圆/扁圆验收：放宽到卡通椭圆眼睛，但仍拒绝乱线、短弧、细长条。
+ * 阈值按点集自身尺度，像素坐标和 Desmos 坐标都能用。
+ */
+const acceptCircleGeometry = (
+  pts: Point[],
+  circ: { h: number; k: number; r: number; rms: number },
+  coverage: number,
+): boolean => {
+  if (!(circ.r > 1e-4) || pts.length < 8) return false;
+  const rel = circ.rms / circ.r;
+  const box = contourBBox(pts);
+  const bw = box.maxX - box.minX;
+  const bh = box.maxY - box.minY;
+  const span = Math.max(bw, bh, 1e-6);
+  if (circ.r < span * 0.12 || circ.r > span * 1.25) return false;
+  const aspect = bw / Math.max(bh, 1e-6);
+  if (aspect < 0.36 || aspect > 2.75) return false;
+  const closed = virtuallyClosePoints(pts);
+  const pathLen = calculatePathLength(closed);
+  const circLen = 2 * Math.PI * circ.r;
+  if (pathLen < circLen * 0.40 || pathLen > circLen * 1.70) return false;
+  const area = calculatePolygonArea(closed);
+  const circularity = pathLen > 0 ? (4 * Math.PI * area) / (pathLen * pathLen) : 0;
+  const fillRatio = bw * bh > 0 ? area / (bw * bh) : 0;
+  if (coverage >= 0.78) {
+    // 整圈：扁圆眼睛 rel≈0.10–0.17、圆形度≈0.9；矩形机身圆形度≈0.78 且填满包围盒
+    if (rel > 0.19) return false;
+    if (circularity < 0.83) return false;
+    if (fillRatio > 0.93) return false;
+  } else if (coverage >= 0.55) {
+    if (rel > 0.12) return false;
+  } else {
+    return false;
+  }
+  return true;
+};
+
+const spanTol = (pts: Point[]): number => {
+  const box = contourBBox(pts);
+  return Math.max(box.maxX - box.minX, box.maxY - box.minY, 1) * 0.02;
+};
+
+/** 只累计相邻内点的弧长，避免把矩形四角「跳着」连成假圆 */
+const inlierArcLength = (pts: Point[], mask: boolean[]): number => {
+  let len = 0;
+  for (let i = 1; i < pts.length; i++) {
+    if (mask[i] && mask[i - 1]) len += pointDist(pts[i - 1], pts[i]);
+  }
+  if (pts.length > 2 && mask[0] && mask[pts.length - 1]) {
+    len += pointDist(pts[0], pts[pts.length - 1]);
+  }
+  return len;
+};
+
+const longestInlierRunLength = (pts: Point[], mask: boolean[]): number => {
+  const n = pts.length;
+  if (n < 2) return 0;
+  const runs: number[] = [];
+  let cur = 0;
+  for (let i = 1; i < n; i++) {
+    if (mask[i] && mask[i - 1]) cur += pointDist(pts[i - 1], pts[i]);
+    else if (cur > 0) {
+      runs.push(cur);
+      cur = 0;
+    }
+  }
+  if (cur > 0) runs.push(cur);
+  if (mask[0] && mask[n - 1] && runs.length > 0) {
+    const wrap = pointDist(pts[0], pts[n - 1]);
+    if (runs.length === 1 && mask.every(Boolean)) runs[0] += wrap;
+    else if (runs.length >= 2) {
+      runs[0] += (runs.pop() ?? 0) + wrap;
+    }
+  }
+  let best = 0;
+  for (const r of runs) if (r > best) best = r;
+  return best;
+};
+
+/**
+ * 从一条轮廓里找圆：先整段（含补缝），失败再在轮廓上抽三点拟合，
+ * 这样镜头粘在机身上、眼睛被眼睑断开时仍能出圆方程。
+ */
+const detectCircleOnContour = (pts: Point[]): DetectedCircle | null => {
+  if (pts.length < 8) return null;
+  const closedPts = virtuallyClosePoints(pts);
+
+  const whole = fitCircleToPoints(closedPts);
+  if (whole) {
+    const coverage = 1 - largestAngularGap(closedPts, whole.h, whole.k) / (Math.PI * 2);
+    if (acceptCircleGeometry(closedPts, whole, coverage) && coverage >= 0.55) {
+      return {
+        ...whole,
+        inliers: pts.map(() => true),
+        inlierRatio: 1,
+      };
+    }
+  }
+
+  const n = pts.length;
+  const step = Math.max(1, Math.floor(n / 16));
+  let best: DetectedCircle | null = null;
+  let bestScore = -1;
+  const box = contourBBox(pts);
+  const minR = Math.max(1e-3, Math.min(box.maxX - box.minX, box.maxY - box.minY) * 0.08);
+  const maxR = Math.max(box.maxX - box.minX, box.maxY - box.minY) * 0.95;
+
+  for (let i = 0; i < n; i += step) {
+    for (let j = i + step * 2; j < n; j += step) {
+      for (let k = j + step * 2; k < n; k += step) {
+        const c3 = circleFrom3Points(pts[i], pts[j], pts[k]);
+        if (!c3 || c3.r < minR || c3.r > maxR) continue;
+        const tol = Math.max(0.06 * c3.r, spanTol(pts) * 0.35);
+        const stats = circleInlierStats(pts, c3.h, c3.k, c3.r, tol);
+        if (stats.count < Math.max(8, n * 0.16)) continue;
+        if (stats.coverage < 0.55) continue;
+        const inlierPts = pts.filter((_, idx) => stats.mask[idx]);
+        const refined = fitCircleToPoints(inlierPts) ?? { ...c3, rms: stats.rms };
+        const cov = Math.max(
+          stats.coverage,
+          1 - largestAngularGap(inlierPts, refined.h, refined.k) / (Math.PI * 2),
+        );
+        if (!acceptCircleGeometry(inlierPts, refined, cov)) continue;
+        const circLen = 2 * Math.PI * refined.r;
+        const arcLen = inlierArcLength(pts, stats.mask);
+        const longest = longestInlierRunLength(pts, stats.mask);
+        // 连续弧必须够长：拒绝矩形四角落在外接圆上的假圆
+        if (arcLen < circLen * 0.45 || arcLen > circLen * 1.70) continue;
+        if (longest < circLen * 0.38) continue;
+        const rel = refined.rms / refined.r;
+        const score = cov * 2 + stats.count / n - rel;
+        if (score > bestScore) {
+          bestScore = score;
+          best = {
+            h: refined.h,
+            k: refined.k,
+            r: refined.r,
+            rms: refined.rms,
+            inliers: stats.mask,
+            inlierRatio: stats.count / n,
+          };
+        }
+      }
+    }
+  }
+  return best;
+};
+
+/** 圆上的内点去掉后，剩下的开链（含与圆的衔接点），避免圆和折线叠画 */
+const outlierRunsFromMask = (pts: Point[], inliers: boolean[]): Point[][] => {
+  const n = pts.length;
+  if (n === 0 || inliers.length !== n) return [];
+  const runs: Point[][] = [];
+  let cur: Point[] = [];
+  for (let i = 0; i < n; i++) {
+    if (!inliers[i]) {
+      if (cur.length === 0 && i > 0) cur.push(pts[i - 1]);
+      cur.push(pts[i]);
+    } else if (cur.length) {
+      cur.push(pts[i]);
+      runs.push(cur);
+      cur = [];
+    }
+  }
+  if (cur.length) {
+    if (runs.length > 0 && !inliers[0]) runs[0] = cur.concat(runs[0]);
+    else runs.push(cur);
+  }
+  return runs.filter(r => r.length >= 4 && calculatePathLength(r) > 0.08);
+};
+
+const contourLooksClosedCircle = (pts: Point[]): boolean => {
+  const hit = detectCircleOnContour(pts);
+  return !!(hit && hit.inlierRatio >= 0.62);
 };
 
 /** 主方向直线段拟合；rms 为垂距均方根 */
@@ -2336,6 +2603,33 @@ const extractSegmentationContours = (
   return traceSegmentationBoundaryLoops(seg);
 };
 
+/**
+ * 从色块边界里捞真正的圆/扁圆（卡通眼睛、拍立得镜头）。
+ * Sobel 追踪常把这些环拆开或粘到眼镜框/机身上，色块边界却是闭合的。
+ */
+const extractCircularRegionLoops = (
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+): Point[][] => {
+  const { contours } = extractSegmentationContours(ctx, width, height, 400);
+  const out: Point[][] = [];
+  for (const raw of contours) {
+    if (raw.length < 8) continue;
+    const pts = smoothPointsPasses(raw, 1);
+    const box = contourBBox(pts);
+    const bw = box.maxX - box.minX;
+    const bh = box.maxY - box.minY;
+    if (bw < 10 || bh < 10) continue;
+    if (bw > width * 0.62 || bh > height * 0.62) continue;
+    const aspect = bw / Math.max(bh, 1);
+    if (aspect < 0.42 || aspect > 2.4) continue;
+    const hit = detectCircleOnContour(pts);
+    if (hit && hit.inlierRatio >= 0.68 && hit.r >= 5) out.push(pts);
+  }
+  return out;
+};
+
 const extractColorFillPolygons = (
   ctx: CanvasRenderingContext2D,
   width: number,
@@ -2795,12 +3089,9 @@ const generateFourierExpressions = (
     const end = pts[pts.length - 1];
     const gap = Math.sqrt((start.x - end.x) ** 2 + (start.y - end.y) ** 2);
     const closedHint = closedHints[i];
-    const closeGap = Math.max(10, Math.min(W, H) * 0.012);
-    const isClosed = closedHint != null
-      ? closedHint
-      : (gap < closeGap || gap < pathLength * 0.035);
+    const closeGap = Math.max(12, Math.min(W, H) * 0.02);
 
-    const area = calculatePolygonArea(pts); // 多边形面积
+    const area = calculatePolygonArea(pts); // 多边形面积（鞋带会把首尾连上）
     const boundsArea = w * h;               // 包围盒面积
 
     // 圆形度：完美圆形 = 1.0，线条 ≈ 0
@@ -2811,10 +3102,28 @@ const generateFourierExpressions = (
     // 实心圆 → 0.7-1.0；线条、字母 → 0.1-0.3
     const fillRatio = boundsArea > 0 ? area / boundsArea : 0;
 
+    // 不要让 AI 的 open hint 盖掉几何上的近圆；描边缺口对眼睛/镜头很常见
+    let isClosed = closedHint === true
+      || gap < closeGap
+      || gap < pathLength * 0.08;
+    if (!isClosed && circularity > 0.45 && gap < Math.max(closeGap * 2.8, pathLength * 0.25)) {
+      isClosed = true;
+    }
+    if (!isClosed && pts.length >= 8) {
+      const circFit = fitCircleToPoints(pts);
+      if (circFit) {
+        const cov = 1 - largestAngularGap(pts, circFit.h, circFit.k) / (Math.PI * 2);
+        if (cov > 0.55 && circFit.rms / circFit.r < 0.16) isClosed = true;
+      }
+    }
+
+    let points = pts;
+    if (isClosed && gap > 1e-6) points = [...pts, { ...pts[0] }];
+
     return {
       index: i, cx, cy, minX, maxX, minY, maxY,
       w, h, boundsArea, pathLength,
-      points: pts,
+      points,
       averageStrength: strengths[i], // 该轮廓的平均边缘强度
       isClosed,
       radiusCV: 0, // 暂未使用
@@ -2876,8 +3185,8 @@ const generateFourierExpressions = (
       return;
     }
 
-    // 实心小色块噪声；高圆形度的小环（瞳孔、镜头）要留
-    if (m.w < minBlobSize && m.h < minBlobSize && m.fillRatio > 0.55 && m.circularity < 0.55) {
+    // 实心小色块噪声；高圆形度的小环（瞳孔、镜头、卡通眼）要留
+    if (m.w < minBlobSize && m.h < minBlobSize && m.fillRatio > 0.55 && m.circularity < 0.42) {
       activeSet.delete(m.index);
     }
   });
@@ -2886,6 +3195,53 @@ const generateFourierExpressions = (
   let finalContours = survivors.map(m => m.points);
   let finalClosed = survivors.map(m => m.isClosed);
   let finalStrengths = survivors.map(m => m.averageStrength);
+
+  if (bezierHiFi) {
+    const blobs = extractCircularRegionLoops(ctx, W, H);
+    if (blobs.length > 0) {
+      const drop = new Set<number>();
+      const addBlobs: Point[][] = [];
+      for (const blob of blobs) {
+        const bc = contourCentroid(blob);
+        const bb = contourBBox(blob);
+        const br = Math.max(bb.maxX - bb.minX, bb.maxY - bb.minY) / 2;
+        const blobLen = calculatePathLength(blob);
+        let duplicateCircle = false;
+        for (let i = 0; i < finalContours.length; i++) {
+          const cc = contourCentroid(finalContours[i]);
+          if (Math.hypot(cc.x - bc.x, cc.y - bc.y) >= br * 0.62) continue;
+          if (contourLooksClosedCircle(finalContours[i])) {
+            duplicateCircle = true;
+            break;
+          }
+          const otherLen = calculatePathLength(finalContours[i]);
+          if (otherLen > blobLen * 1.8) continue;
+          drop.add(i);
+        }
+        if (duplicateCircle) continue;
+        addBlobs.push(blob);
+      }
+      if (drop.size > 0 || addBlobs.length > 0) {
+        const keptC: Point[][] = [];
+        const keptClosed: boolean[] = [];
+        const keptS: number[] = [];
+        for (let i = 0; i < finalContours.length; i++) {
+          if (drop.has(i)) continue;
+          keptC.push(finalContours[i]);
+          keptClosed.push(finalClosed[i]);
+          keptS.push(finalStrengths[i]);
+        }
+        for (const blob of addBlobs) {
+          keptC.push(blob);
+          keptClosed.push(true);
+          keptS.push(Math.max(strengthThreshold * 1.25, 24));
+        }
+        finalContours = keptC;
+        finalClosed = keptClosed;
+        finalStrengths = keptS;
+      }
+    }
+  }
 
   if (bezierHiFi && finalContours.length > 1) {
     const linkGap = Math.max(18, Math.round(Math.min(W, H) * 0.024));
@@ -2903,18 +3259,33 @@ const generateFourierExpressions = (
       const len = calculatePathLength(finalContours[i]);
       const closed = finalClosed[i];
       const strong = (finalStrengths[i] ?? 0) >= strengthThreshold * 1.05;
+      const keepRound = contourLooksClosedCircle(finalContours[i]);
       if (closed) {
-        if (len < minClosedAfter && !strong) continue;
-      } else if (len < minOpenAfter && !strong) {
+        if (len < minClosedAfter && !strong && !keepRound) continue;
+      } else if (len < minOpenAfter && !strong && !keepRound) {
         continue;
       }
       keptC.push(finalContours[i]);
-      keptClosed.push(closed);
+      keptClosed.push(closed || keepRound);
       keptS.push(finalStrengths[i]);
     }
     finalContours = keptC;
     finalClosed = keptClosed;
     finalStrengths = keptS;
+
+    for (let i = 0; i < finalContours.length; i++) {
+      const c = finalContours[i];
+      if (c.length < 3) continue;
+      const gap = pointDist(c[0], c[c.length - 1]);
+      if (finalClosed[i]) {
+        if (gap > 1e-6) finalContours[i] = [...c, { ...c[0] }];
+        continue;
+      }
+      if (contourLooksClosedCircle(c)) {
+        finalClosed[i] = true;
+        if (gap > 1e-6) finalContours[i] = [...c, { ...c[0] }];
+      }
+    }
 
     const dupDist = Math.max(5, Math.min(12, Math.min(W, H) * 0.01));
     const deduped = suppressNearDuplicateContours(finalContours, finalClosed, finalStrengths, dupDist);
@@ -2958,6 +3329,7 @@ const generateFourierExpressions = (
   const BEZIER_MAX_ERR = Math.max(0.005, desmosScale * (options.compactFourier ? 1.1 : 0.38));
   let bezierSegsUsed = 0;
   const bezierTableOrdinal = { n: 0 };
+  const emittedCircles: { h: number; k: number; r: number }[] = [];
 
   finalContours.forEach((rawPoints, idx) => {
     const isClosed = finalClosed[idx] ?? false;
@@ -3040,29 +3412,85 @@ const generateFourierExpressions = (
       }
 
       const pathLenPx = calculatePathLength(fitImg);
-      const areaPx = calculatePolygonArea(fitImg);
-      const circNow = pathLenPx > 0 ? (4 * Math.PI * areaPx) / (pathLenPx * pathLenPx) : 0;
 
-      // 闭合近圆 → (x-h)²+(y-k)²=r²（镜头、眼睛等）
-      if (isClosed && fitDesmos.length >= 10) {
-        const circ = fitCircleToPoints(fitDesmos);
-        const rel = circ ? circ.rms / circ.r : 1;
-        if (circ && circ.r > 0.1 && rel < 0.08 && (circNow > 0.38 || rel < 0.045)) {
-          const h = fmtDesmosNumBezier(circ.h);
-          const k = fmtDesmosNumBezier(circ.k);
-          const r2 = fmtDesmosNumBezier(circ.r * circ.r);
-          contourExpressions.push({
-            id: `${idPrefix}bez_circle_${index}`,
-            latex: restrictPlot(
-              `\\left(x-${h}\\right)^{2}+\\left(y-${k}\\right)^{2}=${r2}`,
-            ),
+      const emitCircleLatex = (circ: DetectedCircle): boolean => {
+        if (circ.r < 0.08 || circ.r > 12) return false;
+        const dup = emittedCircles.some(e => (
+          Math.hypot(e.h - circ.h, e.k - circ.k) < 0.35 * Math.min(e.r, circ.r)
+          && Math.abs(e.r - circ.r) / Math.max(e.r, circ.r) < 0.28
+        ));
+        if (dup) return false;
+        const h = fmtDesmosNumBezier(circ.h);
+        const k = fmtDesmosNumBezier(circ.k);
+        const r2 = fmtDesmosNumBezier(circ.r * circ.r);
+        contourExpressions.push({
+          id: `${idPrefix}bez_circle_${index}`,
+          latex: restrictPlot(
+            `\\left(x-${h}\\right)^{2}+\\left(y-${k}\\right)^{2}=${r2}`,
+          ),
+          color: plotColor,
+          lineWidth,
+          lineOpacity: 1,
+          hidden: false,
+        });
+        emittedCircles.push({ h: circ.h, k: circ.k, r: circ.r });
+        return true;
+      };
+
+      const emitOpenChain = (desmosPts: Point[], extra: string) => {
+        if (desmosPts.length < 2) return;
+        if (desmosPts.length >= 4) {
+          const line = fitLineToPoints(desmosPts);
+          const lineTol = Math.max(0.028, desmosScale * 0.8);
+          if (line && line.rms < lineTol && line.length > 0.3) {
+            const a = desmosPts[0];
+            const b = desmosPts[desmosPts.length - 1];
+            const ax = fmtDesmosNumBezier(a.x);
+            const ay = fmtDesmosNumBezier(a.y);
+            const dx = fmtDesmosNumBezier(b.x - a.x);
+            const dy = fmtDesmosNumBezier(b.y - a.y);
+            contourExpressions.push({
+              id: `${idPrefix}bez_line_${index}${extra}`,
+              latex: restrictPlot(`\\left(${ax}+(${dx})t,${ay}+(${dy})t\\right)`),
+              color: plotColor,
+              lineWidth,
+              lineOpacity: 1,
+              hidden: false,
+              parametricDomain: { min: '0', max: '1' },
+            });
+            return;
+          }
+        }
+        const remain = Math.max(0, BEZIER_SEG_BUDGET - bezierSegsUsed);
+        const cap = Math.min(36, remain, Math.max(4, Math.round(desmosPts.length / 4)));
+        if (cap >= 3 && desmosPts.length >= 4) {
+          const segs = fitCubicBezierChain(desmosPts, false, cap, { maxErr: BEZIER_MAX_ERR });
+          const emitted = pushBezierChainExpressions(contourExpressions, segs, {
+            idPrefix,
+            index,
+            idExtra: extra,
             color: plotColor,
             lineWidth,
-            lineOpacity: 1,
-            hidden: false,
+            restrict: restrictPlot,
           });
-          return;
+          bezierSegsUsed += segs.length;
+          if (emitted > 0) return;
         }
+      };
+
+      // 近圆（含微开缺口、扁圆眼睛）→ 只出圆方程，不叠折线
+      const circleHit = detectCircleOnContour(fitDesmos);
+      if (circleHit && circleHit.r >= 0.08 && circleHit.r <= 12) {
+        emitCircleLatex(circleHit);
+        if (circleHit.inlierRatio < 0.68) {
+          const runs = outlierRunsFromMask(fitDesmos, circleHit.inliers);
+          let rest = 0;
+          for (const run of runs) {
+            if (calculatePathLength(run) < desmosScale * 10) continue;
+            emitOpenChain(run, `_rest${rest++}`);
+          }
+        }
+        return;
       }
 
       // 整段近直线 → 参数一次式（端点用真实首尾，避免过冲叠线）
@@ -3279,7 +3707,10 @@ const generateFourierExpressions = (
   const outlineNote = aiUsed
     ? `（AI 精确轮廓 ${Math.min(options.aiContours!.length, finalContours.length)} 条 + 边缘检测补充）`
     : '';
-  const fitNote = fitMethod === 'bezier' ? '，贝塞尔拟合' : '，傅里叶拟合';
+  const circleCount = contourExpressions.filter(e => String(e.id ?? '').includes('bez_circle_')).length;
+  const fitNote = fitMethod === 'bezier'
+    ? (circleCount > 0 ? `，贝塞尔拟合（${circleCount} 个圆方程）` : '，贝塞尔拟合')
+    : '，傅里叶拟合';
 
   return {
     expressions,
