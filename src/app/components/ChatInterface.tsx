@@ -140,6 +140,19 @@ interface Message {
   createdAt?: number;
 }
 
+const countClosedFormFits = (expressions: { id?: string }[]) => {
+  let circles = 0;
+  let ellipses = 0;
+  let lines = 0;
+  for (const expr of expressions) {
+    const id = String(expr?.id ?? '');
+    if (id.includes('bez_circle_')) circles++;
+    else if (id.includes('bez_ellipse_')) ellipses++;
+    else if (id.includes('bez_line_')) lines++;
+  }
+  return { circles, ellipses, lines };
+};
+
 const parseMessageTimestamp = (id: string): number | undefined => {
   if (id === 'init') return undefined;
   const n = Number(id);
@@ -1054,12 +1067,18 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     if (signal?.aborted) return;
     await revealDrawingProgress(result.expressions, aiMsgId, signal, mode);
 
+    const stats = countClosedFormFits(result.expressions);
     setMessages(prev => prev.map(m =>
       m.id === aiMsgId ? {
         ...m,
-        content: `Success ${emoji}`,
-        translationKey: 'emoji_success',
-        translationParams: { emoji },
+        content: result.explanation || `Success ${emoji}`,
+        translationKey: 'emoji_success_stats',
+        translationParams: {
+          emoji,
+          circles: String(stats.circles),
+          ellipses: String(stats.ellipses),
+          lines: String(stats.lines),
+        },
         drawingProgressPhase: undefined,
         drawingProgressCurrent: undefined,
         drawingProgressTotal: undefined,
@@ -1373,13 +1392,21 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
             );
         }
 
+        const stats = countClosedFormFits(expressions);
+        const statsParams = {
+          circles: String(stats.circles),
+          ellipses: String(stats.ellipses),
+          lines: String(stats.lines),
+        };
+
         if (task.signal.aborted) {
           if (expressions.length > 0) {
             setMessages(prev => prev.map(m =>
               m.id === progressMsgId ? {
                 ...m,
-                content: 'Drawing partial',
-                translationKey: 'drawing_partial_complete',
+                content: result.explanation || 'Drawing partial',
+                translationKey: 'drawing_complete_stats',
+                translationParams: statsParams,
                 drawingProgressPhase: undefined,
                 drawingProgressCurrent: undefined,
                 drawingProgressTotal: undefined,
@@ -1392,8 +1419,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
         setMessages(prev => prev.map(m =>
             m.id === progressMsgId ? {
                 ...m,
-                content: 'Drawing complete',
-                translationKey: 'drawing_complete',
+                content: result.explanation || 'Drawing complete',
+                translationKey: 'drawing_complete_stats',
+                translationParams: statsParams,
                 drawingProgressPhase: undefined,
                 drawingProgressCurrent: undefined,
                 drawingProgressTotal: undefined,

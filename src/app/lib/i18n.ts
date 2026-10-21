@@ -232,6 +232,7 @@ export const translations = {
     confirm_clear: '确定要清除所有对话记录吗？',  // confirm() 弹窗的提示文字
     canvas_cleared: '画板已清空。',              // 清空画板后在聊天中显示的消息
     drawing_complete: '绘画已完成。',            // 图片拟合成功后的消息
+    drawing_complete_stats: '绘画已完成（{circles} 个圆方程，{ellipses} 个椭圆方程，{lines} 条直线）。',
     drawing_processing: '正在分析图片…',
     gif_drawing_processing: '正在解码 GIF 并分析时间轴…',
     gif_drawing_frame: '正在处理第 {current}/{total} 关键帧…',
@@ -309,6 +310,7 @@ export const translations = {
     // {emoji} 是模板占位符，会被 t() 函数中的 params 参数替换成实际 emoji
     emoji_drawing: '正在绘制 {emoji} ...',
     emoji_success: '✅ 已为您绘制 {emoji}',
+    emoji_success_stats: '✅ 已为您绘制 {emoji}（{circles} 个圆方程，{ellipses} 个椭圆方程，{lines} 条直线）。',
     emoji_fail: '❌ 绘制失败，无法解析该 Emoji 的轮廓。',
 
     // ── 使用技巧（帮助面板） ──────────────────────────────────────────────────
@@ -690,6 +692,7 @@ export const translations = {
     confirm_clear: 'Are you sure you want to clear chat history?',
     canvas_cleared: 'Canvas cleared.',
     drawing_complete: 'Drawing complete.',
+    drawing_complete_stats: 'Drawing complete ({circles} circle equations, {ellipses} ellipse equations, {lines} line equations).',
     drawing_processing: 'Analyzing image…',
     gif_drawing_processing: 'Decoding GIF and building timeline…',
     gif_drawing_frame: 'Processing keyframe {current}/{total}…',
@@ -766,6 +769,7 @@ export const translations = {
     // ── Emoji 绘图状态消息 ────────────────────────────────────────────────────
     emoji_drawing: 'Drawing {emoji} ...',
     emoji_success: '✅ Drawn {emoji} for you',
+    emoji_success_stats: '✅ Drawn {emoji} ({circles} circle equations, {ellipses} ellipse equations, {lines} line equations).',
     emoji_fail: '❌ Failed to draw. Could not parse contour for this Emoji.',
 
     // ── 使用技巧 ──────────────────────────────────────────────────────────────

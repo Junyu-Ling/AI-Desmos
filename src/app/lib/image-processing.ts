@@ -1081,7 +1081,7 @@ const detectCircleOnContour = (pts: Point[]): DetectedCircle | null => {
   const whole = fitCircleToPoints(closedPts);
   if (whole) {
     const coverage = 1 - largestAngularGap(closedPts, whole.h, whole.k) / (Math.PI * 2);
-    if (acceptCircleGeometry(closedPts, whole, coverage) && coverage >= 0.55) {
+    if (acceptCircleGeometry(closedPts, whole, coverage) && coverage >= 0.72) {
       return {
         ...whole,
         inliers: pts.map(() => true),
@@ -1106,7 +1106,7 @@ const detectCircleOnContour = (pts: Point[]): DetectedCircle | null => {
         const tol = Math.max(0.06 * c3.r, spanTol(pts) * 0.35);
         const stats = circleInlierStats(pts, c3.h, c3.k, c3.r, tol);
         if (stats.count < Math.max(8, n * 0.16)) continue;
-        if (stats.coverage < 0.55) continue;
+        if (stats.coverage < 0.70) continue;
         const inlierPts = pts.filter((_, idx) => stats.mask[idx]);
         const refined = fitCircleToPoints(inlierPts) ?? { ...c3, rms: stats.rms };
         const cov = Math.max(
@@ -2603,31 +2603,617 @@ const extractSegmentationContours = (
   return traceSegmentationBoundaryLoops(seg);
 };
 
+type FilledRoundFeature = {
+  kind: 'circle' | 'ellipse';
+  h: number;
+  k: number;
+  r: number;
+  rx: number;
+  ry: number;
+  theta: number;
+};
+
+const sampleSrcRgb = (
+  src: Uint8ClampedArray,
+  width: number,
+  height: number,
+  x: number,
+  y: number,
+): { r: number; g: number; b: number } => {
+  const xi = Math.max(0, Math.min(width - 1, Math.round(x)));
+  const yi = Math.max(0, Math.min(height - 1, Math.round(y)));
+  const o = (yi * width + xi) * 4;
+  return { r: src[o], g: src[o + 1], b: src[o + 2] };
+};
+
+const lumOf = (c: { r: number; g: number; b: number }): number =>
+  0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
+
+/** 填色像素的惯性椭圆：不依赖描边是否闭合 */
+const fitFilledEllipseMoments = (
+  pts: Point[],
+): { h: number; k: number; rx: number; ry: number; theta: number } | null => {
+  const n = pts.length;
+  if (n < 10) return null;
+  let sx = 0;
+  let sy = 0;
+  for (const p of pts) {
+    sx += p.x;
+    sy += p.y;
+  }
+  const h = sx / n;
+  const k = sy / n;
+  let mu20 = 0;
+  let mu02 = 0;
+  let mu11 = 0;
+  for (const p of pts) {
+    const dx = p.x - h;
+    const dy = p.y - k;
+    mu20 += dx * dx;
+    mu02 += dy * dy;
+    mu11 += dx * dy;
+  }
+  mu20 /= n;
+  mu02 /= n;
+  mu11 /= n;
+  const theta = 0.5 * Math.atan2(2 * mu11, mu20 - mu02);
+  const c = Math.cos(theta);
+  const s = Math.sin(theta);
+  let varU = 0;
+  let varV = 0;
+  for (const p of pts) {
+    const dx = p.x - h;
+    const dy = p.y - k;
+    const u = dx * c + dy * s;
+    const v = -dx * s + dy * c;
+    varU += u * u;
+    varV += v * v;
+  }
+  varU /= n;
+  varV /= n;
+  const rx = 2 * Math.sqrt(Math.max(varU, 1e-8));
+  const ry = 2 * Math.sqrt(Math.max(varV, 1e-8));
+  if (!(rx > 1e-3 && ry > 1e-3)) return null;
+  return { h, k, rx, ry, theta };
+};
+
+const ellipseRadiusNorm = (
+  x: number,
+  y: number,
+  ell: { h: number; k: number; rx: number; ry: number; theta: number },
+): number => {
+  const dx = x - ell.h;
+  const dy = y - ell.k;
+  const c = Math.cos(ell.theta);
+  const s = Math.sin(ell.theta);
+  const u = (dx * c + dy * s) / Math.max(ell.rx, 1e-6);
+  const v = (-dx * s + dy * c) / Math.max(ell.ry, 1e-6);
+  return Math.hypot(u, v);
+};
+
+/**
+ * 无序边界点云上的圆拟合。描边缺口、机身粘连时仍能出圆，
+ * 不要求点已连成闭合环。
+ */
+const detectCircleOnPointCloud = (pts: Point[]): DetectedCircle | null => {
+  if (pts.length < 8) return null;
+  const box = contourBBox(pts);
+  const span = Math.max(box.maxX - box.minX, box.maxY - box.minY, 1);
+  const minR = span * 0.28;
+  const maxR = span * 0.78;
+  const aspect = (box.maxX - box.minX) / Math.max(box.maxY - box.minY, 1e-6);
+  if (aspect < 0.36 || aspect > 2.75) return null;
+
+  const consider = (
+    circ: { h: number; k: number; r: number; rms: number },
+    inliers: boolean[],
+    inlierCount: number,
+  ): DetectedCircle | null => {
+    if (!(circ.r > minR && circ.r < maxR)) return null;
+    if (circ.rms / circ.r > 0.16) return null;
+    const ratio = inlierCount / pts.length;
+    if (ratio < 0.55) return null;
+    const inlierPts = pts.filter((_, i) => inliers[i]);
+    const coverage = inlierPts.length >= 3
+      ? 1 - largestAngularGap(inlierPts, circ.h, circ.k) / (Math.PI * 2)
+      : 0;
+    if (coverage < 0.55) return null;
+    return { ...circ, inliers, inlierRatio: ratio };
+  };
+
+  const whole = fitCircleToPoints(pts);
+  let best: DetectedCircle | null = null;
+  let bestScore = -1;
+  if (whole) {
+    const tol = Math.max(0.08 * whole.r, span * 0.02);
+    const stats = circleInlierStats(pts, whole.h, whole.k, whole.r, tol);
+    const hit = consider(
+      { ...whole, rms: stats.rms },
+      stats.mask,
+      stats.count,
+    );
+    if (hit) {
+      best = hit;
+      bestScore = hit.inlierRatio + (1 - hit.rms / hit.r);
+    }
+  }
+
+  const n = pts.length;
+  const step = Math.max(1, Math.floor(n / 14));
+  for (let i = 0; i < n; i += step) {
+    for (let j = i + step * 2; j < n; j += step) {
+      for (let k = j + step * 2; k < n; k += step) {
+        const c3 = circleFrom3Points(pts[i], pts[j], pts[k]);
+        if (!c3 || c3.r < minR || c3.r > maxR) continue;
+        const tol = Math.max(0.08 * c3.r, span * 0.02);
+        const stats = circleInlierStats(pts, c3.h, c3.k, c3.r, tol);
+        if (stats.count < Math.max(8, n * 0.5)) continue;
+        const inlierPts = pts.filter((_, idx) => stats.mask[idx]);
+        const refined = fitCircleToPoints(inlierPts) ?? { ...c3, rms: stats.rms };
+        const hit = consider(refined, stats.mask, stats.count);
+        if (!hit) continue;
+        const score = hit.inlierRatio + (1 - hit.rms / hit.r);
+        if (score > bestScore) {
+          bestScore = score;
+          best = hit;
+        }
+      }
+    }
+  }
+  return best;
+};
+
+const fillInteriorHoles = (mask: Uint8Array, gw: number, gh: number): Uint8Array => {
+  const outside = new Uint8Array(gw * gh);
+  const stack: number[] = [];
+  const seed = (x: number, y: number) => {
+    const i = y * gw + x;
+    if (mask[i] || outside[i]) return;
+    outside[i] = 1;
+    stack.push(i);
+  };
+  for (let x = 0; x < gw; x++) {
+    seed(x, 0);
+    seed(x, gh - 1);
+  }
+  for (let y = 1; y < gh - 1; y++) {
+    seed(0, y);
+    seed(gw - 1, y);
+  }
+  while (stack.length) {
+    const cur = stack.pop()!;
+    const x = cur % gw;
+    const y = Math.floor(cur / gw);
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + dx;
+      const ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+      const ni = ny * gw + nx;
+      if (mask[ni] || outside[ni]) continue;
+      outside[ni] = 1;
+      stack.push(ni);
+    }
+  }
+  const filled = new Uint8Array(mask);
+  for (let i = 0; i < filled.length; i++) {
+    if (!outside[i]) filled[i] = 1;
+  }
+  return filled;
+};
+
+/** 从色块质心沿 24 条射线走到颜色突变，半径变异小则是圆/椭圆 */
+const radialBoundaryPoints = (
+  src: Uint8ClampedArray,
+  width: number,
+  height: number,
+  cx: number,
+  cy: number,
+  seed: { r: number; g: number; b: number },
+  maxR: number,
+): Point[] => {
+  const pts: Point[] = [];
+  const rays = 24;
+  for (let i = 0; i < rays; i++) {
+    const ang = (i * Math.PI * 2) / rays;
+    const dx = Math.cos(ang);
+    const dy = Math.sin(ang);
+    let hit = maxR;
+    for (let r = 2; r <= maxR; r += 1) {
+      const rgb = sampleSrcRgb(src, width, height, cx + dx * r, cy + dy * r);
+      const lumJump = Math.abs(lumOf(rgb) - lumOf(seed));
+      const dist = colorDistance(rgb, seed);
+      // 深灰镜头填色与黑色圈边 lum 接近，不能当成边界；米色机身才会双双跳变
+      if (lumJump > 36 && dist > 40) {
+        hit = r;
+        break;
+      }
+    }
+    if (hit < maxR * 0.96) {
+      pts.push({ x: cx + dx * hit, y: cy + dy * hit });
+    }
+  }
+  return pts;
+};
+
+const featureFromFilledCells = (
+  cells: Point[],
+  src: Uint8ClampedArray,
+  width: number,
+  height: number,
+  cellArea = 1,
+): FilledRoundFeature | null => {
+  if (cells.length < 12) return null;
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  let sx = 0;
+  let sy = 0;
+  for (const p of cells) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+    sx += p.x;
+    sy += p.y;
+  }
+  const pad = Math.sqrt(Math.max(cellArea, 1)) * 0.5;
+  const bw = Math.max(maxX - minX + 2 * pad, pad * 2);
+  const bh = Math.max(maxY - minY + 2 * pad, pad * 2);
+  const minSide = Math.min(width, height);
+  if (bw < Math.max(10, minSide * 0.018) || bh < Math.max(10, minSide * 0.018)) return null;
+  if (bw > minSide * 0.36 || bh > minSide * 0.36) return null;
+  const aspect = bw / Math.max(bh, 1e-6);
+  if (aspect < 0.42 || aspect > 2.15) return null;
+  const bboxArea = Math.max(bw * bh, 1);
+  const fillArea = cells.length * Math.max(cellArea, 1e-6);
+  const extent = fillArea / bboxArea;
+  // 圆/椭圆 extent≈0.785；矩形机身≈1。高光挖洞的环会略低。
+  if (extent < 0.64 || extent > 0.90) return null;
+
+  const ell = fitFilledEllipseMoments(cells);
+  if (!ell) return null;
+  let inside = 0;
+  for (const p of cells) {
+    if (ellipseRadiusNorm(p.x, p.y, ell) <= 1.08) inside++;
+  }
+  const coverage = inside / cells.length;
+  const ellArea = Math.PI * ell.rx * ell.ry;
+  const occupancy = ellArea > 1 ? fillArea / ellArea : 0;
+  if (coverage < 0.80 || occupancy < 0.72 || occupancy > 1.28) return null;
+
+  const cx = sx / cells.length;
+  const cy = sy / cells.length;
+  const seed = sampleSrcRgb(src, width, height, cx, cy);
+  const maxR = Math.max(bw, bh) * 0.85;
+  const radialPts = radialBoundaryPoints(src, width, height, cx, cy, seed, maxR);
+  let cv = 1;
+  if (radialPts.length >= 14) {
+    const radii = radialPts.map(p => Math.hypot(p.x - cx, p.y - cy));
+    const meanR = radii.reduce((a, b) => a + b, 0) / radii.length;
+    let varR = 0;
+    for (const r of radii) varR += (r - meanR) * (r - meanR);
+    cv = Math.sqrt(varR / radii.length) / Math.max(meanR, 1e-6);
+  }
+
+  const cloud = radialPts.length >= 12 ? detectCircleOnPointCloud(radialPts) : null;
+  const axisRatio = Math.max(ell.rx, ell.ry) / Math.max(Math.min(ell.rx, ell.ry), 1e-6);
+  // 填色 extent 已拒绝矩形；径向 CV 只用来选圆还是椭圆，高光缺口不再一票否决
+  const circularEnough = axisRatio < 1.22 && (cv < 0.22 || radialPts.length < 14);
+  const ellipseEnough = axisRatio <= 1.85 && extent <= 0.90 && (cv < 0.34 || radialPts.length < 14);
+
+  if (circularEnough && cloud && cloud.r >= 5) {
+    return {
+      kind: 'circle',
+      h: cloud.h,
+      k: cloud.k,
+      r: cloud.r,
+      rx: cloud.r,
+      ry: cloud.r,
+      theta: 0,
+    };
+  }
+  if (circularEnough) {
+    const r = (ell.rx + ell.ry) / 2;
+    return { kind: 'circle', h: ell.h, k: ell.k, r, rx: r, ry: r, theta: 0 };
+  }
+  if (ellipseEnough) {
+    if (axisRatio < 1.16) {
+      const r = (ell.rx + ell.ry) / 2;
+      return { kind: 'circle', h: ell.h, k: ell.k, r, rx: r, ry: r, theta: 0 };
+    }
+    return {
+      kind: 'ellipse',
+      h: ell.h,
+      k: ell.k,
+      r: (ell.rx + ell.ry) / 2,
+      rx: ell.rx,
+      ry: ell.ry,
+      theta: ell.theta,
+    };
+  }
+  return null;
+};
+
+const nmsFilledRounds = (
+  feats: FilledRoundFeature[],
+  width: number,
+  height: number,
+): FilledRoundFeature[] => {
+  const minSide = Math.min(width, height);
+  const margin = minSide * 0.08;
+  const scored = feats
+    .filter(f => {
+      if (f.r < minSide * 0.018 || f.r > minSide * 0.11) return false;
+      if (f.h - f.r < margin || f.k - f.r < margin) return false;
+      if (f.h + f.r > width - margin || f.k + f.r > height - margin) return false;
+      const axis = Math.max(f.rx, f.ry) / Math.max(Math.min(f.rx, f.ry), 1e-6);
+      return axis <= 1.85;
+    })
+    .map(f => {
+      const pref = f.r / minSide;
+      // 眼睛/镜头大约是画面短边的 3%–9%；大块头发/脸得分更低
+      const sizeFit = pref >= 0.025 && pref <= 0.09 ? 2.2 : 1;
+      const roundBonus = f.kind === 'circle' ? 1.35 : 1;
+      return { f, score: sizeFit * roundBonus / (1 + Math.abs(pref - 0.05)) };
+    });
+  scored.sort((a, b) => b.score - a.score);
+  const kept: FilledRoundFeature[] = [];
+  for (const { f } of scored) {
+    const dup = kept.some(k => {
+      const dist = Math.hypot(k.h - f.h, k.k - f.k);
+      const similar = Math.abs(k.r - f.r) / Math.max(k.r, f.r) < 0.34;
+      return similar && dist < 0.45 * Math.min(k.r, f.r);
+    });
+    if (!dup) kept.push(f);
+    if (kept.length >= 5) break;
+  }
+  return kept;
+};
+
+const cellsFromMask = (
+  mask: Uint8Array,
+  gw: number,
+  gh: number,
+  width: number,
+  height: number,
+): Point[] => {
+  const cells: Point[] = [];
+  const sx = width / gw;
+  const sy = height / gh;
+  for (let gy = 0; gy < gh; gy++) {
+    for (let gx = 0; gx < gw; gx++) {
+      if (!mask[gy * gw + gx]) continue;
+      cells.push({ x: (gx + 0.5) * sx, y: (gy + 0.5) * sy });
+    }
+  }
+  return cells;
+};
+
+const connectedMasks = (
+  flags: Uint8Array,
+  gw: number,
+  gh: number,
+  minSize: number,
+): Uint8Array[] => {
+  const seen = new Uint8Array(gw * gh);
+  const out: Uint8Array[] = [];
+  for (let i = 0; i < flags.length; i++) {
+    if (!flags[i] || seen[i]) continue;
+    const mask = new Uint8Array(gw * gh);
+    const stack = [i];
+    seen[i] = 1;
+    let size = 0;
+    while (stack.length) {
+      const cur = stack.pop()!;
+      mask[cur] = 1;
+      size++;
+      const x = cur % gw;
+      const y = Math.floor(cur / gw);
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+        const ni = ny * gw + nx;
+        if (!flags[ni] || seen[ni]) continue;
+        seen[ni] = 1;
+        stack.push(ni);
+      }
+    }
+    if (size >= minSize) out.push(mask);
+  }
+  return out;
+};
+
+/**
+ * 在填色原图上找圆/椭圆：色块惯性椭圆 + 无序点云 RANSAC + 径向采样。
+ * 拍立得镜头（米色机身上的深色实心圆）和浅灰椭圆眼睛不依赖 Sobel 闭环。
+ */
+const detectFilledRoundFeatures = (
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+): FilledRoundFeature[] => {
+  const gridMax = Math.min(480, Math.max(width, height));
+  const seg = buildColorSegmentation(ctx, width, height, gridMax);
+  const { gw, gh, src, labels, borderBg, rgbAt } = seg;
+  const minCells = Math.max(12, Math.round((gw * gh) * 0.00035));
+  const maxCells = Math.round(gw * gh * 0.08);
+  const found: FilledRoundFeature[] = [];
+  const cellArea = (width / gw) * (height / gh);
+  const sx = width / gw;
+  const sy = height / gh;
+
+  const considerCells = (cells: Point[]) => {
+    if (cells.length < minCells || cells.length > maxCells) return;
+    const feat = featureFromFilledCells(cells, src, width, height, cellArea);
+    if (feat) found.push(feat);
+  };
+
+  const byLabel = new Map<number, Point[]>();
+  for (let gy = 0; gy < gh; gy++) {
+    for (let gx = 0; gx < gw; gx++) {
+      const i = gy * gw + gx;
+      if (borderBg[i]) continue;
+      const lab = labels[i];
+      if (lab <= 0) continue;
+      let arr = byLabel.get(lab);
+      if (!arr) {
+        arr = [];
+        byLabel.set(lab, arr);
+      }
+      arr.push({ x: (gx + 0.5) * sx, y: (gy + 0.5) * sy });
+    }
+  }
+  for (const cells of byLabel.values()) considerCells(cells);
+
+  // 亮度分层：浅灰眼睛 / 深色镜头在 RGB 量化碎片化时仍能成块
+  const lumFlagsDark = new Uint8Array(gw * gh);
+  const lumFlagsMid = new Uint8Array(gw * gh);
+  for (let gy = 0; gy < gh; gy++) {
+    for (let gx = 0; gx < gw; gx++) {
+      const i = gy * gw + gx;
+      if (borderBg[i]) continue;
+      const c = rgbAt(gx, gy);
+      if (isCanvasBackground(c.r, c.g, c.b)) continue;
+      const lum = lumOf(c);
+      const chroma = Math.max(c.r, c.g, c.b) - Math.min(c.r, c.g, c.b);
+      if (lum < 110) lumFlagsDark[i] = 1;
+      else if (lum >= 110 && lum <= 210 && chroma < 52) lumFlagsMid[i] = 1;
+    }
+  }
+  const erode4 = (mask: Uint8Array) => {
+    const out = new Uint8Array(gw * gh);
+    for (let y = 1; y < gh - 1; y++) {
+      for (let x = 1; x < gw - 1; x++) {
+        const i = y * gw + x;
+        if (mask[i] && mask[i - 1] && mask[i + 1] && mask[i - gw] && mask[i + gw]) out[i] = 1;
+      }
+    }
+    return out;
+  };
+  const dilate4 = (mask: Uint8Array) => {
+    const out = new Uint8Array(mask);
+    for (let y = 1; y < gh - 1; y++) {
+      for (let x = 1; x < gw - 1; x++) {
+        if (!mask[y * gw + x]) continue;
+        out[y * gw + x - 1] = 1;
+        out[y * gw + x + 1] = 1;
+        out[(y - 1) * gw + x] = 1;
+        out[(y + 1) * gw + x] = 1;
+      }
+    }
+    return out;
+  };
+  // 开运算剥掉细黑线：镜头实心圆留下，机身黑色描边消失（放大后描边更粗，多蚀几次）
+  let darkOpened = lumFlagsDark;
+  for (let i = 0; i < 3; i++) darkOpened = erode4(darkOpened);
+  for (let i = 0; i < 3; i++) darkOpened = dilate4(darkOpened);
+  for (const part of connectedMasks(darkOpened, gw, gh, minCells)) {
+    considerCells(cellsFromMask(fillInteriorHoles(part, gw, gh), gw, gh, width, height));
+  }
+  for (const part of connectedMasks(lumFlagsDark, gw, gh, minCells)) {
+    considerCells(cellsFromMask(part, gw, gh, width, height));
+  }
+  for (const part of connectedMasks(lumFlagsMid, gw, gh, minCells)) {
+    considerCells(cellsFromMask(part, gw, gh, width, height));
+  }
+
+  // 深色实心圆补检（镜头）：只从暗且均匀的格子做径向采样，不扫整图
+  if (nmsFilledRounds(found, width, height).length < 3) {
+    const minR = Math.min(width, height) * 0.025;
+    const maxR = Math.min(width, height) * 0.11;
+    const step = 8;
+    for (let gy = 2; gy < gh - 2; gy += step) {
+      for (let gx = 2; gx < gw - 2; gx += step) {
+        const i = gy * gw + gx;
+        if (borderBg[i] || !lumFlagsDark[i]) continue;
+        const seed = rgbAt(gx, gy);
+        let varSum = 0;
+        for (let dy = -2; dy <= 2; dy++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            varSum += colorDistance(seed, rgbAt(gx + dx, gy + dy));
+          }
+        }
+        if (varSum / 25 > 16) continue;
+        const cx = (gx + 0.5) * sx;
+        const cy = (gy + 0.5) * sy;
+        const radialPts = radialBoundaryPoints(src, width, height, cx, cy, seed, maxR * 1.4);
+        if (radialPts.length < 18) continue;
+        const radii = radialPts.map(p => Math.hypot(p.x - cx, p.y - cy));
+        const sortedR = [...radii].sort((a, b) => a - b);
+        const medR = sortedR[Math.floor(sortedR.length / 2)];
+        const outerPts = radialPts.filter((_, idx) => radii[idx] >= medR * 0.72);
+        const cloud = detectCircleOnPointCloud(outerPts.length >= 14 ? outerPts : radialPts);
+        if (cloud && cloud.r >= minR && cloud.r <= maxR) {
+          found.push({
+            kind: 'circle',
+            h: cloud.h,
+            k: cloud.k,
+            r: cloud.r,
+            rx: cloud.r,
+            ry: cloud.r,
+            theta: 0,
+          });
+        }
+      }
+    }
+  }
+
+  return nmsFilledRounds(found, width, height);
+};
+
+const contourMatchesRoundFeature = (pts: Point[], feat: FilledRoundFeature): boolean => {
+  if (pts.length < 3) return false;
+  const ell = {
+    h: feat.h,
+    k: feat.k,
+    rx: Math.max(feat.rx, feat.r),
+    ry: Math.max(feat.ry, feat.r),
+    theta: feat.theta,
+  };
+  const tol = 0.22;
+  let near = 0;
+  let inside = 0;
+  for (const p of pts) {
+    const rho = ellipseRadiusNorm(p.x, p.y, ell);
+    if (Math.abs(rho - 1) <= tol) near++;
+    if (rho < 1 + tol) inside++;
+  }
+  const fracNear = near / pts.length;
+  const fracInside = inside / pts.length;
+  if (fracNear >= 0.50) return true;
+  const c = contourCentroid(pts);
+  const box = contourBBox(pts);
+  const span = Math.max(box.maxX - box.minX, box.maxY - box.minY);
+  const featSpan = Math.max(feat.rx, feat.ry) * 2;
+  if (ellipseRadiusNorm(c.x, c.y, ell) < 0.92 && span < featSpan * 1.4) return true;
+  if (fracInside > 0.72 && span < featSpan * 1.65) return true;
+  return false;
+};
+
 /**
  * 从色块边界里捞真正的圆/扁圆（卡通眼睛、拍立得镜头）。
- * Sobel 追踪常把这些环拆开或粘到眼镜框/机身上，色块边界却是闭合的。
+ * Sobel 追踪常把这些环拆开或粘到眼镜框/机身上；填色检测已改为主路径。
  */
 const extractCircularRegionLoops = (
   ctx: CanvasRenderingContext2D,
   width: number,
   height: number,
 ): Point[][] => {
-  const { contours } = extractSegmentationContours(ctx, width, height, 400);
-  const out: Point[][] = [];
-  for (const raw of contours) {
-    if (raw.length < 8) continue;
-    const pts = smoothPointsPasses(raw, 1);
-    const box = contourBBox(pts);
-    const bw = box.maxX - box.minX;
-    const bh = box.maxY - box.minY;
-    if (bw < 10 || bh < 10) continue;
-    if (bw > width * 0.62 || bh > height * 0.62) continue;
-    const aspect = bw / Math.max(bh, 1);
-    if (aspect < 0.42 || aspect > 2.4) continue;
-    const hit = detectCircleOnContour(pts);
-    if (hit && hit.inlierRatio >= 0.68 && hit.r >= 5) out.push(pts);
-  }
-  return out;
+  const feats = detectFilledRoundFeatures(ctx, width, height);
+  return feats.map(f => {
+    const pts: Point[] = [];
+    for (let i = 0; i < 32; i++) {
+      const ang = (i * Math.PI * 2) / 32;
+      const c = Math.cos(f.theta);
+      const s = Math.sin(f.theta);
+      const u = f.rx * Math.cos(ang);
+      const v = f.ry * Math.sin(ang);
+      pts.push({ x: f.h + u * c - v * s, y: f.k + u * s + v * c });
+    }
+    return pts;
+  });
 };
 
 const extractColorFillPolygons = (
@@ -3003,13 +3589,17 @@ const generateFourierExpressions = (
   let fillPolys: FillPolygon[] = [];
   let fillExpressions: any[] = [];
   const useColorOutline = includeOutline && !includeFill && (options.outlineStyle ?? 'color') === 'color';
+  // 圆/椭圆必须看未经对比度拉伸的原图填色，Sobel 修复画布会把镜头/眼睛糊进机身
+  const fillSrcCtx = createFillContext(width, height, options.fillImageData, ctx);
+  const filledRounds = includeOutline
+    ? detectFilledRoundFeatures(fillSrcCtx, width, height)
+    : [];
 
   if (includeFill) {
-    const fillCtx = createFillContext(width, height, options.fillImageData, ctx);
     // 黑色勾线时，纯黑格已由轮廓表达，不必再填；彩色勾线时黑发/黑眼必须留下色块
     const skipOutlineBlackFills = includeOutline && !useColorOutline;
     fillPolys = extractColorFillPolygons(
-      fillCtx, width, height, offsetX, offsetY, desmosScale, options.maxFillPolygons,
+      fillSrcCtx, width, height, offsetX, offsetY, desmosScale, options.maxFillPolygons,
       skipOutlineBlackFills,
       options.fillDetailMode ?? 'cell',
     );
@@ -3196,51 +3786,20 @@ const generateFourierExpressions = (
   let finalClosed = survivors.map(m => m.isClosed);
   let finalStrengths = survivors.map(m => m.averageStrength);
 
-  if (bezierHiFi) {
-    const blobs = extractCircularRegionLoops(ctx, W, H);
-    if (blobs.length > 0) {
-      const drop = new Set<number>();
-      const addBlobs: Point[][] = [];
-      for (const blob of blobs) {
-        const bc = contourCentroid(blob);
-        const bb = contourBBox(blob);
-        const br = Math.max(bb.maxX - bb.minX, bb.maxY - bb.minY) / 2;
-        const blobLen = calculatePathLength(blob);
-        let duplicateCircle = false;
-        for (let i = 0; i < finalContours.length; i++) {
-          const cc = contourCentroid(finalContours[i]);
-          if (Math.hypot(cc.x - bc.x, cc.y - bc.y) >= br * 0.62) continue;
-          if (contourLooksClosedCircle(finalContours[i])) {
-            duplicateCircle = true;
-            break;
-          }
-          const otherLen = calculatePathLength(finalContours[i]);
-          if (otherLen > blobLen * 1.8) continue;
-          drop.add(i);
-        }
-        if (duplicateCircle) continue;
-        addBlobs.push(blob);
-      }
-      if (drop.size > 0 || addBlobs.length > 0) {
-        const keptC: Point[][] = [];
-        const keptClosed: boolean[] = [];
-        const keptS: number[] = [];
-        for (let i = 0; i < finalContours.length; i++) {
-          if (drop.has(i)) continue;
-          keptC.push(finalContours[i]);
-          keptClosed.push(finalClosed[i]);
-          keptS.push(finalStrengths[i]);
-        }
-        for (const blob of addBlobs) {
-          keptC.push(blob);
-          keptClosed.push(true);
-          keptS.push(Math.max(strengthThreshold * 1.25, 24));
-        }
-        finalContours = keptC;
-        finalClosed = keptClosed;
-        finalStrengths = keptS;
-      }
+  if (filledRounds.length > 0) {
+    const keptC: Point[][] = [];
+    const keptClosed: boolean[] = [];
+    const keptS: number[] = [];
+    for (let i = 0; i < finalContours.length; i++) {
+      const pts = finalContours[i];
+      if (filledRounds.some(f => contourMatchesRoundFeature(pts, f))) continue;
+      keptC.push(pts);
+      keptClosed.push(finalClosed[i]);
+      keptS.push(finalStrengths[i]);
     }
+    finalContours = keptC;
+    finalClosed = keptClosed;
+    finalStrengths = keptS;
   }
 
   if (bezierHiFi && finalContours.length > 1) {
@@ -3294,6 +3853,21 @@ const generateFourierExpressions = (
     finalStrengths = deduped.strengths;
   }
 
+  if (filledRounds.length > 0) {
+    const keptC: Point[][] = [];
+    const keptClosed: boolean[] = [];
+    const keptS: number[] = [];
+    for (let i = 0; i < finalContours.length; i++) {
+      if (filledRounds.some(f => contourMatchesRoundFeature(finalContours[i], f))) continue;
+      keptC.push(finalContours[i]);
+      keptClosed.push(finalClosed[i]);
+      keptS.push(finalStrengths[i]);
+    }
+    finalContours = keptC;
+    finalClosed = keptClosed;
+    finalStrengths = keptS;
+  }
+
   const contourOrder = finalContours.map((c, i) => ({
     c,
     closed: finalClosed[i],
@@ -3330,6 +3904,68 @@ const generateFourierExpressions = (
   let bezierSegsUsed = 0;
   const bezierTableOrdinal = { n: 0 };
   const emittedCircles: { h: number; k: number; r: number }[] = [];
+  const lineWidthOutline = fillPolys.length > 0 ? 2 : 2.5;
+
+  filledRounds.forEach((feat, fillIdx) => {
+    const h = (feat.h - offsetX) * desmosScale;
+    const k = -(feat.k - offsetY) * desmosScale;
+    const rx = feat.rx * desmosScale;
+    const ry = feat.ry * desmosScale;
+    const r = feat.r * desmosScale;
+    const minClosedR = Math.max(0.18, desmosScale * 8);
+    if (r < minClosedR || r > 12) return;
+    const dup = emittedCircles.some(e => (
+      Math.hypot(e.h - h, e.k - k) < 0.35 * Math.min(e.r, r)
+      && Math.abs(e.r - r) / Math.max(e.r, r) < 0.28
+    ));
+    if (dup) return;
+    const peri: Point[] = [];
+    for (let i = 0; i < 16; i++) {
+      const ang = (i * Math.PI * 2) / 16;
+      const c = Math.cos(feat.theta);
+      const s = Math.sin(feat.theta);
+      const u = feat.rx * Math.cos(ang);
+      const v = feat.ry * Math.sin(ang);
+      peri.push({ x: feat.h + u * c - v * s, y: feat.k + u * s + v * c });
+    }
+    const plotColor = colorSampleData
+      ? sampleContourColorFromData(colorSampleData, width, height, peri)
+      : SMART_DRAW_OUTLINE_COLOR;
+    const hs = fmtDesmosNumBezier(h);
+    const ks = fmtDesmosNumBezier(k);
+    const asEllipse = feat.kind === 'ellipse'
+      && (Math.max(rx, ry) / Math.max(Math.min(rx, ry), 1e-6) >= 1.12);
+    if (!asEllipse) {
+      contourExpressions.push({
+        id: `${idPrefix}bez_circle_fill_${fillIdx}`,
+        latex: restrictPlot(
+          `\\left(x-${hs}\\right)^{2}+\\left(y-${ks}\\right)^{2}=${fmtDesmosNumBezier(r * r)}`,
+        ),
+        color: plotColor,
+        lineWidth: lineWidthOutline,
+        lineOpacity: 1,
+        hidden: false,
+      });
+    } else {
+      const rx2 = fmtDesmosNumBezier(rx * rx);
+      const ry2 = fmtDesmosNumBezier(ry * ry);
+      const theta = -feat.theta;
+      const ct = Math.cos(theta);
+      const st = Math.sin(theta);
+      const latex = Math.abs(st) < 0.12
+        ? `\\frac{\\left(x-${hs}\\right)^{2}}{${rx2}}+\\frac{\\left(y-${ks}\\right)^{2}}{${ry2}}=1`
+        : `\\frac{\\left(\\left(x-${hs}\\right)\\cdot${fmtDesmosNumBezier(ct)}+\\left(y-${ks}\\right)\\cdot${fmtDesmosNumBezier(st)}\\right)^{2}}{${rx2}}+\\frac{\\left(-\\left(x-${hs}\\right)\\cdot${fmtDesmosNumBezier(st)}+\\left(y-${ks}\\right)\\cdot${fmtDesmosNumBezier(ct)}\\right)^{2}}{${ry2}}=1`;
+      contourExpressions.push({
+        id: `${idPrefix}bez_ellipse_fill_${fillIdx}`,
+        latex: restrictPlot(latex),
+        color: plotColor,
+        lineWidth: lineWidthOutline,
+        lineOpacity: 1,
+        hidden: false,
+      });
+    }
+    emittedCircles.push({ h, k, r });
+  });
 
   finalContours.forEach((rawPoints, idx) => {
     const isClosed = finalClosed[idx] ?? false;
@@ -3414,7 +4050,7 @@ const generateFourierExpressions = (
       const pathLenPx = calculatePathLength(fitImg);
 
       const emitCircleLatex = (circ: DetectedCircle): boolean => {
-        if (circ.r < 0.08 || circ.r > 12) return false;
+        if (circ.r < Math.max(0.18, desmosScale * 8) || circ.r > 12) return false;
         const dup = emittedCircles.some(e => (
           Math.hypot(e.h - circ.h, e.k - circ.k) < 0.35 * Math.min(e.r, circ.r)
           && Math.abs(e.r - circ.r) / Math.max(e.r, circ.r) < 0.28
@@ -3478,9 +4114,11 @@ const generateFourierExpressions = (
         }
       };
 
-      // 近圆（含微开缺口、扁圆眼睛）→ 只出圆方程，不叠折线
-      const circleHit = detectCircleOnContour(fitDesmos);
-      if (circleHit && circleHit.r >= 0.08 && circleHit.r <= 12) {
+      // 近圆：填色检测已负责眼睛/镜头。Sobel 只在填色没找到时补，避免把头发拟成假圆。
+      const minClosedR = Math.max(0.18, desmosScale * 8);
+      const maxClosedR = Math.min(12, desmosScale * Math.min(width, height) * 0.11);
+      const circleHit = filledRounds.length >= 2 ? null : detectCircleOnContour(fitDesmos);
+      if (circleHit && circleHit.r >= minClosedR && circleHit.r <= maxClosedR) {
         emitCircleLatex(circleHit);
         if (circleHit.inlierRatio < 0.68) {
           const runs = outlierRunsFromMask(fitDesmos, circleHit.inliers);
@@ -3708,9 +4346,16 @@ const generateFourierExpressions = (
     ? `（AI 精确轮廓 ${Math.min(options.aiContours!.length, finalContours.length)} 条 + 边缘检测补充）`
     : '';
   const circleCount = contourExpressions.filter(e => String(e.id ?? '').includes('bez_circle_')).length;
+  const ellipseCount = contourExpressions.filter(e => String(e.id ?? '').includes('bez_ellipse_')).length;
+  const lineCount = contourExpressions.filter(e => String(e.id ?? '').includes('bez_line_')).length;
+  const closedFormNote = [
+    `${circleCount} 个圆方程`,
+    ellipseCount > 0 ? `${ellipseCount} 个椭圆方程` : null,
+    `${lineCount} 条直线`,
+  ].filter(Boolean).join('，');
   const fitNote = fitMethod === 'bezier'
-    ? (circleCount > 0 ? `，贝塞尔拟合（${circleCount} 个圆方程）` : '，贝塞尔拟合')
-    : '，傅里叶拟合';
+    ? `，贝塞尔拟合（${closedFormNote}）`
+    : `，傅里叶拟合（${closedFormNote}）`;
 
   return {
     expressions,
