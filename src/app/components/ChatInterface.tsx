@@ -1236,7 +1236,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
          errorKey = 'err_key';
       } else if (error.message && (
          error.message.includes('NetworkError') ||
-         error.message.includes('Failed to fetch')
+         error.message.includes('Failed to fetch') ||
+         /API Error: 404\b/.test(error.message) ||
+         /API Error: 502\b/.test(error.message) ||
+         /API Error: 503\b/.test(error.message) ||
+         /API Error: 504\b/.test(error.message)
       )) {
          errorKey = 'err_network';
       }

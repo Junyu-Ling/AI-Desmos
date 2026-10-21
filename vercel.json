@@ -4,7 +4,16 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "installCommand": "npm install",
+  "trailingSlash": false,
   "rewrites": [
+    {
+      "source": "/api/deepseek/:path*",
+      "destination": "/api/deepseek?path=:path*"
+    },
+    {
+      "source": "/api/gemini/:path*",
+      "destination": "/api/gemini?path=:path*"
+    },
     {
       "source": "/((?!assets/|api/).*)",
       "destination": "/index.html"
