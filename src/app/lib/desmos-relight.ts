@@ -17,6 +17,13 @@ import {
   LIGHTING_K_SCALE,
 } from './desmos-lighting-table';
 
+/**
+ * 默认观察角（度）。选在光照表里「平坦正面法线周围最平稳」的方向：
+ * 离镜面高光斑与暗斑较远，浮雕轻微倾斜时颜色也不会跳变，同时仍保留一点立体视角。
+ */
+export const DEFAULT_CAMERA_AZIMUTH = 14;
+export const DEFAULT_CAMERA_ELEVATION = 12;
+
 let tableA: Float32Array | null = null;
 let tableK: Float32Array | null = null;
 
@@ -55,6 +62,10 @@ export function sampleLighting(nx: number, ny: number): { A: number; K: number }
   return { A: at(tableA!), K: at(tableK!) };
 }
 
+const smoothstep = (a: number, b: number, x: number): number => {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+};
 const toLinear = (v: number): number => {
   const c = v / 255;
   return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
@@ -65,7 +76,7 @@ const toSrgb = (l: number): number => {
 };
 
 /** 默认相机（与 uprightViewMatrix 同约定）的正交基：D 指向相机，Rt 屏幕右，U 屏幕上 */
-export function cameraBasis(azimuthDeg = 24, elevationDeg = 16) {
+export function cameraBasis(azimuthDeg = DEFAULT_CAMERA_AZIMUTH, elevationDeg = DEFAULT_CAMERA_ELEVATION) {
   const az = (azimuthDeg * Math.PI) / 180;
   const el = (elevationDeg * Math.PI) / 180;
   const D = [Math.sin(az) * Math.cos(el), -Math.cos(az) * Math.cos(el), Math.sin(el)];
@@ -107,7 +118,7 @@ export function relightFaceColors(
   faceColor: ArrayLike<number>,
   options: RelightOptions = {},
 ): Int32Array {
-  const { D, Rt, U } = cameraBasis(options.azimuth ?? 24, options.elevation ?? 16);
+  const { D, Rt, U } = cameraBasis(options.azimuth ?? DEFAULT_CAMERA_AZIMUTH, options.elevation ?? DEFAULT_CAMERA_ELEVATION);
   const keep = options.keepShading ?? 0.3;
   const ref = referenceGain();
   const m = Math.floor(faces.length / 3);
@@ -139,11 +150,26 @@ export function relightFaceColors(
     const m2 = 1 + keep * (gain - 1);
 
     const r = lin[(q >> 16) & 255], g = lin[(q >> 8) & 255], bl = lin[q & 255];
-    const cr = (r * m2 - A) / kk;
-    const cg = (g * m2 - A) / kk;
-    const cb = (bl * m2 - A) / kk;
+    // 掠射面（几乎侧对相机）光照表采样不可靠、也不该强行校正：向原色过渡
+    const w = smoothstep(0.2, 0.55, Math.abs(sz));
+    const raw = [(r * m2 - A) / kk, (g * m2 - A) / kk, (bl * m2 - A) / kk];
+    const inRange = raw.every(v => v >= 0 && v <= 1);
+    let rr: number, gg: number, bb: number;
+    if (inRange) {
+      [rr, gg, bb] = raw;
+    } else {
+      // 某通道需要负值/超过 1（光照底噪压不住）：按亮度整体缩放，避免偏色
+      const Y = 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+      const Yc = Math.min(1, Math.max(0, (Y * m2 - A) / kk));
+      const gain = Y > 1e-5 ? Yc / Y : 0;
+      rr = Math.min(1, r * gain);
+      gg = Math.min(1, g * gain);
+      bb = Math.min(1, bl * gain);
+    }
     out[f] =
-      (Math.round(toSrgb(cr)) << 16) | (Math.round(toSrgb(cg)) << 8) | Math.round(toSrgb(cb));
+      (Math.round(toSrgb(rr * w + r * (1 - w))) << 16) |
+      (Math.round(toSrgb(gg * w + g * (1 - w))) << 8) |
+      Math.round(toSrgb(bb * w + bl * (1 - w)));
   }
   return out;
 }

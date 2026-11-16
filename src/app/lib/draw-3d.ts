@@ -52,9 +52,6 @@ type Cell = {
 const luminance = (r: number, g: number, b: number): number =>
   (0.299 * r + 0.587 * g + 0.114 * b) / 255;
 
-const isNearWhite = (r: number, g: number, b: number): boolean =>
-  Math.min(r, g, b) >= 243 && Math.max(r, g, b) - Math.min(r, g, b) <= 14;
-
 const quant5 = (r: number, g: number, b: number): number =>
   ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
 
@@ -63,6 +60,42 @@ const median = (arr: number[]): number => {
   return s[Math.floor(s.length / 2)];
 };
 
+/**
+ * 估计背景色：取图像最外圈像素里「最多的那一类颜色」。
+ * 仅当它占外圈 ≥ 55% 才认定为背景（照片/商品图的白底、纯色底都适用）；否则返回 null（只靠透明通道）。
+ * 以前用「近白(≥243)」判背景，浅灰高光面一旦碰到白底边缘就会让泛洪「漏进」物体内部造成缺块。
+ */
+function estimateBackground(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+): [number, number, number] | null {
+  const ring = Math.max(2, Math.round(Math.min(width, height) * 0.006));
+  const buckets = new Map<number, { n: number; r: number; g: number; b: number }>();
+  let total = 0;
+  let opaque = 0;
+  const add = (x: number, y: number) => {
+    const i = (y * width + x) * 4;
+    total++;
+    if (data[i + 3] < 28) return;
+    opaque++;
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+    const e = buckets.get(key);
+    if (e) { e.n++; e.r += r; e.g += g; e.b += b; }
+    else buckets.set(key, { n: 1, r, g, b });
+  };
+  for (let y = 0; y < height; y += 2) {
+    for (let x = 0; x < width; x += 2) {
+      if (x < ring || y < ring || x >= width - ring || y >= height - ring) add(x, y);
+    }
+  }
+  if (opaque < total * 0.35 || opaque === 0) return null;
+  let best: { n: number; r: number; g: number; b: number } | null = null;
+  for (const e of buckets.values()) if (!best || e.n > best.n) best = e;
+  if (!best || best.n < opaque * 0.55) return null;
+  return [best.r / best.n, best.g / best.n, best.b / best.n];
+}
 /** 采样成单元格，识别背景（透明 / 与边界相连的近白） */
 function buildCells(
   data: Uint8ClampedArray,
@@ -78,6 +111,13 @@ function buildCells(
 
   const cells: Cell[] = new Array(gw * gh);
   const candidateBg = new Uint8Array(gw * gh);
+  const bgColor = estimateBackground(data, width, height);
+  // 背景色容差：足够吸收 JPEG 噪声，又不会把贴近白色的浅灰高光面当成背景
+  const BG_TOL = 6;
+  const isBgLike = (r: number, g: number, b: number): boolean =>
+    bgColor
+      ? Math.abs(r - bgColor[0]) <= BG_TOL && Math.abs(g - bgColor[1]) <= BG_TOL && Math.abs(b - bgColor[2]) <= BG_TOL
+      : Math.min(r, g, b) >= 250 && Math.max(r, g, b) - Math.min(r, g, b) <= 8;
 
   for (let gy = 0; gy < gh; gy++) {
     for (let gx = 0; gx < gw; gx++) {
@@ -103,7 +143,7 @@ function buildCells(
             continue;
           }
           const r = data[i], g = data[i + 1], b = data[i + 2];
-          if (isNearWhite(r, g, b)) white++;
+          if (isBgLike(r, g, b)) white++;
           rs.push(r);
           gs.push(g);
           bs.push(b);
@@ -118,18 +158,26 @@ function buildCells(
       }
       const r = median(rs), g = median(gs), b = median(bs);
       cells[idx] = { r, g, b, empty: false };
-      if (transparent / Math.max(1, total) > 0.72 || white / Math.max(1, total) > 0.72) {
+      if (transparent / Math.max(1, total) > 0.72 || white / Math.max(1, total) > 0.8) {
         candidateBg[idx] = 1;
       }
     }
   }
 
-  // 从边界泛洪：只有与图像边界相连的背景候选格才是真正的背景
+  // 从边界泛洪：只有与图像边界相连的背景候选格才是真正的背景。
+  // 相邻格之间颜色一旦出现台阶（≥5）就不再扩散——浅灰高光面贴着白底时，泛洪不会「漏」进物体内部。
   const bg = new Uint8Array(gw * gh);
   const stack: number[] = [];
-  const seed = (x: number, y: number) => {
+  const STEP_TOL = 5;
+  const similar = (a: number, b: number): boolean => {
+    const ca = cells[a], cb = cells[b];
+    if (ca.empty && cb.empty) return true;
+    if (ca.empty || cb.empty) return true; // 与透明 / 空格相邻：不设限
+    return Math.abs(ca.r - cb.r) <= STEP_TOL && Math.abs(ca.g - cb.g) <= STEP_TOL && Math.abs(ca.b - cb.b) <= STEP_TOL;
+  };
+  const seed = (x: number, y: number, from = -1) => {
     const i = y * gw + x;
-    if (candidateBg[i] && !bg[i]) {
+    if (candidateBg[i] && !bg[i] && (from < 0 || similar(from, i))) {
       bg[i] = 1;
       stack.push(i);
     }
@@ -145,10 +193,10 @@ function buildCells(
   while (stack.length) {
     const i = stack.pop()!;
     const x = i % gw, y = (i / gw) | 0;
-    if (x > 0) seed(x - 1, y);
-    if (x < gw - 1) seed(x + 1, y);
-    if (y > 0) seed(x, y - 1);
-    if (y < gh - 1) seed(x, y + 1);
+    if (x > 0) seed(x - 1, y, i);
+    if (x < gw - 1) seed(x + 1, y, i);
+    if (y > 0) seed(x, y - 1, i);
+    if (y < gh - 1) seed(x, y + 1, i);
   }
   for (let i = 0; i < cells.length; i++) {
     if (bg[i]) cells[i].empty = true;
@@ -258,14 +306,16 @@ function buildReliefAt(
 
   // 高度场：距离变换 → 圆润截面 → 明度浮雕 → 3×3 平滑
   const dist = distanceToEmpty(cells, gw, gh);
-  const R = Math.max(2.5, 0.11 * Math.max(gw, gh));
+  // 截面用 tanh：边缘处有限坡度（约 25°，避开光照表里的高光斑）而不是垂直墙，这样轮廓侧壁不会面向相机侧的高光/暗斑，
+  // 中部渐渐趋于平坦，图片内容几乎正对相机，颜色更稳。
+  const cellUnits = (2 * halfX) / gw;
+  const EDGE_SLOPE = 0.45;
   const h = new Float32Array(gw * gh);
   for (let i = 0; i < h.length; i++) {
     const c = cells[i];
     if (c.empty) continue;
-    const t = Math.min(1, dist[i] / R);
-    const round = Math.sqrt(Math.max(0, 1 - (1 - t) * (1 - t)));
-    const bump = 0.14 * (1 - luminance(c.r, c.g, c.b));
+    const round = Math.tanh((EDGE_SLOPE * Math.max(0.2, dist[i] - 0.5) * cellUnits) / baseDepth);
+    const bump = 0.03 * (1 - luminance(c.r, c.g, c.b));
     h[i] = baseDepth * (round * (0.86 + bump)) + 0.02;
   }
   const hs = new Float32Array(h.length);

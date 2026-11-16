@@ -15,7 +15,12 @@
  *     逐面颜色列表才是高精度上色的正解。
  */
 
-import { relightFaceColors, type RelightOptions } from './desmos-relight';
+import {
+  DEFAULT_CAMERA_AZIMUTH,
+  DEFAULT_CAMERA_ELEVATION,
+  relightFaceColors,
+  type RelightOptions,
+} from './desmos-relight';
 
 export type Vec3 = { x: number; y: number; z: number };
 
@@ -173,7 +178,7 @@ export function buildListChunks(
  * 实测约定：数组 a 满足 相机方向 D = −(a0,a3,a6)，屏幕右 = −(a1,a4,a7)，屏幕上 = (a2,a5,a8)。
  * 相机从 −y 侧看向 +y（物体正面朝 −y），再向 +x 偏 azimuth°、抬高 elevation°，保留一点立体感。
  */
-export function uprightViewMatrix(azimuthDeg = 24, elevationDeg = 16): number[] {
+export function uprightViewMatrix(azimuthDeg = DEFAULT_CAMERA_AZIMUTH, elevationDeg = DEFAULT_CAMERA_ELEVATION): number[] {
   const az = (azimuthDeg * Math.PI) / 180;
   const el = (elevationDeg * Math.PI) / 180;
   const D = [Math.sin(az) * Math.cos(el), -Math.cos(az) * Math.cos(el), Math.sin(el)];
@@ -299,6 +304,115 @@ function legacySetExpression(calculator: any, chunk: Desmos3DExpression[]) {
   else plain.forEach(e => calculator.setExpression(e));
 }
 
+/** 探测当前 Desmos 是否真的保留 colorLatex（旧版 API 会静默丢弃，导致整块只有一种颜色） */
+function probeColorLatexSupport(calculator: any): boolean {
+  try {
+    const st = calculator.getState();
+    const saved = JSON.parse(JSON.stringify(st));
+    st.expressions = {
+      ...(st.expressions || {}),
+      list: [
+        { type: 'expression', id: '__cp1', latex: 'P_{r}=\\left[1\\right]', hidden: true },
+        { type: 'expression', id: '__cp2', latex: 'P_{k}=\\operatorname{rgb}\\left(P_{r},0,0\\right)', hidden: true },
+        {
+          type: 'expression',
+          id: '__cp3',
+          latex: '\\operatorname{triangle}\\left(\\left(0,0,0\\right),\\left(1,0,0\\right),\\left(0,1,0\\right)\\right)',
+          colorLatex: 'P_{k}',
+          hidden: true,
+        },
+      ],
+    };
+    calculator.setState(st);
+    const back = (calculator.getState().expressions?.list || []).find((e: any) => e.id === '__cp3');
+    calculator.setState(saved);
+    return !!(back && back.colorLatex);
+  } catch {
+    return true;
+  }
+}
+
+const parseIntList = (latex: string | undefined): number[] => {
+  if (!latex) return [];
+  const m = /\\left\[([^\]]*)\\right\]/.exec(latex);
+  if (!m) return [];
+  return m[1].split(',').map(v => Number(v.trim())).filter(v => Number.isFinite(v));
+};
+
+/**
+ * 降级：不支持 colorLatex 时，把「逐面颜色」网格改成「调色板分组」——
+ * 每块网格量化成 ≤48 种颜色，每种颜色一条普通 color 的 triangle 表达式（共用同一个顶点列表）。
+ */
+export function downgradeColorLatex(expressions: Desmos3DExpression[]): Desmos3DExpression[] {
+  const byId = new Map(expressions.map(e => [e.id, e] as const));
+  const drop = new Set<string>();
+  const extra = new Map<string, Desmos3DExpression[]>();
+
+  for (const e of expressions) {
+    if (!e.colorLatex || !e.id.endsWith('_T')) continue;
+    const prefix = e.id.slice(0, -2);
+    const vExpr = byId.get(`${prefix}_V`);
+    const tag = vExpr?.latex ? /^V_\{(\w+)\}=/.exec(vExpr.latex)?.[1] : undefined;
+    const A = parseIntList(byId.get(`${prefix}_A`)?.latex);
+    const B = parseIntList(byId.get(`${prefix}_B`)?.latex);
+    const C = parseIntList(byId.get(`${prefix}_C`)?.latex);
+    const Q = parseIntList(byId.get(`${prefix}_Q`)?.latex);
+    if (!tag || !A.length || A.length !== Q.length) continue;
+
+    // 调色板：4 位/通道直方图取前 48 桶，其余并入最近的一桶
+    const hist = new Map<number, { n: number; r: number; g: number; b: number }>();
+    const key = (q: number) => (((q >> 20) & 15) << 8) | (((q >> 12) & 15) << 4) | ((q >> 4) & 15);
+    for (const q of Q) {
+      const k = key(q);
+      const h = hist.get(k);
+      const r = (q >> 16) & 255, g = (q >> 8) & 255, b = q & 255;
+      if (h) { h.n++; h.r += r; h.g += g; h.b += b; }
+      else hist.set(k, { n: 1, r, g, b });
+    }
+    const palette = [...hist.values()]
+      .sort((p, q) => q.n - p.n)
+      .slice(0, 48)
+      .map(h => [h.r / h.n, h.g / h.n, h.b / h.n]);
+    const groups: number[][] = palette.map(() => []);
+    for (let i = 0; i < Q.length; i++) {
+      const r = (Q[i] >> 16) & 255, g = (Q[i] >> 8) & 255, b = Q[i] & 255;
+      let best = 0, bd = Infinity;
+      for (let j = 0; j < palette.length; j++) {
+        const d = (palette[j][0] - r) ** 2 + (palette[j][1] - g) ** 2 + (palette[j][2] - b) ** 2;
+        if (d < bd) { bd = d; best = j; }
+      }
+      groups[best].push(i);
+    }
+
+    const out: Desmos3DExpression[] = [];
+    groups.forEach((idxs, j) => {
+      if (!idxs.length) return;
+      const t = `${tag}x${j}`;
+      out.push({ id: `${prefix}_gA${j}`, latex: `A_{${t}}=${lst(idxs.map(i => A[i]))}`, hidden: true });
+      out.push({ id: `${prefix}_gB${j}`, latex: `B_{${t}}=${lst(idxs.map(i => B[i]))}`, hidden: true });
+      out.push({ id: `${prefix}_gC${j}`, latex: `D_{${t}}=${lst(idxs.map(i => C[i]))}`, hidden: true });
+      out.push({
+        id: `${prefix}_gT${j}`,
+        latex:
+          `\\operatorname{triangle}\\left(V_{${tag}}\\left[A_{${t}}\\right],V_{${tag}}\\left[B_{${t}}\\right],V_{${tag}}\\left[D_{${t}}\\right]\\right)`,
+        color: packedToHex(packRgb(palette[j][0], palette[j][1], palette[j][2])),
+        fillOpacity: 1,
+      });
+    });
+    for (const suf of ['A', 'B', 'C', 'Q', 'K', 'T']) drop.add(`${prefix}_${suf}`);
+    extra.set(`${prefix}_V`, out);
+  }
+
+  if (!extra.size) return expressions;
+  const result: Desmos3DExpression[] = [];
+  for (const e of expressions) {
+    if (drop.has(e.id)) continue;
+    result.push(e);
+    const add = extra.get(e.id);
+    if (add) result.push(...add);
+  }
+  return result;
+}
 /**
  * 渐进写入 3D 表达式。
  * 走 getState / setState，因为 colorLatex、parametricDomain3D* 只有状态注入才会生效。
@@ -322,6 +436,7 @@ export async function applyDesmos3DExpressions(
   },
 ): Promise<void> {
   if (!calculator || !expressions.length) return;
+  let exprs = expressions;
   const batchSize = Math.max(1, options?.batchSize ?? 7);
   const signal = options?.signal;
   const canState = typeof calculator.getState === 'function' && typeof calculator.setState === 'function';
@@ -356,13 +471,18 @@ export async function applyDesmos3DExpressions(
     }
   }
 
-  for (let i = 0; i < expressions.length; i += batchSize) {
+  if (canState && exprs.some(e => e.colorLatex) && !probeColorLatexSupport(calculator)) {
+    console.warn('[desmos-3d] 当前 Desmos API 不支持 colorLatex，已降级为调色板分组着色（建议刷新页面以加载 v1.13）');
+    exprs = downgradeColorLatex(exprs);
+  }
+
+  for (let i = 0; i < exprs.length; i += batchSize) {
     if (signal?.aborted) {
       const err = new Error('Aborted');
       err.name = 'AbortError';
       throw err;
     }
-    const chunk = expressions.slice(i, i + batchSize);
+    const chunk = exprs.slice(i, i + batchSize);
     if (canState) {
       const st = calculator.getState();
       const list: any[] = (st.expressions && st.expressions.list) || [];
@@ -377,7 +497,7 @@ export async function applyDesmos3DExpressions(
     } else {
       legacySetExpression(calculator, chunk);
     }
-    options?.onProgress?.(Math.min(i + chunk.length, expressions.length), expressions.length);
+    options?.onProgress?.(Math.min(i + chunk.length, exprs.length), exprs.length);
     await new Promise<void>(r => setTimeout(r, 16));
   }
 }

@@ -43,6 +43,12 @@ const API_KEY = 'dcb31709b452b1cf9dc26972add0fda6';
  */
 const SCRIPT_URL = `https://www.desmos.com/api/v1.13/calculator.js?apiKey=${API_KEY}`;
 
+/**
+ * 热更新 / 旧会话里 window.Desmos 可能还是以前加载的 v1.11：它会忽略 colorLatex，
+ * 3D 网格会退化成「每块一个颜色」。用标记确认当前全局确实来自 v1.13 脚本，否则重新加载。
+ */
+const isApiCurrent = (): boolean => (window as any).__desmosApiUrl === SCRIPT_URL;
+
 export const DesmosCalculator: React.FC<DesmosCalculatorProps> = ({
   className = 'w-full h-full',
   mode = '2d',
@@ -156,6 +162,7 @@ export const DesmosCalculator: React.FC<DesmosCalculatorProps> = ({
 
       const ready =
         window.Desmos &&
+        isApiCurrent() &&
         (mode === '3d'
           ? typeof window.Desmos.Calculator3D === 'function'
           : typeof window.Desmos.GraphingCalculator === 'function');
@@ -169,10 +176,18 @@ export const DesmosCalculator: React.FC<DesmosCalculatorProps> = ({
         `script[src="${SCRIPT_URL}"]`,
       ) as HTMLScriptElement | null;
 
+      if (script && window.Desmos) {
+        // 本版本的脚本标签已存在且已执行完 → 全局 Desmos 即 v1.13
+        (window as any).__desmosApiUrl = SCRIPT_URL;
+      }
+
       if (!script) {
         script = document.createElement('script');
         script.src = SCRIPT_URL;
         script.async = true;
+        script.onload = () => {
+          (window as any).__desmosApiUrl = SCRIPT_URL;
+        };
         script.onerror = (e: any) => {
           console.error('Desmos script load error:', e);
           if (isMounted.current && !destroyed) {
@@ -189,6 +204,7 @@ export const DesmosCalculator: React.FC<DesmosCalculatorProps> = ({
       checkInterval = setInterval(() => {
         const ok =
           window.Desmos &&
+          isApiCurrent() &&
           (mode === '3d'
             ? typeof window.Desmos.Calculator3D === 'function'
             : typeof window.Desmos.GraphingCalculator === 'function');
