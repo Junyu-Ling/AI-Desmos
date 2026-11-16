@@ -60,6 +60,7 @@ import {
   persistApiConfig,
   detectProviderFromKey,
   getProviderById,
+  getDesmos3DModeAddon,
 } from '../lib/deepseek';
 
 // 图像处理：图片/Emoji → 傅里叶变换 → Desmos 表达式
@@ -69,7 +70,12 @@ import {
   applyModel3DExpressionsProgressively,
   isObjFile,
   unsupportedModelMessage,
+  pairObjAndMtl,
 } from '../lib/model-3d';
+import {
+  processImageToDesmos3D,
+  processEmojiToDesmos3D,
+} from '../lib/draw-3d';
 import type { CalculatorDimension } from './DesmosCalculator';
 import { detachGifPlayback } from '../lib/gif-animation';
 import { extractGifFirstFrameAsPngFile } from '../lib/gif-decode';
@@ -237,6 +243,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
    * 这是 React 中处理"异步中使用最新 prop"的标准技巧。
    */
   const calculatorRef = useRef(calculator);
+  /** 中央 3D/2D 模式引用：异步绘图路由以此为准 */
+  const calculatorModeRef = useRef<CalculatorDimension>(calculatorMode);
   const workspaceRestoredRef = useRef(false);
   const workspaceSaverRef = useRef(createDebouncedWorkspaceSaver());
 
@@ -245,6 +253,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
     if (!calc) return;
     workspaceSaverRef.current.flush(calc);
   };
+
+  const is3DMode = () => calculatorModeRef.current === '3d';
 
   /**
    * isComposingRef — 追踪中文输入法的组合状态
@@ -268,6 +278,10 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
   useEffect(() => {
     calculatorRef.current = calculator;
   }, [calculator]);
+
+  useEffect(() => {
+    calculatorModeRef.current = calculatorMode;
+  }, [calculatorMode]);
 
   /** 画板 + GIF 播放状态持久化：刷新恢复，变更自动保存，仅「清空画板」时清除 */
   useEffect(() => {
@@ -1075,6 +1089,59 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
       drawingProgressPhase: 'processing',
     }]);
 
+    // 3D 模式：Emoji → 着色挤出立体（非平面公式）
+    if (is3DMode()) {
+      setMessages(prev => prev.map(m =>
+        m.id === aiMsgId
+          ? { ...m, content: t('draw_3d_processing'), translationKey: 'draw_3d_processing' }
+          : m,
+      ));
+      const result3d = await processEmojiToDesmos3D(emoji, { mode });
+      if (signal?.aborted) return;
+      const calc = calculatorRef.current;
+      if (calc && result3d.expressions.length > 0) {
+        await applyModel3DExpressionsProgressively(calc, result3d.expressions, {
+          clearFirst: true,
+          signal,
+          onProgress: (current, total) => {
+            setMessages(prev => prev.map(m =>
+              m.id === aiMsgId
+                ? {
+                    ...m,
+                    content: t('draw_3d_inject_progress', {
+                      current: String(current),
+                      total: String(total),
+                    }),
+                    translationKey: 'draw_3d_inject_progress',
+                    translationParams: { current: String(current), total: String(total) },
+                    drawingProgressPhase: 'outline',
+                    drawingProgressCurrent: current,
+                    drawingProgressTotal: total,
+                  }
+                : m,
+            ));
+          },
+        });
+      }
+      const params = {
+        emoji,
+        regions: String(result3d.regionCount),
+        triangles: String(result3d.triangleCount),
+      };
+      setMessages(prev => prev.map(m =>
+        m.id === aiMsgId ? {
+          ...m,
+          content: t('draw_3d_emoji_complete', params),
+          translationKey: 'draw_3d_emoji_complete',
+          translationParams: params,
+          drawingProgressPhase: undefined,
+          drawingProgressCurrent: undefined,
+          drawingProgressTotal: undefined,
+        } : m,
+      ));
+      return;
+    }
+
     const result = await processEmojiToFourier(emoji, {
       mode,
       fitMethod: fitMethodRef.current,
@@ -1202,6 +1269,12 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
                 role: 'system',
                 content: "SYSTEM ALERT: You are in 'Desmos Mode'. You MUST output math in <DESMOS>...</DESMOS> tags. Example: <DESMOS>x^2+y^2=1</DESMOS>. Unformatted math will NOT be visible to the user. Do NOT chat about math without drawing it. Structure your response with clear paragraphs separated by blank lines for readability. Use line breaks between different points or explanations."
             });
+            if (is3DMode()) {
+              history.push({
+                role: 'system',
+                content: getDesmos3DModeAddon(language),
+              });
+            }
         }
 
         history.push({ role: 'user', content: textToSend });
@@ -1263,7 +1336,12 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
         requestLang,
         customApiKey,
         claudeLongHand,
-        { provider: apiProvider, model: apiModel, key: customApiKey },
+        {
+          provider: apiProvider,
+          model: apiModel,
+          key: customApiKey,
+          calculatorDimension: is3DMode() ? '3d' : '2d',
+        },
       ); 
       
     } catch (error: any) {
@@ -1385,10 +1463,58 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
         setMessages(prev => [...prev, {
             id: progressMsgId,
             role: 'assistant',
-            content: t('drawing_processing'),
-            translationKey: 'drawing_processing',
+            content: t(is3DMode() ? 'draw_3d_processing' : 'drawing_processing'),
+            translationKey: is3DMode() ? 'draw_3d_processing' : 'drawing_processing',
             drawingProgressPhase: 'processing',
         }]);
+
+        // 3D 模式：图片 / GIF 首帧 → 色块挤出立体（保留采样颜色）
+        if (is3DMode()) {
+          const result3d = await processImageToDesmos3D(file, { mode });
+          if (task.signal.aborted) return;
+          const calc = calculatorRef.current;
+          if (calc && result3d.expressions.length > 0) {
+            await applyModel3DExpressionsProgressively(calc, result3d.expressions, {
+              clearFirst: true,
+              signal: task.signal,
+              onProgress: (current, total) => {
+                setMessages(prev => prev.map(m =>
+                  m.id === progressMsgId
+                    ? {
+                        ...m,
+                        content: t('draw_3d_inject_progress', {
+                          current: String(current),
+                          total: String(total),
+                        }),
+                        translationKey: 'draw_3d_inject_progress',
+                        translationParams: { current: String(current), total: String(total) },
+                        drawingProgressPhase: 'fill',
+                        drawingProgressCurrent: current,
+                        drawingProgressTotal: total,
+                      }
+                    : m,
+                ));
+              },
+            });
+          }
+          const params3d = {
+            regions: String(result3d.regionCount),
+            triangles: String(result3d.triangleCount),
+            colors: String(result3d.colorCount),
+          };
+          setMessages(prev => prev.map(m =>
+            m.id === progressMsgId ? {
+              ...m,
+              content: t('draw_3d_complete', params3d),
+              translationKey: 'draw_3d_complete',
+              translationParams: params3d,
+              drawingProgressPhase: undefined,
+              drawingProgressCurrent: undefined,
+              drawingProgressTotal: undefined,
+            } : m,
+          ));
+          return;
+        }
 
         const result = await processImageToFourier(file, {
             mode,
@@ -1458,7 +1584,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
             id: Date.now().toString(), 
             role: 'system', 
             content: 'Image processing failed',
-            translationKey: 'image_process_fail'
+            translationKey: is3DMode() ? 'draw_3d_fail' : 'image_process_fail'
         }]);
     } finally {
         endTask();
@@ -1513,9 +1639,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
   };
 
   /**
-   * processModel3DFile — OBJ → Desmos 3D triangle / 线框，写入 3D 计算器
+   * processModel3DFile — OBJ(+MTL) → 高保真 Desmos 3D，写入 3D 计算器
    */
-  const processModel3DFile = async (file: File) => {
+  const processModel3DFile = async (file: File, mtlFile?: File | null) => {
     const unsupportedKey = unsupportedModelMessage(file);
     if (unsupportedKey && !isObjFile(file)) {
       setMessages(prev => [...prev, {
@@ -1527,10 +1653,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
       return;
     }
 
+    const label = mtlFile ? `${file.name} + ${mtlFile.name}` : file.name;
     const userMsg: Message = {
       id: Date.now().toString(),
       role: 'user',
-      content: `[${t('mode_3d_model')}: ${file.name}]`,
+      content: `[${t('mode_3d_model')}: ${label}]`,
     };
     setMessages(prev => [...prev, userMsg]);
     setIsLoading(true);
@@ -1547,7 +1674,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
       }]);
 
       // 非 3D 模式时先切到 3D（会重建计算器）
-      if (calculatorMode !== '3d') {
+      if (calculatorModeRef.current !== '3d') {
         onRequestCalculatorMode?.('3d');
         setMessages(prev => prev.map(m =>
           m.id === progressMsgId
@@ -1564,7 +1691,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
           : m,
       ));
 
-      const result = await processObjFileToDesmos3D(file);
+      const result = await processObjFileToDesmos3D(file, { mtlFile: mtlFile ?? null });
 
       if (task.signal.aborted) return;
 
@@ -1603,7 +1730,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
         },
       });
 
-      const completeKey = result.warning || 'model_3d_complete';
+      const completeKey = result.warning || result.explanation || 'model_3d_complete_hi';
       const params = {
         vertices: String(result.vertexCount),
         faces: String(result.faceCount),
@@ -1627,7 +1754,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
     } catch (error) {
       if (isAbortError(error)) return;
       const msg = error instanceof Error ? error.message : String(error);
-      let key = 'model_3d_fail';
+      let key: keyof typeof translations['zh'] = 'model_3d_fail';
       if (msg === 'OBJ_NO_VERTICES' || msg === 'OBJ_NO_FACES' || msg === 'OBJ_EMPTY') {
         key = 'model_3d_invalid_obj';
       } else if (msg === '3D_CALC_TIMEOUT') {
@@ -2201,12 +2328,23 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
                     type="file"
                     ref={model3dFileRef}
                     className="hidden"
-                    accept=".obj,model/obj,text/plain"
+                    accept=".obj,.mtl,model/obj,text/plain"
+                    multiple
                     onChange={async (e) => {
-                      const file = e.target.files?.[0];
+                      const files = e.target.files ? Array.from(e.target.files) : [];
                       e.target.value = '';
-                      if (!file) return;
-                      await processModel3DFile(file);
+                      if (!files.length) return;
+                      const paired = pairObjAndMtl(files);
+                      if (!paired) {
+                        setMessages(prev => [...prev, {
+                          id: Date.now().toString(),
+                          role: 'system',
+                          content: t('unsupported_3d_format'),
+                          translationKey: 'unsupported_3d_format',
+                        }]);
+                        return;
+                      }
+                      await processModel3DFile(paired.obj, paired.mtl);
                     }}
                 />
 

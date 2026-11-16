@@ -1,20 +1,25 @@
 /**
- * model-3d.ts — OBJ 网格解析 → Desmos 3D triangle 表达式
+ * model-3d.ts — OBJ(+MTL) 高保真网格 → Desmos Calculator3D 表达式
  *
- * 【v1 策略】
- * - 仅正式支持 OBJ（纯文本、浏览器可直接解析）
- * - GLB/GLTF 等格式给出明确提示，不静默失败
- * - 面片三角化后归一化到约 [-10,10]^3
- * - 用 Desmos 3D 的 triangle((x,y,z),...) 绘制；面片过多时均匀抽样
- * - 超大网格可回退为边线参数曲线，避免表达式爆炸卡死
+ * Desmos 3D 可用原语（官方）：
+ *   triangle((x,y,z),...) · sphere(center,r) · segment · vector
+ *   单参数曲线 (x(t),y(t),z(t)) · 双参数曲面 (x(u,v),y(u,v),z(u,v))
+ *   setExpression({ color, fillOpacity, ... })
+ *
+ * 策略（无法对任意网格只输出闭式曲面时）：
+ *   1) 检测到球/柱/盒 → 解析原语或少量参数曲面
+ *   2) 其余 → 自适应保特征减面 + 带颜色的高密度 triangle 批次渐进注入
  */
 
 export type Vec3 = { x: number; y: number; z: number };
 
 export type Mesh3D = {
   vertices: Vec3[];
-  /** 三角面：每项为顶点下标（0-based）三元组 */
+  /** 每顶点可选 RGB（0–1 或 0–255，解析时统一到 0–1） */
+  vertexColors?: Array<{ r: number; g: number; b: number } | null>;
   triangles: [number, number, number][];
+  /** 每三角面颜色（#rrggbb）；缺省时由顶点色/材质回退 */
+  faceColors?: (string | null)[];
 };
 
 export type Desmos3DExpression = {
@@ -24,9 +29,12 @@ export type Desmos3DExpression = {
   fillOpacity?: number;
   lineOpacity?: number;
   secret?: boolean;
-  /** Desmos note 行 */
   type?: 'text' | 'expression';
   text?: string;
+  /** 参数域（Desmos 3D parametric） */
+  parametricDomain?: { min: number; max: number };
+  /** u,v 域，部分 API 用数组；写入时尽量兼容 */
+  domain?: { u?: [number, number]; v?: [number, number] };
 };
 
 export type Model3DConvertResult = {
@@ -36,26 +44,22 @@ export type Model3DConvertResult = {
   triangleCount: number;
   renderedTriangles: number;
   renderedEdges: number;
-  mode: 'triangles' | 'wireframe' | 'mixed';
+  analyticCount: number;
+  mode: 'triangles' | 'wireframe' | 'mixed' | 'analytic' | 'hybrid';
   explanation: string;
   warning?: string;
+  colorSource: 'vertex' | 'mtl' | 'none' | 'mixed';
 };
 
-/** 面片上限：过多时 Desmos 会明显卡顿 */
-export const MAX_TRIANGLES = 500;
-/** 线框边上限（回退模式） */
-export const MAX_EDGES = 800;
-/** 归一化目标半边长（约落在 [-10,10]） */
+/** 高保真面片预算（分批注入，避免一次卡死） */
+export const MAX_TRIANGLES = 2800;
+/** 线框边上限（极端大网格回退） */
+export const MAX_EDGES = 1600;
 export const TARGET_HALF_EXTENT = 9;
+/** 超过此面数且无法有效减面时再考虑线框 */
+export const WIREFRAME_FACE_THRESHOLD = MAX_TRIANGLES * 8;
 
-const MESH_COLORS = [
-  '#2d70b3',
-  '#388c46',
-  '#c74440',
-  '#6042a6',
-  '#fa7e19',
-  '#000000',
-];
+const DEFAULT_MESH_COLOR = '#2d70b3';
 
 const fmt = (n: number): string => {
   if (!Number.isFinite(n)) return '0';
@@ -67,14 +71,43 @@ const fmt = (n: number): string => {
 const fmtPt = (p: Vec3): string =>
   `\\left(${fmt(p.x)},${fmt(p.y)},${fmt(p.z)}\\right)`;
 
+const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
+
+const rgbToHex = (r: number, g: number, b: number): string => {
+  const to = (v: number) => {
+    const n = Math.round(clamp01(v) * 255);
+    return n.toString(16).padStart(2, '0');
+  };
+  return `#${to(r)}${to(g)}${to(b)}`;
+};
+
+const parseRgbTriplet = (parts: string[], start: number): { r: number; g: number; b: number } | null => {
+  if (parts.length < start + 3) return null;
+  let r = Number(parts[start]);
+  let g = Number(parts[start + 1]);
+  let b = Number(parts[start + 2]);
+  if (![r, g, b].every(Number.isFinite)) return null;
+  // OBJ 顶点色常见 0–1；若任一 >1 则按 0–255
+  if (r > 1 || g > 1 || b > 1) {
+    r /= 255;
+    g /= 255;
+    b /= 255;
+  }
+  return { r: clamp01(r), g: clamp01(g), b: clamp01(b) };
+};
+
 export function isObjFile(file: File): boolean {
   const name = file.name.toLowerCase();
   return name.endsWith('.obj') || file.type === 'model/obj' || file.type === 'text/plain';
 }
 
+export function isMtlFile(file: File): boolean {
+  return file.name.toLowerCase().endsWith('.mtl');
+}
+
 export function unsupportedModelMessage(file: File): string | null {
   const name = file.name.toLowerCase();
-  if (name.endsWith('.obj')) return null;
+  if (name.endsWith('.obj') || name.endsWith('.mtl')) return null;
   if (
     name.endsWith('.glb') ||
     name.endsWith('.gltf') ||
@@ -87,18 +120,70 @@ export function unsupportedModelMessage(file: File): string | null {
   return 'unsupported_3d_format';
 }
 
+export type MtlLibrary = Map<string, string>;
+
+/** 解析 Wavefront MTL：取 newmtl + Kd 漫反射色 */
+export function parseMtl(text: string): MtlLibrary {
+  const map: MtlLibrary = new Map();
+  let current: string | null = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    if (line.toLowerCase().startsWith('newmtl ')) {
+      current = line.slice(7).trim();
+      if (current && !map.has(current)) map.set(current, DEFAULT_MESH_COLOR);
+      continue;
+    }
+    if (!current) continue;
+    const lower = line.toLowerCase();
+    if (lower.startsWith('kd ')) {
+      const parts = line.slice(3).trim().split(/\s+/);
+      const rgb = parseRgbTriplet(parts, 0);
+      if (rgb) map.set(current, rgbToHex(rgb.r, rgb.g, rgb.b));
+    }
+  }
+  return map;
+}
+
 /**
- * 解析 Wavefront OBJ（仅 v / f；忽略材质、法线、UV）
- * 顶点索引支持负索引；多边形用扇形三角化。
+ * 解析 Wavefront OBJ
+ * - v x y z [r g b]
+ * - usemtl / mtllib（mtllib 名仅记录；颜色靠外部 MTL）
+ * - f 扇形三角化
  */
-export function parseObj(text: string): Mesh3D {
+export function parseObj(text: string, materials?: MtlLibrary): Mesh3D & { mtllibNames: string[] } {
   const vertices: Vec3[] = [];
+  const vertexColors: Array<{ r: number; g: number; b: number } | null> = [];
   const triangles: [number, number, number][] = [];
+  const faceColors: (string | null)[] = [];
+  const mtllibNames: string[] = [];
+  let activeColor: string | null = null;
+  let sawVertexColor = false;
+  let sawMtlColor = false;
 
   const lines = text.split(/\r?\n/);
   for (const raw of lines) {
     const line = raw.trim();
     if (!line || line.startsWith('#')) continue;
+
+    if (line.toLowerCase().startsWith('mtllib ')) {
+      const name = line.slice(7).trim();
+      if (name) mtllibNames.push(name);
+      continue;
+    }
+
+    if (line.toLowerCase().startsWith('usemtl ')) {
+      const name = line.slice(7).trim();
+      if (materials?.has(name)) {
+        activeColor = materials.get(name)!;
+        sawMtlColor = true;
+      } else {
+        // 无 MTL 时用材质名哈希出稳定色，避免整模单色
+        activeColor = hashNameToColor(name);
+        sawMtlColor = true;
+      }
+      continue;
+    }
 
     if (line.startsWith('v ')) {
       const parts = line.slice(2).trim().split(/\s+/);
@@ -108,6 +193,14 @@ export function parseObj(text: string): Mesh3D {
       const z = Number(parts[2]);
       if (![x, y, z].every(Number.isFinite)) continue;
       vertices.push({ x, y, z });
+      // v x y z r g b  （部分导出器；跳过可选 w）
+      let rgb: { r: number; g: number; b: number } | null = null;
+      if (parts.length >= 6) {
+        const start = parts.length >= 7 ? 4 : 3;
+        rgb = parseRgbTriplet(parts, start);
+      }
+      if (rgb) sawVertexColor = true;
+      vertexColors.push(rgb);
       continue;
     }
 
@@ -115,34 +208,59 @@ export function parseObj(text: string): Mesh3D {
       const parts = line.slice(2).trim().split(/\s+/);
       const idxs: number[] = [];
       for (const part of parts) {
-        // f 可用 v / v/vt / v/vt/vn / v//vn
         const token = part.split('/')[0];
         const n = Number(token);
         if (!Number.isFinite(n) || n === 0) continue;
-        // OBJ 正索引从 1 开始；负索引相对当前顶点数
         const idx = n < 0 ? vertices.length + n : n - 1;
         if (idx < 0 || idx >= vertices.length) continue;
         idxs.push(idx);
       }
       if (idxs.length < 3) continue;
-      // 扇形三角化： (0,i,i+1)
       for (let i = 1; i < idxs.length - 1; i++) {
         triangles.push([idxs[0], idxs[i], idxs[i + 1]]);
+        faceColors.push(activeColor);
       }
     }
   }
 
-  if (vertices.length === 0) {
-    throw new Error('OBJ_NO_VERTICES');
-  }
-  if (triangles.length === 0) {
-    throw new Error('OBJ_NO_FACES');
-  }
+  if (vertices.length === 0) throw new Error('OBJ_NO_VERTICES');
+  if (triangles.length === 0) throw new Error('OBJ_NO_FACES');
 
-  return { vertices, triangles };
+  const hasAnyVertColor = vertexColors.some(Boolean);
+  const resolvedFaceColors = triangles.map((tri, i) => {
+    if (faceColors[i]) return faceColors[i];
+    if (!hasAnyVertColor) return null;
+    const cols = [vertexColors[tri[0]], vertexColors[tri[1]], vertexColors[tri[2]]].filter(
+      Boolean,
+    ) as Array<{ r: number; g: number; b: number }>;
+    if (!cols.length) return null;
+    const r = cols.reduce((s, c) => s + c.r, 0) / cols.length;
+    const g = cols.reduce((s, c) => s + c.g, 0) / cols.length;
+    const b = cols.reduce((s, c) => s + c.b, 0) / cols.length;
+    return rgbToHex(r, g, b);
+  });
+
+  void sawVertexColor;
+  void sawMtlColor;
+
+  return {
+    vertices,
+    vertexColors: hasAnyVertColor ? vertexColors : undefined,
+    triangles,
+    faceColors: resolvedFaceColors,
+    mtllibNames,
+  };
 }
 
-/** 居中并等比缩放到目标包围盒 */
+function hashNameToColor(name: string): string {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  const r = 0.25 + ((h >> 0) & 255) / 255 * 0.55;
+  const g = 0.25 + ((h >> 8) & 255) / 255 * 0.55;
+  const b = 0.25 + ((h >> 16) & 255) / 255 * 0.55;
+  return rgbToHex(r, g, b);
+}
+
 export function normalizeMesh(mesh: Mesh3D, halfExtent = TARGET_HALF_EXTENT): Mesh3D {
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
@@ -169,32 +287,279 @@ export function normalizeMesh(mesh: Mesh3D, halfExtent = TARGET_HALF_EXTENT): Me
       y: (v.y - cy) * scale,
       z: (v.z - cz) * scale,
     })),
+    vertexColors: mesh.vertexColors?.slice(),
     triangles: mesh.triangles.slice(),
+    faceColors: mesh.faceColors?.slice(),
   };
 }
 
-/** 均匀抽样，尽量保留整体外形 */
-function sampleIndices(total: number, maxKeep: number): number[] {
-  if (total <= maxKeep) {
-    return Array.from({ length: total }, (_, i) => i);
+function sub(a: Vec3, b: Vec3): Vec3 {
+  return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+}
+function cross(a: Vec3, b: Vec3): Vec3 {
+  return {
+    x: a.y * b.z - a.z * b.y,
+    y: a.z * b.x - a.x * b.z,
+    z: a.x * b.y - a.y * b.x,
+  };
+}
+function len(v: Vec3): number {
+  return Math.hypot(v.x, v.y, v.z);
+}
+function normalize(v: Vec3): Vec3 {
+  const L = len(v) || 1;
+  return { x: v.x / L, y: v.y / L, z: v.z / L };
+}
+function faceNormal(a: Vec3, b: Vec3, c: Vec3): Vec3 {
+  return normalize(cross(sub(b, a), sub(c, a)));
+}
+function faceArea(a: Vec3, b: Vec3, c: Vec3): number {
+  return 0.5 * len(cross(sub(b, a), sub(c, a)));
+}
+function centroid(a: Vec3, b: Vec3, c: Vec3): Vec3 {
+  return { x: (a.x + b.x + c.x) / 3, y: (a.y + b.y + c.y) / 3, z: (a.z + b.z + c.z) / 3 };
+}
+
+/** 自适应保特征抽样：空间分层 + 轮廓边加权 + 曲率加权 */
+export function adaptiveSelectTriangles(
+  mesh: Mesh3D,
+  maxKeep: number,
+): number[] {
+  const n = mesh.triangles.length;
+  if (n <= maxKeep) return Array.from({ length: n }, (_, i) => i);
+
+  const verts = mesh.vertices;
+  const normals: Vec3[] = new Array(n);
+  const areas: number[] = new Array(n);
+  const edgeFaces = new Map<string, number[]>();
+
+  const edgeKey = (i: number, j: number) => (i < j ? `${i}:${j}` : `${j}:${i}`);
+
+  for (let i = 0; i < n; i++) {
+    const [ia, ib, ic] = mesh.triangles[i];
+    const a = verts[ia];
+    const b = verts[ib];
+    const c = verts[ic];
+    normals[i] = faceNormal(a, b, c);
+    areas[i] = faceArea(a, b, c);
+    for (const [u, v] of [[ia, ib], [ib, ic], [ic, ia]] as [number, number][]) {
+      const k = edgeKey(u, v);
+      const list = edgeFaces.get(k);
+      if (list) list.push(i);
+      else edgeFaces.set(k, [i]);
+    }
   }
-  const out: number[] = [];
-  for (let i = 0; i < maxKeep; i++) {
-    out.push(Math.floor((i * total) / maxKeep));
+
+  const curvature = new Float32Array(n);
+  const silhouette = new Uint8Array(n);
+  for (const faces of edgeFaces.values()) {
+    if (faces.length === 1) {
+      silhouette[faces[0]] = 1;
+      continue;
+    }
+    if (faces.length === 2) {
+      const [f0, f1] = faces;
+      const dot =
+        normals[f0].x * normals[f1].x +
+        normals[f0].y * normals[f1].y +
+        normals[f0].z * normals[f1].z;
+      const ang = 1 - Math.max(-1, Math.min(1, dot));
+      curvature[f0] += ang;
+      curvature[f1] += ang;
+    }
   }
-  return out;
+
+  const scores = new Float64Array(n);
+  let maxScore = 0;
+  for (let i = 0; i < n; i++) {
+    const sil = silhouette[i] ? 2.8 : 1;
+    const curv = 1 + curvature[i] * 2.2;
+    const areaTerm = Math.sqrt(Math.max(areas[i], 1e-12));
+    scores[i] = areaTerm * curv * sil;
+    if (scores[i] > maxScore) maxScore = scores[i];
+  }
+
+  // 空间分层：保证全身覆盖，不只留大面
+  const BINS = 10;
+  const binLists: number[][] = Array.from({ length: BINS * BINS * BINS }, () => []);
+  for (let i = 0; i < n; i++) {
+    const [ia, ib, ic] = mesh.triangles[i];
+    const c = centroid(verts[ia], verts[ib], verts[ic]);
+    const bx = Math.min(BINS - 1, Math.max(0, Math.floor(((c.x + 10) / 20) * BINS)));
+    const by = Math.min(BINS - 1, Math.max(0, Math.floor(((c.y + 10) / 20) * BINS)));
+    const bz = Math.min(BINS - 1, Math.max(0, Math.floor(((c.z + 10) / 20) * BINS)));
+    binLists[bx * BINS * BINS + by * BINS + bz].push(i);
+  }
+
+  const selected = new Set<number>();
+  const occupied = binLists.filter(b => b.length > 0);
+  const perBin = Math.max(2, Math.floor(maxKeep / Math.max(1, occupied.length)));
+
+  for (const bin of occupied) {
+    bin.sort((a, b) => scores[b] - scores[a]);
+    for (let k = 0; k < Math.min(perBin, bin.length); k++) {
+      selected.add(bin[k]);
+      if (selected.size >= maxKeep) break;
+    }
+    if (selected.size >= maxKeep) break;
+  }
+
+  if (selected.size < maxKeep) {
+    const rest = Array.from({ length: n }, (_, i) => i)
+      .filter(i => !selected.has(i))
+      .sort((a, b) => scores[b] - scores[a]);
+    for (const i of rest) {
+      selected.add(i);
+      if (selected.size >= maxKeep) break;
+    }
+  }
+
+  return Array.from(selected).sort((a, b) => a - b);
+}
+
+type AnalyticPrimitive =
+  | { kind: 'sphere'; center: Vec3; radius: number; color: string }
+  | { kind: 'box'; min: Vec3; max: Vec3; color: string }
+  | { kind: 'cylinder'; axis: 'x' | 'y' | 'z'; center: Vec3; radius: number; halfLen: number; color: string };
+
+function averageFaceColor(mesh: Mesh3D): string {
+  const colors = (mesh.faceColors || []).filter(Boolean) as string[];
+  if (!colors.length) return DEFAULT_MESH_COLOR;
+  let r = 0, g = 0, b = 0;
+  for (const hex of colors) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(hex);
+    if (!m) continue;
+    r += parseInt(m[1].slice(0, 2), 16);
+    g += parseInt(m[1].slice(2, 4), 16);
+    b += parseInt(m[1].slice(4, 6), 16);
+  }
+  const n = colors.length;
+  return rgbToHex(r / n / 255, g / n / 255, b / n / 255);
+}
+
+/** 简单几何原语检测（高置信才启用） */
+export function detectAnalyticPrimitives(mesh: Mesh3D): AnalyticPrimitive[] {
+  const verts = mesh.vertices;
+  if (verts.length < 8) return [];
+
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  let sx = 0, sy = 0, sz = 0;
+  for (const v of verts) {
+    sx += v.x; sy += v.y; sz += v.z;
+    if (v.x < minX) minX = v.x;
+    if (v.y < minY) minY = v.y;
+    if (v.z < minZ) minZ = v.z;
+    if (v.x > maxX) maxX = v.x;
+    if (v.y > maxY) maxY = v.y;
+    if (v.z > maxZ) maxZ = v.z;
+  }
+  const n = verts.length;
+  const cx = sx / n, cy = sy / n, cz = sz / n;
+  const color = averageFaceColor(mesh);
+
+  // Sphere：半径变异系数小
+  const radii = verts.map(v => Math.hypot(v.x - cx, v.y - cy, v.z - cz));
+  const meanR = radii.reduce((a, b) => a + b, 0) / n;
+  if (meanR > 0.5) {
+    let varSum = 0;
+    for (const r of radii) varSum += (r - meanR) ** 2;
+    const cv = Math.sqrt(varSum / n) / meanR;
+    if (cv < 0.06 && mesh.triangles.length >= 20) {
+      return [{ kind: 'sphere', center: { x: cx, y: cy, z: cz }, radius: meanR, color }];
+    }
+  }
+
+  // Box：顶点几乎落在 AABB 八角附近
+  const corners: Vec3[] = [
+    { x: minX, y: minY, z: minZ }, { x: maxX, y: minY, z: minZ },
+    { x: minX, y: maxY, z: minZ }, { x: maxX, y: maxY, z: minZ },
+    { x: minX, y: minY, z: maxZ }, { x: maxX, y: minY, z: maxZ },
+    { x: minX, y: maxY, z: maxZ }, { x: maxX, y: maxY, z: maxZ },
+  ];
+  const diag = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) || 1;
+  let nearCorner = 0;
+  for (const v of verts) {
+    let best = Infinity;
+    for (const c of corners) {
+      const d = Math.hypot(v.x - c.x, v.y - c.y, v.z - c.z);
+      if (d < best) best = d;
+    }
+    if (best < diag * 0.08) nearCorner++;
+  }
+  const extentX = maxX - minX, extentY = maxY - minY, extentZ = maxZ - minZ;
+  if (nearCorner / n > 0.55 && n <= 24 && Math.min(extentX, extentY, extentZ) > 0.2) {
+    return [{
+      kind: 'box',
+      min: { x: minX, y: minY, z: minZ },
+      max: { x: maxX, y: maxY, z: maxZ },
+      color,
+    }];
+  }
+
+  // Cylinder：某一轴上径向距离稳定
+  const tryAxis = (axis: 'x' | 'y' | 'z'): AnalyticPrimitive | null => {
+    const rads: number[] = [];
+    let axisMin = Infinity, axisMax = -Infinity;
+    for (const v of verts) {
+      let r: number;
+      let along: number;
+      if (axis === 'z') {
+        r = Math.hypot(v.x - cx, v.y - cy);
+        along = v.z;
+      } else if (axis === 'y') {
+        r = Math.hypot(v.x - cx, v.z - cz);
+        along = v.y;
+      } else {
+        r = Math.hypot(v.y - cy, v.z - cz);
+        along = v.x;
+      }
+      rads.push(r);
+      if (along < axisMin) axisMin = along;
+      if (along > axisMax) axisMax = along;
+    }
+    const mean = rads.reduce((a, b) => a + b, 0) / n;
+    if (mean < 0.4) return null;
+    let vs = 0;
+    for (const r of rads) vs += (r - mean) ** 2;
+    const cv = Math.sqrt(vs / n) / mean;
+    const half = (axisMax - axisMin) / 2;
+    if (cv < 0.08 && half > mean * 0.35) {
+      return {
+        kind: 'cylinder',
+        axis,
+        center: { x: cx, y: cy, z: cz },
+        radius: mean,
+        halfLen: half,
+        color,
+      };
+    }
+    return null;
+  };
+
+  for (const axis of ['z', 'y', 'x'] as const) {
+    const hit = tryAxis(axis);
+    if (hit) return [hit];
+  }
+
+  return [];
+}
+
+function triangleLatex(a: Vec3, b: Vec3, c: Vec3): string {
+  return `\\operatorname{triangle}\\left(${fmtPt(a)},${fmtPt(b)},${fmtPt(c)}\\right)`;
+}
+
+function edgeLatex(a: Vec3, b: Vec3): string {
+  const lerp = (pa: number, pb: number) =>
+    `\\left(1-t\\right)\\cdot${fmt(pa)}+t\\cdot${fmt(pb)}`;
+  return `\\left(${lerp(a.x, b.x)},${lerp(a.y, b.y)},${lerp(a.z, b.z)}\\right)`;
 }
 
 function uniqueEdges(triangles: [number, number, number][]): [number, number][] {
   const seen = new Set<string>();
   const edges: [number, number][] = [];
   for (const [a, b, c] of triangles) {
-    const triples: [number, number][] = [
-      [a, b],
-      [b, c],
-      [c, a],
-    ];
-    for (const [u, v] of triples) {
+    for (const [u, v] of [[a, b], [b, c], [c, a]] as [number, number][]) {
       const lo = Math.min(u, v);
       const hi = Math.max(u, v);
       const key = `${lo}:${hi}`;
@@ -206,15 +571,74 @@ function uniqueEdges(triangles: [number, number, number][]): [number, number][] 
   return edges;
 }
 
-function triangleLatex(a: Vec3, b: Vec3, c: Vec3): string {
-  return `\\operatorname{triangle}\\left(${fmtPt(a)},${fmtPt(b)},${fmtPt(c)}\\right)`;
+function sampleIndices(total: number, maxKeep: number): number[] {
+  if (total <= maxKeep) return Array.from({ length: total }, (_, i) => i);
+  const out: number[] = [];
+  for (let i = 0; i < maxKeep; i++) out.push(Math.floor((i * total) / maxKeep));
+  return out;
 }
 
-/** 参数线段：(1-t)P + tQ，t∈[0,1] */
-function edgeLatex(a: Vec3, b: Vec3): string {
-  const lerp = (pa: number, pb: number) =>
-    `\\left(1-t\\right)\\cdot${fmt(pa)}+t\\cdot${fmt(pb)}`;
-  return `\\left(${lerp(a.x, b.x)},${lerp(a.y, b.y)},${lerp(a.z, b.z)}\\right)`;
+function boxTriangles(min: Vec3, max: Vec3): Array<[Vec3, Vec3, Vec3]> {
+  const p = (x: number, y: number, z: number): Vec3 => ({ x, y, z });
+  const v000 = p(min.x, min.y, min.z);
+  const v001 = p(min.x, min.y, max.z);
+  const v010 = p(min.x, max.y, min.z);
+  const v011 = p(min.x, max.y, max.z);
+  const v100 = p(max.x, min.y, min.z);
+  const v101 = p(max.x, min.y, max.z);
+  const v110 = p(max.x, max.y, min.z);
+  const v111 = p(max.x, max.y, max.z);
+  return [
+    [v000, v100, v110], [v000, v110, v010],
+    [v001, v011, v111], [v001, v111, v101],
+    [v000, v010, v011], [v000, v011, v001],
+    [v100, v101, v111], [v100, v111, v110],
+    [v000, v001, v101], [v000, v101, v100],
+    [v010, v110, v111], [v010, v111, v011],
+  ];
+}
+
+function analyticToExpressions(primitives: AnalyticPrimitive[]): Desmos3DExpression[] {
+  const out: Desmos3DExpression[] = [];
+  primitives.forEach((p, i) => {
+    if (p.kind === 'sphere') {
+      out.push({
+        id: `m3d_sphere_${i}`,
+        latex: `\\operatorname{sphere}\\left(${fmtPt(p.center)},${fmt(p.radius)}\\right)`,
+        color: p.color,
+        fillOpacity: 0.85,
+      });
+      return;
+    }
+    if (p.kind === 'box') {
+      boxTriangles(p.min, p.max).forEach((tri, j) => {
+        out.push({
+          id: `m3d_box_${i}_${j}`,
+          latex: triangleLatex(tri[0], tri[1], tri[2]),
+          color: p.color,
+          fillOpacity: 0.8,
+        });
+      });
+      return;
+    }
+    // cylinder parametric
+    const { center: c, radius: r, halfLen: h, axis, color } = p;
+    let latex: string;
+    if (axis === 'z') {
+      latex = `\\left(${fmt(c.x)}+${fmt(r)}\\cos\\left(u\\right),${fmt(c.y)}+${fmt(r)}\\sin\\left(u\\right),${fmt(c.z)}+v\\right)`;
+    } else if (axis === 'y') {
+      latex = `\\left(${fmt(c.x)}+${fmt(r)}\\cos\\left(u\\right),${fmt(c.y)}+v,${fmt(c.z)}+${fmt(r)}\\sin\\left(u\\right)\\right)`;
+    } else {
+      latex = `\\left(${fmt(c.x)}+v,${fmt(c.y)}+${fmt(r)}\\cos\\left(u\\right),${fmt(c.z)}+${fmt(r)}\\sin\\left(u\\right)\\right)`;
+    }
+    out.push({
+      id: `m3d_cyl_${i}`,
+      latex: `${latex}\\left\\{0\\le u\\le2\\pi\\right\\}\\left\\{-${fmt(h)}\\le v\\le${fmt(h)}\\right\\}`,
+      color,
+      fillOpacity: 0.8,
+    });
+  });
+  return out;
 }
 
 const pushBatch = (calculator: any, chunk: Desmos3DExpression[]) => {
@@ -226,26 +650,61 @@ const pushBatch = (calculator: any, chunk: Desmos3DExpression[]) => {
   chunk.forEach(expr => calculator.setExpression(expr));
 };
 
+function detectColorSource(mesh: Mesh3D): Model3DConvertResult['colorSource'] {
+  const faces = mesh.faceColors || [];
+  const colored = faces.filter(Boolean).length;
+  if (!colored) return 'none';
+  if (mesh.vertexColors?.some(Boolean)) return colored < faces.length ? 'mixed' : 'vertex';
+  return 'mtl';
+}
+
 /**
- * 网格 → Desmos 3D 表达式
- * 优先 triangle 面片；过多则抽样；极端大网格改用边线框。
+ * 网格 → Desmos 3D 表达式（解析原语优先，其余高密度着色三角面）
  */
 export function meshToDesmos3D(
   meshIn: Mesh3D,
-  options?: { maxTriangles?: number; maxEdges?: number; clearFirst?: boolean },
+  options?: { maxTriangles?: number; maxEdges?: number },
 ): Model3DConvertResult {
   const maxTriangles = options?.maxTriangles ?? MAX_TRIANGLES;
   const maxEdges = options?.maxEdges ?? MAX_EDGES;
   const mesh = normalizeMesh(meshIn);
+  const faceCount = mesh.triangles.length;
+  const colorSource = detectColorSource(mesh);
 
   const expressions: Desmos3DExpression[] = [];
   let renderedTriangles = 0;
   let renderedEdges = 0;
+  let analyticCount = 0;
   let mode: Model3DConvertResult['mode'] = 'triangles';
   let warning: string | undefined;
 
-  const faceCount = mesh.triangles.length;
-  const useWireframe = faceCount > maxTriangles * 3;
+  const primitives = detectAnalyticPrimitives(mesh);
+  if (primitives.length > 0) {
+    const analyticExprs = analyticToExpressions(primitives);
+    expressions.push(...analyticExprs);
+    analyticCount = analyticExprs.length;
+    mode = 'analytic';
+    // 球/柱/盒已足够表达时不再铺三角面
+    const noteExpr: Desmos3DExpression = {
+      id: 'm3d_note',
+      type: 'text',
+      text: `3D analytic · ${primitives.map(p => p.kind).join('+')} · V${mesh.vertices.length} F${faceCount}`,
+    };
+    return {
+      expressions: [noteExpr, ...expressions],
+      vertexCount: mesh.vertices.length,
+      faceCount,
+      triangleCount: faceCount,
+      renderedTriangles: 0,
+      renderedEdges: 0,
+      analyticCount,
+      mode,
+      explanation: 'model_3d_complete_hi',
+      colorSource,
+    };
+  }
+
+  const useWireframe = faceCount > WIREFRAME_FACE_THRESHOLD;
 
   if (useWireframe) {
     mode = 'wireframe';
@@ -260,19 +719,20 @@ export function meshToDesmos3D(
       expressions.push({
         id: `m3d_e_${i}`,
         latex: edgeLatex(a, b),
-        color: MESH_COLORS[i % MESH_COLORS.length],
-        lineOpacity: 0.85,
+        color: mesh.faceColors?.[keep[i]] || DEFAULT_MESH_COLOR,
+        lineOpacity: 0.9,
       });
       renderedEdges++;
     }
   } else {
-    const keep = sampleIndices(faceCount, maxTriangles);
+    const keep = adaptiveSelectTriangles(mesh, maxTriangles);
     if (keep.length < faceCount) {
-      warning = 'model_3d_decimated';
+      warning = 'model_3d_decimated_hi';
       mode = 'mixed';
     }
     for (let i = 0; i < keep.length; i++) {
-      const [ia, ib, ic] = mesh.triangles[keep[i]];
+      const fi = keep[i];
+      const [ia, ib, ic] = mesh.triangles[fi];
       const a = mesh.vertices[ia];
       const b = mesh.vertices[ib];
       const c = mesh.vertices[ic];
@@ -280,17 +740,17 @@ export function meshToDesmos3D(
       expressions.push({
         id: `m3d_t_${i}`,
         latex: triangleLatex(a, b, c),
-        color: MESH_COLORS[i % MESH_COLORS.length],
-        fillOpacity: 0.55,
+        color: mesh.faceColors?.[fi] || DEFAULT_MESH_COLOR,
+        fillOpacity: 0.92,
       });
       renderedTriangles++;
     }
   }
 
-  const noteExpr: any = {
+  const noteExpr: Desmos3DExpression = {
     id: 'm3d_note',
     type: 'text',
-    text: `3D mesh · V${mesh.vertices.length} F${faceCount} → tri ${renderedTriangles} / edge ${renderedEdges}`,
+    text: `3D mesh · V${mesh.vertices.length} F${faceCount} → tri ${renderedTriangles} / edge ${renderedEdges} · color:${colorSource}`,
   };
 
   return {
@@ -300,13 +760,15 @@ export function meshToDesmos3D(
     triangleCount: faceCount,
     renderedTriangles,
     renderedEdges,
+    analyticCount,
     mode,
-    explanation: 'model_3d_complete',
+    explanation: 'model_3d_complete_hi',
     warning,
+    colorSource,
   };
 }
 
-/** 渐进写入，避免一次塞入过多表达式卡死主线程 */
+/** 渐进写入：小批次 + 间歇让出主线程 */
 export async function applyModel3DExpressionsProgressively(
   calculator: any,
   expressions: Desmos3DExpression[],
@@ -318,7 +780,7 @@ export async function applyModel3DExpressionsProgressively(
   },
 ): Promise<void> {
   if (!calculator || !expressions.length) return;
-  const batchSize = options?.batchSize ?? 25;
+  const batchSize = options?.batchSize ?? 35;
   const signal = options?.signal;
 
   if (options?.clearFirst !== false) {
@@ -334,15 +796,27 @@ export async function applyModel3DExpressionsProgressively(
     const chunk = expressions.slice(i, i + batchSize);
     pushBatch(calculator, chunk);
     options?.onProgress?.(Math.min(i + chunk.length, expressions.length), expressions.length);
-    // 让出主线程，便于 UI 更新
-    await new Promise<void>(r => setTimeout(r, 0));
+    // 大批次时稍作停顿，降低 Desmos 渲染峰值
+    const pause = expressions.length > 1200 ? 12 : expressions.length > 600 ? 6 : 0;
+    await new Promise<void>(r => setTimeout(r, pause));
   }
 }
 
-/** 从 File 读入并转换 */
+export async function processObjTextToDesmos3D(
+  objText: string,
+  mtlText?: string,
+  options?: { maxTriangles?: number; maxEdges?: number },
+): Promise<Model3DConvertResult> {
+  if (!objText.trim()) throw new Error('OBJ_EMPTY');
+  const materials = mtlText ? parseMtl(mtlText) : undefined;
+  const mesh = parseObj(objText, materials);
+  return meshToDesmos3D(mesh, options);
+}
+
+/** 从 File 读入并转换；可选附带 MTL File */
 export async function processObjFileToDesmos3D(
   file: File,
-  options?: { maxTriangles?: number; maxEdges?: number },
+  options?: { maxTriangles?: number; maxEdges?: number; mtlFile?: File | null },
 ): Promise<Model3DConvertResult> {
   const unsupported = unsupportedModelMessage(file);
   if (unsupported && !isObjFile(file)) {
@@ -350,10 +824,18 @@ export async function processObjFileToDesmos3D(
   }
 
   const text = await file.text();
-  if (!text.trim()) {
-    throw new Error('OBJ_EMPTY');
+  let mtlText: string | undefined;
+  if (options?.mtlFile) {
+    mtlText = await options.mtlFile.text();
   }
+  return processObjTextToDesmos3D(text, mtlText, options);
+}
 
-  const mesh = parseObj(text);
-  return meshToDesmos3D(mesh, options);
+/** 从多选 FileList 中配对 .obj + .mtl */
+export function pairObjAndMtl(files: File[]): { obj: File; mtl?: File } | null {
+  const list = Array.from(files);
+  const obj = list.find(isObjFile);
+  if (!obj) return null;
+  const mtl = list.find(isMtlFile);
+  return { obj, mtl };
 }

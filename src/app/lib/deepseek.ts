@@ -76,6 +76,8 @@ export type ApiConfigOverrides = {
   provider?: ApiProviderId | string;
   model?: string;
   key?: string;
+  /** 画板维度：3D 时系统提示追加 Calculator3D 语法 */
+  calculatorDimension?: '2d' | '3d';
 };
 
 /** 把当前 UI 里的 Key/服务商立刻写入 localStorage，保证 getApiConfig 与界面一致 */
@@ -532,15 +534,60 @@ const PROMPTS: Record<string, string> = {
   en: PROMPT_EN, // 英文界面用英文提示词
 };
 
+/** Desmos Calculator3D 语法补充（画板处于 3D 时追加） */
+const DESMOS_3D_MODE_ADDON_ZH = [
+  '',
+  '【当前画板：Desmos 3D — 必须输出 3D 语法】',
+  '- 用户请求画图/物体/场景时，全部用 3D 表达式，禁止只输出 2D 的 (x,y) 曲线当最终结果。',
+  '- 可用原语：',
+  '  · triangle((x,y,z),(x,y,z),(x,y,z)) 三角面',
+  '  · sphere((x,y,z),r) 球面',
+  '  · segment((x,y,z),(x,y,z)) / vector((x,y,z),(x,y,z))',
+  '  · 单参数曲线 (X(t),Y(t),Z(t))，默认 t∈[0,1]，整圆加 \\\\left\\\\{0\\\\le t\\\\le 2\\\\pi\\\\right\\\\}',
+  '  · 双参数曲面 (X(u,v),Y(u,v),Z(u,v))，如圆柱 (\\\\cos(u),\\\\sin(u),v)',
+  '- 颜色：通过表达式 color 无法在标签内直接设时，仍输出正确几何；优先用可区分的多条曲面表达不同部件。',
+  '- 示例：',
+  '  <DESMOS>\\\\operatorname{sphere}\\\\left((0,0,0),2\\\\right)</DESMOS>',
+  '  <DESMOS>(\\\\cos(u),\\\\sin(u),v)\\\\left\\\\{0\\\\le u\\\\le 2\\\\pi\\\\right\\\\}\\\\left\\\\{0\\\\le v\\\\le 3\\\\right\\\\}</DESMOS>',
+  '  <DESMOS>\\\\operatorname{triangle}\\\\left((0,0,0),(2,0,0),(1,1,1)\\\\right)</DESMOS>',
+  '- 2D 专用规则（仅用 t 的平面参数、x-y 不等式填色）在 3D 模式下让位于上述 3D 原语。',
+  '',
+].join('\n');
+
+const DESMOS_3D_MODE_ADDON_EN = [
+  '',
+  '[Canvas is Desmos 3D — MUST emit 3D syntax]',
+  '- For any draw/object/scene request, output 3D expressions only; do not finish with flat 2D (x,y) curves.',
+  '- Primitives:',
+  '  · triangle((x,y,z),(x,y,z),(x,y,z))',
+  '  · sphere((x,y,z),r)',
+  '  · segment / vector with 3D points',
+  '  · parametric curve (X(t),Y(t),Z(t)); surface (X(u,v),Y(u,v),Z(u,v)) e.g. (\\\\cos(u),\\\\sin(u),v)',
+  '- Examples:',
+  '  <DESMOS>\\\\operatorname{sphere}\\\\left((0,0,0),2\\\\right)</DESMOS>',
+  '  <DESMOS>(\\\\cos(u),\\\\sin(u),v)\\\\left\\\\{0\\\\le u\\\\le 2\\\\pi\\\\right\\\\}\\\\left\\\\{0\\\\le v\\\\le 3\\\\right\\\\}</DESMOS>',
+  '  <DESMOS>\\\\operatorname{triangle}\\\\left((0,0,0),(2,0,0),(1,1,1)\\\\right)</DESMOS>',
+  '- Prefer 3D primitives over 2D-only x–y fill rules while in 3D mode.',
+  '',
+].join('\n');
+
+/**
+ * getDesmos3DModeAddon — 3D 画板附加系统提示
+ */
+export const getDesmos3DModeAddon = (lang: string = 'zh') =>
+  (lang === 'en' ? DESMOS_3D_MODE_ADDON_EN : DESMOS_3D_MODE_ADDON_ZH);
+
 /**
  * getSystemPrompt — 获取系统提示词（含 Desmos 官方语法参考，见 DESMOS_OFFICIAL_SYNTAX_*）
  *
  * @param lang - 语言代码（'zh' 或 'en'），默认 'zh'
+ * @param dimension - '2d' | '3d'；3D 时追加 Calculator3D 语法
  * @returns 系统提示词字符串
  */
-export const getSystemPrompt = (lang: string = 'zh') => {
+export const getSystemPrompt = (lang: string = 'zh', dimension: '2d' | '3d' = '2d') => {
   const base = PROMPTS[lang] || PROMPTS['zh'];
-  return base + getCreativityModeAddon(lang);
+  const addon3d = dimension === '3d' ? getDesmos3DModeAddon(lang) : '';
+  return base + getCreativityModeAddon(lang) + addon3d;
 };
 
 // ─── 非流式 AI 调用 ──────────────────────────────────────────────────────────
@@ -683,17 +730,18 @@ export const callDeepSeekStream = async (
     key: apiKey ?? configOverrides?.key,
   });
   const providerConfig = resolveProviderConfig(cfg.provider);
+  const calcDim = configOverrides?.calculatorDimension === '3d' ? '3d' : '2d';
 
   if (providerConfig.format === 'anthropic') {
     const key = claudeKey || cfg.key || '';
     if (!key) throw new Error('Claude API key required. Please set it in Settings.');
-    return callClaudeStream(messages, onChunk, key, lang, useComputerUse);
+    return callClaudeStream(messages, onChunk, key, lang, useComputerUse, calcDim);
   }
 
   const key = getEffectiveApiKey(apiKey);
   const model = resolveProviderModel(providerConfig.id, cfg.model);
   const { url, headers } = buildProviderRequest(providerConfig.id, providerConfig.endpoint, key);
-  const systemPrompt = getSystemPrompt(lang);
+  const systemPrompt = getSystemPrompt(lang, calcDim);
 
   try {
     const messagesToSend = [
@@ -798,12 +846,13 @@ export const callClaudeStream = async (
   onChunk: (chunk: string) => void,
   apiKey: string,
   lang: string = 'zh',
-  useComputerUse: boolean = false
+  useComputerUse: boolean = false,
+  calculatorDimension: '2d' | '3d' = '2d',
 ) => {
   const cfg = getApiConfig();
   // 优先用 Claude 配置中的模型，没有就用默认模型
   const model = (cfg.provider === 'claude' ? cfg.model : null) || DEFAULT_MODELS['claude'];
-  const systemPrompt = getSystemPrompt(lang);
+  const systemPrompt = getSystemPrompt(lang, calculatorDimension);
 
   // ── 长手模式：追加操作说明到系统提示词 ──────────────────────────────────
   // 三元表达式：useComputerUse 为 true 时拼接额外说明，否则空字符串
