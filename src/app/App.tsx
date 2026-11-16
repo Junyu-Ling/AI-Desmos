@@ -41,7 +41,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Toaster, toast } from 'sonner@2.0.3'; // @版本号锁定兼容版本
 
 // 导入本项目的各个子组件
-import { DesmosCalculator } from './components/DesmosCalculator'; // Desmos 计算器组件
+import { DesmosCalculator, type CalculatorDimension } from './components/DesmosCalculator'; // Desmos 计算器组件（2D/3D）
 import { ChatInterface } from './components/ChatInterface';         // AI 聊天界面组件
 import { Onboarding } from './components/Onboarding';               // 首次使用引导页
 
@@ -62,7 +62,7 @@ import { Resizable } from 're-resizable';
 // Loader2     — 旋转加载圈图标（Desmos 加载中）
 // AlertCircle — 警告圆圈图标（加载失败）
 // RefreshCcw  — 刷新图标（重试按钮）
-import { Wrench, Loader2, AlertCircle, RefreshCcw, Pencil, X as XIcon, Undo2, Square } from 'lucide-react';
+import { Wrench, Loader2, AlertCircle, RefreshCcw, Pencil, X as XIcon, Undo2, Square, Box } from 'lucide-react';
 import { processDrawnPathToFourier, getNextHandDrawStrokeIndex, applyFourierExpressionsProgressively, DRAW_COLOR_PRESETS, type HandDrawStroke } from './lib/image-processing';
 import {
   clientToMathCoords,
@@ -107,6 +107,12 @@ function App() {
    * 之后 ChatInterface 需要这个实例来操控画板（添加/清空公式）。
    */
   const [calculator, setCalculator] = useState<any>(null);
+
+  /**
+   * calculatorMode — Desmos 维度：'2d' 平面 / '3d' 立体
+   * 切换时 DesmosCalculator 会销毁并重建实例（画板不跨维度保留）
+   */
+  const [calculatorMode, setCalculatorMode] = useState<CalculatorDimension>('2d');
 
   /**
    * showOnboarding — 是否显示引导页
@@ -936,6 +942,7 @@ function App() {
             onStatusChange      — 状态变化回调，更新 desmosStatus（用于控制加载/错误遮罩）
             className           — 宽高设为 100%，铺满左侧区域 */}
         <DesmosCalculator
+          mode={calculatorMode}
           onCalculatorReady={setCalculator}   // 直接传入 setState 函数作为回调
           onStatusChange={setDesmosStatus}     // 直接传入 setState 函数作为回调
           className="w-full h-full"
@@ -1043,19 +1050,60 @@ function App() {
           </div>
         )}
 
-        {/* Draw mode toggle button (bottom-left) */}
+        {/* 2D / 3D 切换 + 手绘（仅 2D） */}
         {desmosStatus === 'ready' && !showOnboarding && (
-          <button
-            onClick={handleDrawButtonClick}
-            className={`absolute bottom-8 left-6 z-20 flex items-center gap-1.5 px-3 py-2 rounded-full shadow-lg text-sm font-semibold transition-all active:scale-95 ${
-              drawMode
-                ? 'bg-blue-600 text-white hover:bg-blue-700'
-                : 'bg-white text-gray-700 border border-gray-200 hover:bg-gray-50'
-            }`}
-          >
-            <Pencil size={14} />
-            {drawMode ? t('draw_mode_exit') : t('draw_mode_btn')}
-          </button>
+          <div className="absolute bottom-8 left-6 z-20 flex items-center gap-2">
+            <div className="flex items-center rounded-full bg-white border border-gray-200 shadow-lg overflow-hidden text-sm font-semibold">
+              <button
+                type="button"
+                onClick={() => {
+                  if (calculatorMode === '2d') return;
+                  if (drawMode) handleCancelDraw();
+                  setCalculator(null);
+                  setCalculatorMode('2d');
+                }}
+                className={`px-3 py-2 transition-colors ${
+                  calculatorMode === '2d'
+                    ? 'bg-blue-600 text-white'
+                    : 'text-gray-600 hover:bg-gray-50'
+                }`}
+                title={t('mode_2d')}
+              >
+                2D
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (calculatorMode === '3d') return;
+                  if (drawMode) handleCancelDraw();
+                  setCalculator(null);
+                  setCalculatorMode('3d');
+                }}
+                className={`flex items-center gap-1 px-3 py-2 transition-colors ${
+                  calculatorMode === '3d'
+                    ? 'bg-blue-600 text-white'
+                    : 'text-gray-600 hover:bg-gray-50'
+                }`}
+                title={t('mode_3d')}
+              >
+                <Box size={14} />
+                3D
+              </button>
+            </div>
+            {calculatorMode === '2d' && (
+              <button
+                onClick={handleDrawButtonClick}
+                className={`flex items-center gap-1.5 px-3 py-2 rounded-full shadow-lg text-sm font-semibold transition-all active:scale-95 ${
+                  drawMode
+                    ? 'bg-blue-600 text-white hover:bg-blue-700'
+                    : 'bg-white text-gray-700 border border-gray-200 hover:bg-gray-50'
+                }`}
+              >
+                <Pencil size={14} />
+                {drawMode ? t('draw_mode_exit') : t('draw_mode_btn')}
+              </button>
+            )}
+          </div>
         )}
 
         {/* ── 加载遮罩层 ────────────────────────────────────────────────────
@@ -1203,6 +1251,13 @@ function App() {
               onExternalQueryHandled  — 处理完外部查询后的回调（清空 query 和 exprId）*/}
           <ChatInterface
             calculator={calculator}
+            calculatorMode={calculatorMode}
+            onRequestCalculatorMode={(mode) => {
+              if (mode === calculatorMode) return;
+              if (drawMode) handleCancelDraw();
+              setCalculator(null);
+              setCalculatorMode(mode);
+            }}
             onClose={() => setIsChatOpen(false)}
             externalQuery={externalQuery}
             externalCorrectionExprId={externalCorrectionExprId}

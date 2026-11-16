@@ -45,7 +45,7 @@ import React, { useState, useRef, useEffect } from 'react';
 // Pencil=铅笔  GraduationCap=学士帽（解题）  ChevronRight=右箭头  Lock=锁
 // Zap=闪电（试用）  ExternalLink=外部链接  ShieldCheck=盾牌+对勾（安全）
 // MousePointer2=鼠标指针（长手模式）  CloudOff=断网图标  RefreshCcw=刷新
-import { X, Send, Paperclip, Bot, User, Loader2, Trash2, Layers, HelpCircle, BookOpen, MessageSquareX, ScanEye, Share, Settings, Key, Globe, Pen, ImageIcon, Sigma, Eye, Upload, Lightbulb, Wrench, Pencil, GraduationCap, ChevronRight, Lock, Zap, ExternalLink, ShieldCheck, MousePointer2, CloudOff, RefreshCcw, Square, Check } from 'lucide-react';
+import { X, Send, Paperclip, Bot, User, Loader2, Trash2, Layers, HelpCircle, BookOpen, MessageSquareX, ScanEye, Share, Settings, Key, Globe, Pen, ImageIcon, Sigma, Eye, Upload, Lightbulb, Wrench, Pencil, GraduationCap, ChevronRight, Lock, Zap, ExternalLink, ShieldCheck, MousePointer2, CloudOff, RefreshCcw, Square, Check, Box } from 'lucide-react';
 
 // 工具函数：Desmos 流式注入
 import { processDesmosStreamChunk, createDesmosInjectState } from '../lib/utils';
@@ -64,6 +64,13 @@ import {
 
 // 图像处理：图片/Emoji → 傅里叶变换 → Desmos 表达式
 import { processImageToFourier, processEmojiToFourier, applyFourierExpressionsProgressively, type SmartDrawMode, type OutlineStyle, type OutlineFitMethod } from '../lib/image-processing';
+import {
+  processObjFileToDesmos3D,
+  applyModel3DExpressionsProgressively,
+  isObjFile,
+  unsupportedModelMessage,
+} from '../lib/model-3d';
+import type { CalculatorDimension } from './DesmosCalculator';
 import { detachGifPlayback } from '../lib/gif-animation';
 import { extractGifFirstFrameAsPngFile } from '../lib/gif-decode';
 import { getActiveWindowedPlayback } from '../lib/gif-playback';
@@ -92,6 +99,12 @@ import { useLanguage, Language, translations, detectReplyLanguage } from '../lib
 interface ChatInterfaceProps {
   /** Desmos 计算器实例（由 App.tsx 传入，用于操控画板） */
   calculator: any;
+
+  /** 当前画板维度：2D / 3D */
+  calculatorMode?: CalculatorDimension;
+
+  /** 请求切换 2D/3D（上传 3D 模型时若仍在 2D 可先切到 3D） */
+  onRequestCalculatorMode?: (mode: CalculatorDimension) => void;
 
   /** 关闭聊天栏的回调函数（点击 × 按钮时调用） */
   onClose?: () => void;
@@ -189,7 +202,15 @@ const formatMessageTime = (ts: number, language: Language): string => {
   }).format(date);
 };
 
-export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClose, externalQuery, onExternalQueryHandled, externalCorrectionExprId }) => {
+export const ChatInterface: React.FC<ChatInterfaceProps> = ({
+  calculator,
+  calculatorMode = '2d',
+  onRequestCalculatorMode,
+  onClose,
+  externalQuery,
+  onExternalQueryHandled,
+  externalCorrectionExprId,
+}) => {
 
   // ═══════════════════════════════════════════════════════════════════════════
   // 基础状态
@@ -678,6 +699,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
 
   /** drawFileRef — 绘图模式的隐藏文件选择器 <input type="file"> 的引用 */
   const drawFileRef = useRef<HTMLInputElement>(null);
+
+  /** model3dFileRef — 3D 模型（OBJ）文件选择器 */
+  const model3dFileRef = useRef<HTMLInputElement>(null);
 
   /** showDrawModeSheet — 智能绘图：选择仅轮廓 / 仅涂色 / 轮廓+涂色 */
   const [showDrawModeSheet, setShowDrawModeSheet] = useState(false);
@@ -1471,6 +1495,159 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
     await processStaticImageFile(file, mode);
   };
 
+  /** 等待 Desmos 实例就绪（切换 2D→3D 后重建需要时间） */
+  const waitForCalculatorReady = async (signal?: AbortSignal, timeoutMs = 25000) => {
+    const start = Date.now();
+    while (!calculatorRef.current) {
+      if (signal?.aborted) {
+        const err = new Error('Aborted');
+        err.name = 'AbortError';
+        throw err;
+      }
+      if (Date.now() - start > timeoutMs) {
+        throw new Error('3D_CALC_TIMEOUT');
+      }
+      await new Promise<void>(r => setTimeout(r, 120));
+    }
+    return calculatorRef.current;
+  };
+
+  /**
+   * processModel3DFile — OBJ → Desmos 3D triangle / 线框，写入 3D 计算器
+   */
+  const processModel3DFile = async (file: File) => {
+    const unsupportedKey = unsupportedModelMessage(file);
+    if (unsupportedKey && !isObjFile(file)) {
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        role: 'system',
+        content: t(unsupportedKey),
+        translationKey: unsupportedKey,
+      }]);
+      return;
+    }
+
+    const userMsg: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: `[${t('mode_3d_model')}: ${file.name}]`,
+    };
+    setMessages(prev => [...prev, userMsg]);
+    setIsLoading(true);
+    const task = beginTask();
+    const progressMsgId = (Date.now() + 1).toString();
+
+    try {
+      setMessages(prev => [...prev, {
+        id: progressMsgId,
+        role: 'assistant',
+        content: t('model_3d_processing'),
+        translationKey: 'model_3d_processing',
+        drawingProgressPhase: 'processing',
+      }]);
+
+      // 非 3D 模式时先切到 3D（会重建计算器）
+      if (calculatorMode !== '3d') {
+        onRequestCalculatorMode?.('3d');
+        setMessages(prev => prev.map(m =>
+          m.id === progressMsgId
+            ? { ...m, content: t('model_3d_switching'), translationKey: 'model_3d_switching' }
+            : m,
+        ));
+      }
+
+      const calc = await waitForCalculatorReady(task.signal);
+
+      setMessages(prev => prev.map(m =>
+        m.id === progressMsgId
+          ? { ...m, content: t('model_3d_parsing'), translationKey: 'model_3d_parsing' }
+          : m,
+      ));
+
+      const result = await processObjFileToDesmos3D(file);
+
+      if (task.signal.aborted) return;
+
+      setMessages(prev => prev.map(m =>
+        m.id === progressMsgId
+          ? {
+              ...m,
+              content: t('model_3d_injecting'),
+              translationKey: 'model_3d_injecting',
+              drawingProgressPhase: 'outline',
+              drawingProgressCurrent: 0,
+              drawingProgressTotal: result.expressions.length,
+            }
+          : m,
+      ));
+
+      await applyModel3DExpressionsProgressively(calc, result.expressions, {
+        clearFirst: true,
+        signal: task.signal,
+        onProgress: (current, total) => {
+          setMessages(prev => prev.map(m =>
+            m.id === progressMsgId
+              ? {
+                  ...m,
+                  content: t('model_3d_inject_progress', {
+                    current: String(current),
+                    total: String(total),
+                  }),
+                  translationKey: 'model_3d_inject_progress',
+                  translationParams: { current: String(current), total: String(total) },
+                  drawingProgressCurrent: current,
+                  drawingProgressTotal: total,
+                }
+              : m,
+          ));
+        },
+      });
+
+      const completeKey = result.warning || 'model_3d_complete';
+      const params = {
+        vertices: String(result.vertexCount),
+        faces: String(result.faceCount),
+        triangles: String(result.renderedTriangles),
+        edges: String(result.renderedEdges),
+      };
+
+      setMessages(prev => prev.map(m =>
+        m.id === progressMsgId
+          ? {
+              ...m,
+              content: t(completeKey, params),
+              translationKey: completeKey,
+              translationParams: params,
+              drawingProgressPhase: undefined,
+              drawingProgressCurrent: undefined,
+              drawingProgressTotal: undefined,
+            }
+          : m,
+      ));
+    } catch (error) {
+      if (isAbortError(error)) return;
+      const msg = error instanceof Error ? error.message : String(error);
+      let key = 'model_3d_fail';
+      if (msg === 'OBJ_NO_VERTICES' || msg === 'OBJ_NO_FACES' || msg === 'OBJ_EMPTY') {
+        key = 'model_3d_invalid_obj';
+      } else if (msg === '3D_CALC_TIMEOUT') {
+        key = 'model_3d_calc_timeout';
+      } else if (msg === 'unsupported_3d_format') {
+        key = 'unsupported_3d_format';
+      }
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        role: 'system',
+        content: t(key),
+        translationKey: key,
+      }]);
+    } finally {
+      endTask();
+      setIsLoading(false);
+      flushWorkspace();
+    }
+  };
+
   /**
    * handleFileUpload — 处理文件选择器的 onChange 事件
    *
@@ -1966,6 +2143,22 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
                                     <p className="text-[11px] text-gray-400 truncate">{t('mode_solve_desc')}</p>
                                 </div>
                             </button>
+                            {/* 3D 模型（OBJ） */}
+                            <button
+                                onClick={() => {
+                                    setShowUploadMenu(false);
+                                    model3dFileRef.current?.click();
+                                }}
+                                className="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-teal-50 transition-colors text-left"
+                            >
+                                <span className="w-8 h-8 rounded-xl bg-teal-100 text-teal-700 flex items-center justify-center shrink-0">
+                                    <Box size={15} />
+                                </span>
+                                <div className="min-w-0 flex-1">
+                                    <p className="text-sm text-gray-800" style={{fontWeight:600}}>{t('mode_3d_model')}</p>
+                                    <p className="text-[11px] text-gray-400 truncate">{t('mode_3d_model_desc')}</p>
+                                </div>
+                            </button>
                             <div className="h-2" />
                         </div>
                     )}
@@ -2004,6 +2197,18 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ calculator, onClos
                 <input type="file" ref={solveFileRef} className="hidden"
                     accept="image/png,image/jpeg,image/jpg,image/gif,image/webp,image/bmp,image/tiff,image/avif,image/heic,image/heif"
                     onChange={handleFileUpload} />
+                <input
+                    type="file"
+                    ref={model3dFileRef}
+                    className="hidden"
+                    accept=".obj,model/obj,text/plain"
+                    onChange={async (e) => {
+                      const file = e.target.files?.[0];
+                      e.target.value = '';
+                      if (!file) return;
+                      await processModel3DFile(file);
+                    }}
+                />
 
                 {/* Stop / Send */}
                 {isLoading ? (
