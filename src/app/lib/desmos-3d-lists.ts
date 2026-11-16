@@ -9,7 +9,8 @@
  *   · 参数曲面的 u/v 区间走 parametricDomain3Du/v，而不是 {…} 限制式。
  *
  * 实测结论（Desmos API v1.13，无头渲染验证）：
- *   · 单条表达式内的列表上限 10000 个元素 → 每块 ≤ 9500 个三角形 / ≤ 9800 个顶点。
+ *   · 单条表达式内的列表上限 10000 个元素 → 每块 ≤ 1000 个三角形 / ≤ 1100 个顶点。
+ *     （左侧列表会完整排版每一行，单行列表越大 MathQuill 越慢且超线性：9500→1000 使 3 万面导入从 23 秒降到约 3 秒。所有代码都完整显示，不隐藏不压缩）
  *   · colorLatex 必须经 calculator.setState 写入；setExpression(s) 会丢弃该字段。
  *   · 着色器（colormap）里的列表查表上限约 100 个元素，所以不能拿它做大纹理——
  *     逐面颜色列表才是高精度上色的正解。
@@ -54,9 +55,9 @@ export type ListMeshChunk = {
   Q: number[];
 };
 
-/** Desmos 列表元素上限 10000，留出余量 */
-export const LIST_MAX_TRIANGLES = 9500;
-export const LIST_MAX_VERTICES = 9800;
+/** 每块上限：Desmos 硬上限 10000，但列表 UI 排版随行长超线性变慢，取 1000 兼顾「全部显示」与速度 */
+export const LIST_MAX_TRIANGLES = 1000;
+export const LIST_MAX_VERTICES = 1100;
 
 const fmt = (n: number, digits = 3): string => {
   if (!Number.isFinite(n)) return '0';
@@ -210,10 +211,10 @@ export function chunkToExpressions(
 ): Desmos3DExpression[] {
   const out: Desmos3DExpression[] = [];
   const pt = (p: Vec3) => `\\left(${fmt(p.x)},${fmt(p.y)},${fmt(p.z)}\\right)`;
-  out.push({ id: `${idPrefix}_V`, latex: `V_{${tag}}=${lst(chunk.V.map(pt))}`, hidden: true, secret: true });
-  out.push({ id: `${idPrefix}_A`, latex: `A_{${tag}}=${lst(chunk.A)}`, hidden: true, secret: true });
-  out.push({ id: `${idPrefix}_B`, latex: `B_{${tag}}=${lst(chunk.B)}`, hidden: true, secret: true });
-  out.push({ id: `${idPrefix}_C`, latex: `D_{${tag}}=${lst(chunk.C)}`, hidden: true, secret: true });
+  out.push({ id: `${idPrefix}_V`, latex: `V_{${tag}}=${lst(chunk.V.map(pt))}`, hidden: true });
+  out.push({ id: `${idPrefix}_A`, latex: `A_{${tag}}=${lst(chunk.A)}`, hidden: true });
+  out.push({ id: `${idPrefix}_B`, latex: `B_{${tag}}=${lst(chunk.B)}`, hidden: true });
+  out.push({ id: `${idPrefix}_C`, latex: `D_{${tag}}=${lst(chunk.C)}`, hidden: true });
 
   const unique = new Set(chunk.Q);
   const tri = `\\operatorname{triangle}\\left(V_{${tag}}\\left[A_{${tag}}\\right],V_{${tag}}\\left[B_{${tag}}\\right],V_{${tag}}\\left[D_{${tag}}\\right]\\right)`;
@@ -228,7 +229,7 @@ export function chunkToExpressions(
     return out;
   }
 
-  out.push({ id: `${idPrefix}_Q`, latex: `Q_{${tag}}=${lst(chunk.Q)}`, hidden: true, secret: true });
+  out.push({ id: `${idPrefix}_Q`, latex: `Q_{${tag}}=${lst(chunk.Q)}`, hidden: true });
   out.push({
     id: `${idPrefix}_K`,
     latex:
@@ -236,7 +237,6 @@ export function chunkToExpressions(
       `\\operatorname{mod}\\left(\\operatorname{floor}\\left(Q_{${tag}}/256\\right),256\\right),` +
       `\\operatorname{mod}\\left(Q_{${tag}},256\\right)\\right)`,
     hidden: true,
-    secret: true,
   });
   out.push({
     id: `${idPrefix}_T`,
@@ -390,9 +390,9 @@ export function downgradeColorLatex(expressions: Desmos3DExpression[]): Desmos3D
     groups.forEach((idxs, j) => {
       if (!idxs.length) return;
       const t = `${tag}x${j}`;
-      out.push({ id: `${prefix}_gA${j}`, latex: `A_{${t}}=${lst(idxs.map(i => A[i]))}`, hidden: true, secret: true });
-      out.push({ id: `${prefix}_gB${j}`, latex: `B_{${t}}=${lst(idxs.map(i => B[i]))}`, hidden: true, secret: true });
-      out.push({ id: `${prefix}_gC${j}`, latex: `D_{${t}}=${lst(idxs.map(i => C[i]))}`, hidden: true, secret: true });
+      out.push({ id: `${prefix}_gA${j}`, latex: `A_{${t}}=${lst(idxs.map(i => A[i]))}`, hidden: true });
+      out.push({ id: `${prefix}_gB${j}`, latex: `B_{${t}}=${lst(idxs.map(i => B[i]))}`, hidden: true });
+      out.push({ id: `${prefix}_gC${j}`, latex: `D_{${t}}=${lst(idxs.map(i => C[i]))}`, hidden: true });
       out.push({
         id: `${prefix}_gT${j}`,
         latex:
@@ -439,7 +439,8 @@ export async function applyDesmos3DExpressions(
 ): Promise<void> {
   if (!calculator || !expressions.length) return;
   let exprs = expressions;
-  const batchSize = Math.max(1, options?.batchSize ?? 7);
+  // 左侧列表会完整显示每一行：分批 setState 的代价是 O(批数²)（实测 3 万面 70~130 秒），所以只分约 4 批
+  const batchSize = Math.max(1, options?.batchSize ?? Math.max(7, Math.ceil(exprs.length / 4)));
   const signal = options?.signal;
   const canState = typeof calculator.getState === 'function' && typeof calculator.setState === 'function';
 

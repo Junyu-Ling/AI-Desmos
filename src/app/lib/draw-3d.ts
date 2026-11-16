@@ -10,7 +10,7 @@
  *      再叠加明度浮雕（深色描边微微凸起）→ 平滑的充气立体，而不是方块。
  *   3. 前后两张高度场曲面在轮廓处自然闭合；顶点共享，三角面逐个着色。
  *   4. 全部写成「顶点列表 + 索引列表 + 颜色列表」，每块一条 triangle(V[A],V[B],V[D])，
- *      25 万个三角面约 30 个块。
+ *      3 万个三角面约 30 个块。
  */
 
 import type { Desmos3DExpression } from './desmos-3d-lists';
@@ -37,8 +37,8 @@ export type Draw3DOptions = {
 };
 
 const DEFAULT_GRID = 640;
-// 预算只是安全阀，不再是画质瓶颈：Desmos 列表按 9500 面/块自动分块，块数没有硬上限
-const DEFAULT_MAX_TRIANGLES = 250000;
+// 预算由「全部代码完整显示在列表里」的导入速度决定：约 3 万面、约 30 块
+const DEFAULT_MAX_TRIANGLES = 30000;
 const DEFAULT_DEPTH = 2.8;
 const BACK_SCALE = 0.7;
 const BACK_SHADE = 0.85;
@@ -685,7 +685,7 @@ export async function processEmojiToDesmos3D(
   const imageData = ctx.getImageData(0, 0, size, size);
   return buildRelief(imageData.data, size, size, {
     gridMax: 640,
-    maxTriangles: 250000,
+    maxTriangles: 30000,
     baseDepth: 3.2,
     ...options,
   });
