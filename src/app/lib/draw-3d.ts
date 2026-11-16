@@ -630,12 +630,12 @@ export async function processEmojiToDesmos3D(
   const size = 768;
   const big = 1536;
   const failed: Draw3DResult = {
-    expressions: [],
-    regionCount: 0,
-    triangleCount: 0,
-    colorCount: 0,
-    explanation: 'draw_3d_fail',
-  };
+      expressions: [],
+      regionCount: 0,
+      triangleCount: 0,
+      colorCount: 0,
+      explanation: 'draw_3d_fail',
+    };
 
   // 1) 在大画布上用较小字号绘制（不同系统的 Emoji 字形大小差异很大，避免被裁切）
   const src = document.createElement('canvas');

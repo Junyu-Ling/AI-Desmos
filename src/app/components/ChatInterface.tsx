@@ -1641,7 +1641,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
   /**
    * processModel3DFile — OBJ(+MTL) → 高保真 Desmos 3D，写入 3D 计算器
    */
-  const processModel3DFile = async (file: File, mtlFile?: File | null) => {
+  const processModel3DFile = async (file: File, mtlFile?: File | null, textureFiles: File[] = []) => {
     const unsupportedKey = unsupportedModelMessage(file);
     if (unsupportedKey && !isObjFile(file)) {
       setMessages(prev => [...prev, {
@@ -1653,7 +1653,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
       return;
     }
 
-    const label = mtlFile ? `${file.name} + ${mtlFile.name}` : file.name;
+    const label = [file.name, mtlFile?.name, textureFiles.length ? `+${textureFiles.length} tex` : null]
+      .filter(Boolean)
+      .join(' + ');
     const userMsg: Message = {
       id: Date.now().toString(),
       role: 'user',
@@ -1691,7 +1693,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
           : m,
       ));
 
-      const result = await processObjFileToDesmos3D(file, { mtlFile: mtlFile ?? null });
+      const result = await processObjFileToDesmos3D(file, { mtlFile: mtlFile ?? null, textureFiles });
 
       if (task.signal.aborted) return;
 
@@ -2328,7 +2330,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
                     type="file"
                     ref={model3dFileRef}
                     className="hidden"
-                    accept=".obj,.mtl,model/obj,text/plain"
+                    accept=".obj,.mtl,model/obj,text/plain,image/png,image/jpeg,image/webp,image/bmp"
                     multiple
                     onChange={async (e) => {
                       const files = e.target.files ? Array.from(e.target.files) : [];
@@ -2344,7 +2346,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
                         }]);
                         return;
                       }
-                      await processModel3DFile(paired.obj, paired.mtl);
+                      await processModel3DFile(paired.obj, paired.mtl, paired.textures);
                     }}
                 />
 

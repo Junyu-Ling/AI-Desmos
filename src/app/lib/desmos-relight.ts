@@ -151,7 +151,11 @@ export function relightFaceColors(
 
     const r = lin[(q >> 16) & 255], g = lin[(q >> 8) & 255], bl = lin[q & 255];
     // 掠射面（几乎侧对相机）光照表采样不可靠、也不该强行校正：向原色过渡
+    // 掠射面（几乎侧对相机）光照表采样不可靠、也不该强行校正：向原色过渡
     const w = smoothstep(0.2, 0.55, Math.abs(sz));
+    // 落在镜面高光斑里（A 很大）时，加性的高光压不掉：强行校正只会得到灰白色斑块，
+    // 不如保留原色，让它呈现自然的「带色高光」——所以按 A 的大小向原色过渡。
+    const natural = smoothstep(0.04, 0.16, A);
     const raw = [(r * m2 - A) / kk, (g * m2 - A) / kk, (bl * m2 - A) / kk];
     const inRange = raw.every(v => v >= 0 && v <= 1);
     let rr: number, gg: number, bb: number;
@@ -166,10 +170,11 @@ export function relightFaceColors(
       gg = Math.min(1, g * gain);
       bb = Math.min(1, bl * gain);
     }
+    const wt = w * (1 - natural); // 校正权重
     out[f] =
-      (Math.round(toSrgb(rr * w + r * (1 - w))) << 16) |
-      (Math.round(toSrgb(gg * w + g * (1 - w))) << 8) |
-      Math.round(toSrgb(bb * w + bl * (1 - w)));
+      (Math.round(toSrgb(rr * wt + r * (1 - wt))) << 16) |
+      (Math.round(toSrgb(gg * wt + g * (1 - wt))) << 8) |
+      Math.round(toSrgb(bb * wt + bl * (1 - wt)));
   }
   return out;
 }

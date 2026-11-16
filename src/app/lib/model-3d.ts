@@ -21,6 +21,14 @@ import {
   type Desmos3DExpression,
 } from './desmos-3d-lists';
 import { simplifyMesh } from './mesh-simplify';
+import {
+  buildTexturedTriangles,
+  loadTextureImages,
+  parseMtlTextures,
+  isImageFile,
+  type TextureImage,
+  type TextureMap,
+} from './obj-texture';
 
 export type { Desmos3DExpression } from './desmos-3d-lists';
 export type Vec3 = { x: number; y: number; z: number };
@@ -32,6 +40,14 @@ export type Mesh3D = {
   triangles: [number, number, number][];
   /** 每三角面颜色（#rrggbb）；缺省时由顶点色/材质回退 */
   faceColors?: (string | null)[];
+  /** vt 表（OBJ 的 vt u v） */
+  uvs?: Array<[number, number]>;
+  /** 每三角面三个角的 vt 下标（-1 = 无） */
+  triangleUV?: Array<[number, number, number]>;
+  /** 每三角面的材质名 */
+  faceMaterials?: (string | null)[];
+  /** 材质名 → 贴图键（来自 MTL 的 map_Kd） */
+  materialTextures?: Map<string, string>;
 };
 
 export type Model3DConvertResult = {
@@ -45,7 +61,7 @@ export type Model3DConvertResult = {
   mode: 'triangles' | 'wireframe' | 'mixed' | 'analytic' | 'hybrid';
   explanation: string;
   warning?: string;
-  colorSource: 'vertex' | 'mtl' | 'none' | 'mixed';
+  colorSource: 'vertex' | 'mtl' | 'none' | 'mixed' | 'texture';
 };
 
 /** 折叠后的三角形预算（每块 ≤ 9500，约 3 块） */
@@ -148,11 +164,19 @@ export function parseMtl(text: string): MtlLibrary {
  * - usemtl / mtllib（mtllib 名仅记录；颜色靠外部 MTL）
  * - f 扇形三角化
  */
-export function parseObj(text: string, materials?: MtlLibrary): Mesh3D & { mtllibNames: string[] } {
+export function parseObj(
+  text: string,
+  materials?: MtlLibrary,
+  materialTextures?: Map<string, string>,
+): Mesh3D & { mtllibNames: string[] } {
   const vertices: Vec3[] = [];
   const vertexColors: Array<{ r: number; g: number; b: number } | null> = [];
   const triangles: [number, number, number][] = [];
   const faceColors: (string | null)[] = [];
+  const uvs: Array<[number, number]> = [];
+  const triangleUV: Array<[number, number, number]> = [];
+  const faceMaterials: (string | null)[] = [];
+  let activeMaterial: string | null = null;
   const mtllibNames: string[] = [];
   let activeColor: string | null = null;
   let sawVertexColor = false;
@@ -171,14 +195,25 @@ export function parseObj(text: string, materials?: MtlLibrary): Mesh3D & { mtlli
 
     if (line.toLowerCase().startsWith('usemtl ')) {
       const name = line.slice(7).trim();
+      activeMaterial = name;
       if (materials?.has(name)) {
         activeColor = materials.get(name)!;
         sawMtlColor = true;
-      } else {
-        // 无 MTL 时用材质名哈希出稳定色，避免整模单色
+      } else if (materials) {
+        // 给了 MTL 却找不到该材质：用材质名哈希出稳定色以区分部件
         activeColor = hashNameToColor(name);
         sawMtlColor = true;
+      } else {
+        // 没有 MTL：材质名无法还原真实颜色，随机哈希色只会显得「古怪」→ 统一用默认色
+        activeColor = null;
       }
+      continue;
+    }
+
+    if (line.startsWith('vt ')) {
+      const parts = line.slice(3).trim().split(/\s+/);
+      const u = Number(parts[0]), v = Number(parts[1] ?? 0);
+      uvs.push([Number.isFinite(u) ? u : 0, Number.isFinite(v) ? v : 0]);
       continue;
     }
 
@@ -204,18 +239,28 @@ export function parseObj(text: string, materials?: MtlLibrary): Mesh3D & { mtlli
     if (line.startsWith('f ')) {
       const parts = line.slice(2).trim().split(/\s+/);
       const idxs: number[] = [];
+      const uvIdx: number[] = [];
       for (const part of parts) {
-        const token = part.split('/')[0];
-        const n = Number(token);
+        const seg = part.split('/');
+        const n = Number(seg[0]);
         if (!Number.isFinite(n) || n === 0) continue;
         const idx = n < 0 ? vertices.length + n : n - 1;
         if (idx < 0 || idx >= vertices.length) continue;
         idxs.push(idx);
+        const tn = seg[1] ? Number(seg[1]) : NaN;
+        let ti = -1;
+        if (Number.isFinite(tn) && tn !== 0) {
+          ti = tn < 0 ? uvs.length + tn : tn - 1;
+          if (ti < 0 || ti >= uvs.length) ti = -1;
+        }
+        uvIdx.push(ti);
       }
       if (idxs.length < 3) continue;
       for (let i = 1; i < idxs.length - 1; i++) {
         triangles.push([idxs[0], idxs[i], idxs[i + 1]]);
+        triangleUV.push([uvIdx[0], uvIdx[i], uvIdx[i + 1]]);
         faceColors.push(activeColor);
+        faceMaterials.push(activeMaterial);
       }
     }
   }
@@ -245,6 +290,10 @@ export function parseObj(text: string, materials?: MtlLibrary): Mesh3D & { mtlli
     vertexColors: hasAnyVertColor ? vertexColors : undefined,
     triangles,
     faceColors: resolvedFaceColors,
+    uvs: uvs.length ? uvs : undefined,
+    triangleUV: uvs.length ? triangleUV : undefined,
+    faceMaterials,
+    materialTextures,
     mtllibNames,
   };
 }
@@ -261,7 +310,12 @@ function hashNameToColor(name: string): string {
 export function normalizeMesh(mesh: Mesh3D, halfExtent = TARGET_HALF_EXTENT): Mesh3D {
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-  for (const v of mesh.vertices) {
+  // 只统计被三角面引用的顶点：游离顶点会把包围盒撑大，模型就缩成一小团
+  const used = new Uint8Array(mesh.vertices.length);
+  for (const t of mesh.triangles) { used[t[0]] = 1; used[t[1]] = 1; used[t[2]] = 1; }
+  for (let i = 0; i < mesh.vertices.length; i++) {
+    if (!used[i]) continue;
+    const v = mesh.vertices[i];
     if (v.x < minX) minX = v.x;
     if (v.y < minY) minY = v.y;
     if (v.z < minZ) minZ = v.z;
@@ -279,6 +333,7 @@ export function normalizeMesh(mesh: Mesh3D, halfExtent = TARGET_HALF_EXTENT): Me
   const scale = (2 * halfExtent) / Math.max(sx, sy, sz);
 
   return {
+    ...mesh,
     vertices: mesh.vertices.map(v => ({
       x: (v.x - cx) * scale,
       y: (v.y - cy) * scale,
@@ -501,19 +556,53 @@ function detectColorSource(mesh: Mesh3D): Model3DConvertResult['colorSource'] {
  */
 export function meshToDesmos3D(
   meshIn: Mesh3D,
-  options?: { maxTriangles?: number; maxEdges?: number },
+  options?: { maxTriangles?: number; maxEdges?: number; textures?: TextureMap },
 ): Model3DConvertResult {
   const maxTriangles = options?.maxTriangles ?? MAX_TRIANGLES;
   // OBJ 约定 Y 向上；Desmos 3D 是 Z 向上 → (x,y,z) ↦ (x,−z,y)，模型正面（OBJ +z）朝向默认相机
-  const zUp: Mesh3D = {
+  let zUp: Mesh3D = {
     ...meshIn,
     vertices: meshIn.vertices.map(v => ({ x: v.x, y: -v.z, z: v.y })),
   };
+  // 自动转正：模型「深度」（沿视线）明显大于「宽度」时（车、枪、长条物体），绕竖直轴转 90°，
+  // 让最大的一面朝向相机，而不是正对着枪口/车头看成一小团。
+  {
+    const used = new Uint8Array(zUp.vertices.length);
+    for (const t of zUp.triangles) { used[t[0]] = 1; used[t[1]] = 1; used[t[2]] = 1; }
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    zUp.vertices.forEach((v, i) => {
+      if (!used[i]) return;
+      if (v.x < x0) x0 = v.x;
+      if (v.x > x1) x1 = v.x;
+      if (v.y < y0) y0 = v.y;
+      if (v.y > y1) y1 = v.y;
+    });
+    if (y1 - y0 > 1.35 * (x1 - x0)) {
+      zUp = { ...zUp, vertices: zUp.vertices.map(v => ({ x: -v.y, y: v.x, z: v.z })) };
+    }
+  }
   const mesh = normalizeMesh(zUp);
   const faceCount = mesh.triangles.length;
   const colorSource = detectColorSource(mesh);
 
-  const primitives = detectAnalyticPrimitives(mesh);
+  // 贴图：材质带 map_Kd 且用户一并给了图片 → 按 UV 采样（并细分以带走贴图细节）
+  const faceTexture: Array<TextureImage | null> | null = (() => {
+    const tex = options?.textures;
+    if (!tex || tex.size === 0 || !mesh.uvs || !mesh.triangleUV || !mesh.materialTextures || !mesh.faceMaterials) {
+      return null;
+    }
+    let any = false;
+    const arr = mesh.triangles.map((_, i) => {
+      const mat = mesh.faceMaterials![i];
+      const key = mat ? mesh.materialTextures!.get(mat) : undefined;
+      const img = key ? tex.get(key) ?? null : null;
+      if (img) any = true;
+      return img;
+    });
+    return any ? arr : null;
+  })();
+
+  const primitives = faceTexture ? [] : detectAnalyticPrimitives(mesh);
   if (primitives.length > 0) {
     const analyticExprs = analyticToExpressions(primitives);
     const noteExpr: Desmos3DExpression = {
@@ -553,7 +642,23 @@ export function meshToDesmos3D(
     faceColor[i] = hexToPacked(mesh.faceColors?.[i], fallbackColor);
   });
 
-  const simplified = simplifyMesh({ positions, faces, faceColor }, maxTriangles);
+  let simplified;
+  if (faceTexture) {
+    const textured = buildTexturedTriangles(
+      {
+        positions,
+        triangles: mesh.triangles,
+        uvs: mesh.uvs!,
+        triangleUV: mesh.triangleUV!,
+        faceTexture,
+        fallbackColor: faceColor,
+      },
+      maxTriangles,
+    );
+    simplified = simplifyMesh(textured, maxTriangles);
+  } else {
+    simplified = simplifyMesh({ positions, faces, faceColor }, maxTriangles);
+  }
   const built = meshToListExpressions(simplified.positions, simplified.faces, simplified.faceColor, 'm3d');
   const rendered = built.triangleCount;
 
@@ -591,18 +696,23 @@ export const applyModel3DExpressionsProgressively = applyDesmos3DExpressions;
 export async function processObjTextToDesmos3D(
   objText: string,
   mtlText?: string,
-  options?: { maxTriangles?: number; maxEdges?: number },
+  options?: { maxTriangles?: number; maxEdges?: number; textures?: TextureMap },
 ): Promise<Model3DConvertResult> {
   if (!objText.trim()) throw new Error('OBJ_EMPTY');
   const materials = mtlText ? parseMtl(mtlText) : undefined;
-  const mesh = parseObj(objText, materials);
-  return meshToDesmos3D(mesh, options);
+  const materialTextures = mtlText ? parseMtlTextures(mtlText) : undefined;
+  const mesh = parseObj(objText, materials, materialTextures);
+  const result = await Promise.resolve(meshToDesmos3D(mesh, options));
+  if (options?.textures && options.textures.size > 0 && materialTextures && materialTextures.size > 0) {
+    result.colorSource = 'texture';
+  }
+  return result;
 }
 
 /** 从 File 读入并转换；可选附带 MTL File */
 export async function processObjFileToDesmos3D(
   file: File,
-  options?: { maxTriangles?: number; maxEdges?: number; mtlFile?: File | null },
+  options?: { maxTriangles?: number; maxEdges?: number; mtlFile?: File | null; textureFiles?: File[] },
 ): Promise<Model3DConvertResult> {
   const unsupported = unsupportedModelMessage(file);
   if (unsupported && !isObjFile(file)) {
@@ -614,14 +724,16 @@ export async function processObjFileToDesmos3D(
   if (options?.mtlFile) {
     mtlText = await options.mtlFile.text();
   }
-  return processObjTextToDesmos3D(text, mtlText, options);
+  const textures = options?.textureFiles?.length ? await loadTextureImages(options.textureFiles) : undefined;
+  return processObjTextToDesmos3D(text, mtlText, { ...options, textures });
 }
 
 /** 从多选 FileList 中配对 .obj + .mtl */
-export function pairObjAndMtl(files: File[]): { obj: File; mtl?: File } | null {
+export function pairObjAndMtl(files: File[]): { obj: File; mtl?: File; textures: File[] } | null {
   const list = Array.from(files);
-  const obj = list.find(isObjFile);
+  const obj = list.find(f => f.name.toLowerCase().endsWith('.obj')) ?? list.find(isObjFile);
   if (!obj) return null;
   const mtl = list.find(isMtlFile);
-  return { obj, mtl };
+  const textures = list.filter(f => f !== obj && f !== mtl && isImageFile(f));
+  return { obj, mtl, textures };
 }
