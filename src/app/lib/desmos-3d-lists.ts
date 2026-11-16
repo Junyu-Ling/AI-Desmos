@@ -15,6 +15,8 @@
  *     逐面颜色列表才是高精度上色的正解。
  */
 
+import { relightFaceColors, type RelightOptions } from './desmos-relight';
+
 export type Vec3 = { x: number; y: number; z: number };
 
 export type Desmos3DExpression = {
@@ -246,8 +248,11 @@ export function meshToListExpressions(
   faces: ArrayLike<number>,
   faceColor: ArrayLike<number>,
   idPrefix = 'm3d',
+  relight: RelightOptions | false = {},
 ): { expressions: Desmos3DExpression[]; chunkCount: number; triangleCount: number; colorCount: number } {
-  const chunks = buildListChunks(positions, faces, faceColor);
+  // 抵消 Desmos 默认光照对颜色的扭曲（默认相机下看到的就是原色）
+  const colorsOut = relight === false ? faceColor : relightFaceColors(positions, faces, faceColor, relight);
+  const chunks = buildListChunks(positions, faces, colorsOut);
   const base = randomTag();
   const expressions: Desmos3DExpression[] = [];
   const colors = new Set<number>();

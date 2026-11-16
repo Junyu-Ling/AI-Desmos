@@ -36,7 +36,7 @@ export type Draw3DOptions = {
   mode?: 'both' | 'fill' | 'outline';
 };
 
-const DEFAULT_GRID = 200;
+const DEFAULT_GRID = 320;
 const DEFAULT_MAX_TRIANGLES = 30000;
 const DEFAULT_DEPTH = 2.8;
 const BACK_SCALE = 0.7;
@@ -217,9 +217,9 @@ type ReliefBuild = {
 };
 
 /** 高度场平坦度容差：合并块内部角点偏离双线性插值不得超过它（Desmos 单位） */
-const MERGE_HEIGHT_EPS = 0.012;
+const MERGE_HEIGHT_EPS = 0.02;
 /** 合并块颜色容差（每通道，0–255） */
-const MERGE_COLOR_TOL = 5;
+const MERGE_COLOR_TOL = 6;
 
 function buildReliefAt(
   data: Uint8ClampedArray,
@@ -318,13 +318,57 @@ function buildReliefAt(
     }
   }
 
+  // 轮廓抗锯齿：轮廓角点沿轮廓链做 Taubin 平滑（先收缩后膨胀，几乎不缩小形状），
+  // 把「台阶状」的格子边变成平滑曲线；内部角点保持不动。
+  const cornerX = new Float32Array(cw * (gh + 1));
+  const cornerZ = new Float32Array(cw * (gh + 1));
+  for (let j = 0; j <= gh; j++) for (let i = 0; i <= gw; i++) {
+    cornerX[j * cw + i] = toX(i);
+    cornerZ[j * cw + i] = toY(j);
+  }
+  {
+    const inside = (x: number, y: number) => x >= 0 && y >= 0 && x < gw && y < gh && !cells[y * gw + x].empty;
+    // 轮廓边：两侧恰有一侧在内部
+    const chain: number[][] = new Array(cw * (gh + 1));
+    for (let j = 0; j <= gh; j++) {
+      for (let i = 0; i <= gw; i++) {
+        const ci = j * cw + i;
+        if (!cornerBoundary[ci]) continue;
+        const nb: number[] = [];
+        // 右边 (i,j)-(i+1,j)：上侧格 (i,j-1)，下侧格 (i,j)
+        if (i < gw && inside(i, j - 1) !== inside(i, j)) nb.push(ci + 1);
+        if (i > 0 && inside(i - 1, j - 1) !== inside(i - 1, j)) nb.push(ci - 1);
+        if (j < gh && inside(i - 1, j) !== inside(i, j)) nb.push(ci + cw);
+        if (j > 0 && inside(i - 1, j - 1) !== inside(i, j - 1)) nb.push(ci - cw);
+        chain[ci] = nb;
+      }
+    }
+    const smoothPass = (lambda: number) => {
+      const nx = Float32Array.from(cornerX), nz = Float32Array.from(cornerZ);
+      for (let ci = 0; ci < chain.length; ci++) {
+        const nb = chain[ci];
+        if (!nb || nb.length !== 2) continue;
+        const mx = (cornerX[nb[0]] + cornerX[nb[1]]) / 2;
+        const mz = (cornerZ[nb[0]] + cornerZ[nb[1]]) / 2;
+        nx[ci] = cornerX[ci] + lambda * (mx - cornerX[ci]);
+        nz[ci] = cornerZ[ci] + lambda * (mz - cornerZ[ci]);
+      }
+      cornerX.set(nx);
+      cornerZ.set(nz);
+    };
+    for (let it = 0; it < 4; it++) {
+      smoothPass(0.5);
+      smoothPass(-0.53);
+    }
+  }
+
   const frontCount = cw * (gh + 1);
   const positions = new Float64Array(frontCount * 2 * 3);
   for (let j = 0; j <= gh; j++) {
     for (let i = 0; i <= gw; i++) {
       const ci = j * cw + i;
       // 图像竖立在 xz 平面（z 向上），正面朝 −y（默认相机一侧），厚度沿 y
-      const x = toX(i), up = toY(j);
+      const x = cornerX[ci], up = cornerZ[ci];
       positions[ci * 3] = x;
       positions[ci * 3 + 1] = -cornerH[ci];
       positions[ci * 3 + 2] = up;
@@ -589,7 +633,7 @@ export async function processEmojiToDesmos3D(
 
   const imageData = ctx.getImageData(0, 0, size, size);
   return buildRelief(imageData.data, size, size, {
-    gridMax: 220,
+    gridMax: 320,
     maxTriangles: 30000,
     baseDepth: 3.2,
     ...options,
