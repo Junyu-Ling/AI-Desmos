@@ -5,7 +5,7 @@
  *
  * 【这个组件做什么？】
  * 把 Desmos（在线数学绘图工具）嵌入到应用中。
- *   1. 动态加载 Desmos JavaScript（v1.11，同脚本含 Calculator3D）
+ *   1. 动态加载 Desmos JavaScript（v1.13，同脚本含 Calculator3D）
  *   2. 按 mode 创建 GraphingCalculator（2D）或 Calculator3D（3D）
  *   3. 通过回调把实例交给父组件
  *   4. 监听加载状态；移除试用横幅；容器 resize 时调用 resize()
@@ -37,8 +37,11 @@ interface DesmosCalculatorProps {
 
 const API_KEY = 'dcb31709b452b1cf9dc26972add0fda6';
 
-/** v1.11 主脚本已捆绑 Calculator3D（见官方 3D API docs） */
-const SCRIPT_URL = `https://www.desmos.com/api/v1.11/calculator.js?apiKey=${API_KEY}`;
+/**
+ * v1.13 主脚本已捆绑 Calculator3D，且支持 3D colormap（colorLatex 可引用含 x,y,z 的变量）。
+ * 实测 v1.11 会忽略 colormap，所以升级到 v1.13。
+ */
+const SCRIPT_URL = `https://www.desmos.com/api/v1.13/calculator.js?apiKey=${API_KEY}`;
 
 export const DesmosCalculator: React.FC<DesmosCalculatorProps> = ({
   className = 'w-full h-full',

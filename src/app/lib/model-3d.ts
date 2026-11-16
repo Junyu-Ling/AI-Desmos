@@ -1,16 +1,28 @@
 /**
  * model-3d.ts — OBJ(+MTL) 高保真网格 → Desmos Calculator3D 表达式
  *
- * Desmos 3D 可用原语（官方）：
- *   triangle((x,y,z),...) · sphere(center,r) · segment · vector
- *   单参数曲线 (x(t),y(t),z(t)) · 双参数曲面 (x(u,v),y(u,v),z(u,v))
- *   setExpression({ color, fillOpacity, ... })
+ * 借鉴 The Meadow / Colormap Canyon 两张 Desmos 3D 作品的做法，不再「一个三角形一条表达式」：
  *
- * 策略（无法对任意网格只输出闭式曲面时）：
- *   1) 检测到球/柱/盒 → 解析原语或少量参数曲面
- *   2) 其余 → 自适应保特征减面 + 带颜色的高密度 triangle 批次渐进注入
+ *   1) 检测到球 / 柱 / 盒 → 直接输出解析原语（sphere、参数曲面 (cx+r·cos u, cy+r·sin u, cz+v)…），
+ *      u、v 区间走 parametricDomain3Du/v。
+ *   2) 其余网格 → 焊接重合顶点 → QEM 二次误差边折叠（保形、保轮廓、保色）→
+ *      整张网格编码成顶点列表 V + 索引列表 A/B/D + 逐面颜色列表，
+ *      每块用一条 triangle(V[A],V[B],V[D]) 画出至多 9500 个三角形。
+ *   3) 通过 calculator.setState 注入（colorLatex 只有状态注入才生效）。
+ *
+ * 精度：旧版 2800 条独立三角形（直接丢面、会开洞）→ 现在 30000 个折叠后的着色三角形，
+ *       表达式数量从数千条降到约 7·块数。
  */
 
+import {
+  applyDesmos3DExpressions,
+  hexToPacked,
+  meshToListExpressions,
+  type Desmos3DExpression,
+} from './desmos-3d-lists';
+import { simplifyMesh } from './mesh-simplify';
+
+export type { Desmos3DExpression } from './desmos-3d-lists';
 export type Vec3 = { x: number; y: number; z: number };
 
 export type Mesh3D = {
@@ -20,21 +32,6 @@ export type Mesh3D = {
   triangles: [number, number, number][];
   /** 每三角面颜色（#rrggbb）；缺省时由顶点色/材质回退 */
   faceColors?: (string | null)[];
-};
-
-export type Desmos3DExpression = {
-  id: string;
-  latex?: string;
-  color?: string;
-  fillOpacity?: number;
-  lineOpacity?: number;
-  secret?: boolean;
-  type?: 'text' | 'expression';
-  text?: string;
-  /** 参数域（Desmos 3D parametric） */
-  parametricDomain?: { min: number; max: number };
-  /** u,v 域，部分 API 用数组；写入时尽量兼容 */
-  domain?: { u?: [number, number]; v?: [number, number] };
 };
 
 export type Model3DConvertResult = {
@@ -51,13 +48,13 @@ export type Model3DConvertResult = {
   colorSource: 'vertex' | 'mtl' | 'none' | 'mixed';
 };
 
-/** 高保真面片预算（分批注入，避免一次卡死） */
-export const MAX_TRIANGLES = 2800;
-/** 线框边上限（极端大网格回退） */
-export const MAX_EDGES = 1600;
+/** 折叠后的三角形预算（每块 ≤ 9500，约 3 块） */
+export const MAX_TRIANGLES = 30000;
+/** 兼容旧导出（已不再使用线框回退） */
+export const MAX_EDGES = 0;
 export const TARGET_HALF_EXTENT = 9;
-/** 超过此面数且无法有效减面时再考虑线框 */
-export const WIREFRAME_FACE_THRESHOLD = MAX_TRIANGLES * 8;
+export const WIREFRAME_FACE_THRESHOLD = Number.POSITIVE_INFINITY;
+
 
 const DEFAULT_MESH_COLOR = '#2d70b3';
 
@@ -293,130 +290,6 @@ export function normalizeMesh(mesh: Mesh3D, halfExtent = TARGET_HALF_EXTENT): Me
   };
 }
 
-function sub(a: Vec3, b: Vec3): Vec3 {
-  return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
-}
-function cross(a: Vec3, b: Vec3): Vec3 {
-  return {
-    x: a.y * b.z - a.z * b.y,
-    y: a.z * b.x - a.x * b.z,
-    z: a.x * b.y - a.y * b.x,
-  };
-}
-function len(v: Vec3): number {
-  return Math.hypot(v.x, v.y, v.z);
-}
-function normalize(v: Vec3): Vec3 {
-  const L = len(v) || 1;
-  return { x: v.x / L, y: v.y / L, z: v.z / L };
-}
-function faceNormal(a: Vec3, b: Vec3, c: Vec3): Vec3 {
-  return normalize(cross(sub(b, a), sub(c, a)));
-}
-function faceArea(a: Vec3, b: Vec3, c: Vec3): number {
-  return 0.5 * len(cross(sub(b, a), sub(c, a)));
-}
-function centroid(a: Vec3, b: Vec3, c: Vec3): Vec3 {
-  return { x: (a.x + b.x + c.x) / 3, y: (a.y + b.y + c.y) / 3, z: (a.z + b.z + c.z) / 3 };
-}
-
-/** 自适应保特征抽样：空间分层 + 轮廓边加权 + 曲率加权 */
-export function adaptiveSelectTriangles(
-  mesh: Mesh3D,
-  maxKeep: number,
-): number[] {
-  const n = mesh.triangles.length;
-  if (n <= maxKeep) return Array.from({ length: n }, (_, i) => i);
-
-  const verts = mesh.vertices;
-  const normals: Vec3[] = new Array(n);
-  const areas: number[] = new Array(n);
-  const edgeFaces = new Map<string, number[]>();
-
-  const edgeKey = (i: number, j: number) => (i < j ? `${i}:${j}` : `${j}:${i}`);
-
-  for (let i = 0; i < n; i++) {
-    const [ia, ib, ic] = mesh.triangles[i];
-    const a = verts[ia];
-    const b = verts[ib];
-    const c = verts[ic];
-    normals[i] = faceNormal(a, b, c);
-    areas[i] = faceArea(a, b, c);
-    for (const [u, v] of [[ia, ib], [ib, ic], [ic, ia]] as [number, number][]) {
-      const k = edgeKey(u, v);
-      const list = edgeFaces.get(k);
-      if (list) list.push(i);
-      else edgeFaces.set(k, [i]);
-    }
-  }
-
-  const curvature = new Float32Array(n);
-  const silhouette = new Uint8Array(n);
-  for (const faces of edgeFaces.values()) {
-    if (faces.length === 1) {
-      silhouette[faces[0]] = 1;
-      continue;
-    }
-    if (faces.length === 2) {
-      const [f0, f1] = faces;
-      const dot =
-        normals[f0].x * normals[f1].x +
-        normals[f0].y * normals[f1].y +
-        normals[f0].z * normals[f1].z;
-      const ang = 1 - Math.max(-1, Math.min(1, dot));
-      curvature[f0] += ang;
-      curvature[f1] += ang;
-    }
-  }
-
-  const scores = new Float64Array(n);
-  let maxScore = 0;
-  for (let i = 0; i < n; i++) {
-    const sil = silhouette[i] ? 2.8 : 1;
-    const curv = 1 + curvature[i] * 2.2;
-    const areaTerm = Math.sqrt(Math.max(areas[i], 1e-12));
-    scores[i] = areaTerm * curv * sil;
-    if (scores[i] > maxScore) maxScore = scores[i];
-  }
-
-  // 空间分层：保证全身覆盖，不只留大面
-  const BINS = 10;
-  const binLists: number[][] = Array.from({ length: BINS * BINS * BINS }, () => []);
-  for (let i = 0; i < n; i++) {
-    const [ia, ib, ic] = mesh.triangles[i];
-    const c = centroid(verts[ia], verts[ib], verts[ic]);
-    const bx = Math.min(BINS - 1, Math.max(0, Math.floor(((c.x + 10) / 20) * BINS)));
-    const by = Math.min(BINS - 1, Math.max(0, Math.floor(((c.y + 10) / 20) * BINS)));
-    const bz = Math.min(BINS - 1, Math.max(0, Math.floor(((c.z + 10) / 20) * BINS)));
-    binLists[bx * BINS * BINS + by * BINS + bz].push(i);
-  }
-
-  const selected = new Set<number>();
-  const occupied = binLists.filter(b => b.length > 0);
-  const perBin = Math.max(2, Math.floor(maxKeep / Math.max(1, occupied.length)));
-
-  for (const bin of occupied) {
-    bin.sort((a, b) => scores[b] - scores[a]);
-    for (let k = 0; k < Math.min(perBin, bin.length); k++) {
-      selected.add(bin[k]);
-      if (selected.size >= maxKeep) break;
-    }
-    if (selected.size >= maxKeep) break;
-  }
-
-  if (selected.size < maxKeep) {
-    const rest = Array.from({ length: n }, (_, i) => i)
-      .filter(i => !selected.has(i))
-      .sort((a, b) => scores[b] - scores[a]);
-    for (const i of rest) {
-      selected.add(i);
-      if (selected.size >= maxKeep) break;
-    }
-  }
-
-  return Array.from(selected).sort((a, b) => a - b);
-}
-
 type AnalyticPrimitive =
   | { kind: 'sphere'; center: Vec3; radius: number; color: string }
   | { kind: 'box'; min: Vec3; max: Vec3; color: string }
@@ -441,6 +314,10 @@ function averageFaceColor(mesh: Mesh3D): string {
 export function detectAnalyticPrimitives(mesh: Mesh3D): AnalyticPrimitive[] {
   const verts = mesh.vertices;
   if (verts.length < 8) return [];
+
+  // 带有丰富颜色/贴图的模型不能用单色原语替代，否则会丢颜色
+  const distinctColors = new Set((mesh.faceColors || []).filter(Boolean) as string[]);
+  if (distinctColors.size > 2) return [];
 
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
@@ -545,59 +422,6 @@ export function detectAnalyticPrimitives(mesh: Mesh3D): AnalyticPrimitive[] {
   return [];
 }
 
-function triangleLatex(a: Vec3, b: Vec3, c: Vec3): string {
-  return `\\operatorname{triangle}\\left(${fmtPt(a)},${fmtPt(b)},${fmtPt(c)}\\right)`;
-}
-
-function edgeLatex(a: Vec3, b: Vec3): string {
-  const lerp = (pa: number, pb: number) =>
-    `\\left(1-t\\right)\\cdot${fmt(pa)}+t\\cdot${fmt(pb)}`;
-  return `\\left(${lerp(a.x, b.x)},${lerp(a.y, b.y)},${lerp(a.z, b.z)}\\right)`;
-}
-
-function uniqueEdges(triangles: [number, number, number][]): [number, number][] {
-  const seen = new Set<string>();
-  const edges: [number, number][] = [];
-  for (const [a, b, c] of triangles) {
-    for (const [u, v] of [[a, b], [b, c], [c, a]] as [number, number][]) {
-      const lo = Math.min(u, v);
-      const hi = Math.max(u, v);
-      const key = `${lo}:${hi}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      edges.push([lo, hi]);
-    }
-  }
-  return edges;
-}
-
-function sampleIndices(total: number, maxKeep: number): number[] {
-  if (total <= maxKeep) return Array.from({ length: total }, (_, i) => i);
-  const out: number[] = [];
-  for (let i = 0; i < maxKeep; i++) out.push(Math.floor((i * total) / maxKeep));
-  return out;
-}
-
-function boxTriangles(min: Vec3, max: Vec3): Array<[Vec3, Vec3, Vec3]> {
-  const p = (x: number, y: number, z: number): Vec3 => ({ x, y, z });
-  const v000 = p(min.x, min.y, min.z);
-  const v001 = p(min.x, min.y, max.z);
-  const v010 = p(min.x, max.y, min.z);
-  const v011 = p(min.x, max.y, max.z);
-  const v100 = p(max.x, min.y, min.z);
-  const v101 = p(max.x, min.y, max.z);
-  const v110 = p(max.x, max.y, min.z);
-  const v111 = p(max.x, max.y, max.z);
-  return [
-    [v000, v100, v110], [v000, v110, v010],
-    [v001, v011, v111], [v001, v111, v101],
-    [v000, v010, v011], [v000, v011, v001],
-    [v100, v101, v111], [v100, v111, v110],
-    [v000, v001, v101], [v000, v101, v100],
-    [v010, v110, v111], [v010, v111, v011],
-  ];
-}
-
 function analyticToExpressions(primitives: AnalyticPrimitive[]): Desmos3DExpression[] {
   const out: Desmos3DExpression[] = [];
   primitives.forEach((p, i) => {
@@ -606,49 +430,62 @@ function analyticToExpressions(primitives: AnalyticPrimitive[]): Desmos3DExpress
         id: `m3d_sphere_${i}`,
         latex: `\\operatorname{sphere}\\left(${fmtPt(p.center)},${fmt(p.radius)}\\right)`,
         color: p.color,
-        fillOpacity: 0.85,
+        fillOpacity: 1,
       });
       return;
     }
     if (p.kind === 'box') {
-      boxTriangles(p.min, p.max).forEach((tri, j) => {
-        out.push({
-          id: `m3d_box_${i}_${j}`,
-          latex: triangleLatex(tri[0], tri[1], tri[2]),
-          color: p.color,
-          fillOpacity: 0.8,
-        });
-      });
+      // 8 顶点 + 12 三角面 → 一条列表表达式
+      const { min: a, max: b } = p;
+      const pos = [
+        a.x, a.y, a.z, b.x, a.y, a.z, b.x, b.y, a.z, a.x, b.y, a.z,
+        a.x, a.y, b.z, b.x, a.y, b.z, b.x, b.y, b.z, a.x, b.y, b.z,
+      ];
+      const faces = [
+        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4,
+        2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6, 5, 3, 0, 4, 3, 4, 7,
+      ];
+      const col = hexToPacked(p.color, 0x2d70b3);
+      const built = meshToListExpressions(pos, faces, new Array(12).fill(col), `m3d_box${i}`);
+      out.push(...built.expressions);
       return;
     }
-    // cylinder parametric
+    // 圆柱：侧面 + 两端圆盖（均为参数曲面，区间走 parametricDomain3D）
     const { center: c, radius: r, halfLen: h, axis, color } = p;
-    let latex: string;
-    if (axis === 'z') {
-      latex = `\\left(${fmt(c.x)}+${fmt(r)}\\cos\\left(u\\right),${fmt(c.y)}+${fmt(r)}\\sin\\left(u\\right),${fmt(c.z)}+v\\right)`;
-    } else if (axis === 'y') {
-      latex = `\\left(${fmt(c.x)}+${fmt(r)}\\cos\\left(u\\right),${fmt(c.y)}+v,${fmt(c.z)}+${fmt(r)}\\sin\\left(u\\right)\\right)`;
-    } else {
-      latex = `\\left(${fmt(c.x)}+v,${fmt(c.y)}+${fmt(r)}\\cos\\left(u\\right),${fmt(c.z)}+${fmt(r)}\\sin\\left(u\\right)\\right)`;
-    }
+    const side = (u: string, v: string, w: string) =>
+      `\\left(${fmt(c.x)}+${u},${fmt(c.y)}+${v},${fmt(c.z)}+${w}\\right)`;
+    const cu = `${fmt(r)}\\cos\\left(u\\right)`;
+    const su = `${fmt(r)}\\sin\\left(u\\right)`;
+    let sideLatex: string;
+    if (axis === 'z') sideLatex = side(cu, su, 'v');
+    else if (axis === 'y') sideLatex = side(cu, 'v', su);
+    else sideLatex = side('v', cu, su);
     out.push({
       id: `m3d_cyl_${i}`,
-      latex: `${latex}\\left\\{0\\le u\\le2\\pi\\right\\}\\left\\{-${fmt(h)}\\le v\\le${fmt(h)}\\right\\}`,
+      latex: sideLatex,
       color,
-      fillOpacity: 0.8,
+      fillOpacity: 1,
+      parametricDomain3Du: { min: '0', max: '2\\pi' },
+      parametricDomain3Dv: { min: fmt(-h), max: fmt(h) },
     });
+    for (const sign of [-1, 1]) {
+      const rc = 'v\\cos\\left(u\\right)';
+      const rs = 'v\\sin\\left(u\\right)';
+      const off = fmt(sign * h);
+      const capLatex =
+        axis === 'z' ? side(rc, rs, off) : axis === 'y' ? side(rc, off, rs) : side(off, rc, rs);
+      out.push({
+        id: `m3d_cyl_${i}_cap${sign}`,
+        latex: capLatex,
+        color,
+        fillOpacity: 1,
+        parametricDomain3Du: { min: '0', max: '2\\pi' },
+        parametricDomain3Dv: { min: '0', max: fmt(r) },
+      });
+    }
   });
   return out;
 }
-
-const pushBatch = (calculator: any, chunk: Desmos3DExpression[]) => {
-  if (!chunk.length || !calculator) return;
-  if (typeof calculator.setExpressions === 'function') {
-    calculator.setExpressions(chunk);
-    return;
-  }
-  chunk.forEach(expr => calculator.setExpression(expr));
-};
 
 function detectColorSource(mesh: Mesh3D): Model3DConvertResult['colorSource'] {
   const faces = mesh.faceColors || [];
@@ -659,108 +496,88 @@ function detectColorSource(mesh: Mesh3D): Model3DConvertResult['colorSource'] {
 }
 
 /**
- * 网格 → Desmos 3D 表达式（解析原语优先，其余高密度着色三角面）
+ * 网格 → Desmos 3D 表达式
+ * 解析原语优先；其余走 QEM 折叠 + 列表网格编码。
  */
 export function meshToDesmos3D(
   meshIn: Mesh3D,
   options?: { maxTriangles?: number; maxEdges?: number },
 ): Model3DConvertResult {
   const maxTriangles = options?.maxTriangles ?? MAX_TRIANGLES;
-  const maxEdges = options?.maxEdges ?? MAX_EDGES;
-  const mesh = normalizeMesh(meshIn);
+  // OBJ 约定 Y 向上；Desmos 3D 是 Z 向上 → (x,y,z) ↦ (x,−z,y)，模型正面（OBJ +z）朝向默认相机
+  const zUp: Mesh3D = {
+    ...meshIn,
+    vertices: meshIn.vertices.map(v => ({ x: v.x, y: -v.z, z: v.y })),
+  };
+  const mesh = normalizeMesh(zUp);
   const faceCount = mesh.triangles.length;
   const colorSource = detectColorSource(mesh);
-
-  const expressions: Desmos3DExpression[] = [];
-  let renderedTriangles = 0;
-  let renderedEdges = 0;
-  let analyticCount = 0;
-  let mode: Model3DConvertResult['mode'] = 'triangles';
-  let warning: string | undefined;
 
   const primitives = detectAnalyticPrimitives(mesh);
   if (primitives.length > 0) {
     const analyticExprs = analyticToExpressions(primitives);
-    expressions.push(...analyticExprs);
-    analyticCount = analyticExprs.length;
-    mode = 'analytic';
-    // 球/柱/盒已足够表达时不再铺三角面
     const noteExpr: Desmos3DExpression = {
       id: 'm3d_note',
       type: 'text',
       text: `3D analytic · ${primitives.map(p => p.kind).join('+')} · V${mesh.vertices.length} F${faceCount}`,
     };
     return {
-      expressions: [noteExpr, ...expressions],
+      expressions: [noteExpr, ...analyticExprs],
       vertexCount: mesh.vertices.length,
       faceCount,
       triangleCount: faceCount,
       renderedTriangles: 0,
       renderedEdges: 0,
-      analyticCount,
-      mode,
+      analyticCount: analyticExprs.length,
+      mode: 'analytic',
       explanation: 'model_3d_complete_hi',
       colorSource,
     };
   }
 
-  const useWireframe = faceCount > WIREFRAME_FACE_THRESHOLD;
+  // 打包顶点与面颜色
+  const nV = mesh.vertices.length;
+  const positions = new Float64Array(nV * 3);
+  mesh.vertices.forEach((v, i) => {
+    positions[i * 3] = v.x;
+    positions[i * 3 + 1] = v.y;
+    positions[i * 3 + 2] = v.z;
+  });
+  const fallbackColor = hexToPacked(DEFAULT_MESH_COLOR, 0x2d70b3);
+  const faces = new Int32Array(faceCount * 3);
+  const faceColor = new Int32Array(faceCount);
+  mesh.triangles.forEach((t, i) => {
+    faces[i * 3] = t[0];
+    faces[i * 3 + 1] = t[1];
+    faces[i * 3 + 2] = t[2];
+    faceColor[i] = hexToPacked(mesh.faceColors?.[i], fallbackColor);
+  });
 
-  if (useWireframe) {
-    mode = 'wireframe';
-    warning = 'model_3d_wireframe_fallback';
-    const allEdges = uniqueEdges(mesh.triangles);
-    const keep = sampleIndices(allEdges.length, maxEdges);
-    for (let i = 0; i < keep.length; i++) {
-      const [ia, ib] = allEdges[keep[i]];
-      const a = mesh.vertices[ia];
-      const b = mesh.vertices[ib];
-      if (!a || !b) continue;
-      expressions.push({
-        id: `m3d_e_${i}`,
-        latex: edgeLatex(a, b),
-        color: mesh.faceColors?.[keep[i]] || DEFAULT_MESH_COLOR,
-        lineOpacity: 0.9,
-      });
-      renderedEdges++;
-    }
-  } else {
-    const keep = adaptiveSelectTriangles(mesh, maxTriangles);
-    if (keep.length < faceCount) {
-      warning = 'model_3d_decimated_hi';
-      mode = 'mixed';
-    }
-    for (let i = 0; i < keep.length; i++) {
-      const fi = keep[i];
-      const [ia, ib, ic] = mesh.triangles[fi];
-      const a = mesh.vertices[ia];
-      const b = mesh.vertices[ib];
-      const c = mesh.vertices[ic];
-      if (!a || !b || !c) continue;
-      expressions.push({
-        id: `m3d_t_${i}`,
-        latex: triangleLatex(a, b, c),
-        color: mesh.faceColors?.[fi] || DEFAULT_MESH_COLOR,
-        fillOpacity: 0.92,
-      });
-      renderedTriangles++;
-    }
+  const simplified = simplifyMesh({ positions, faces, faceColor }, maxTriangles);
+  const built = meshToListExpressions(simplified.positions, simplified.faces, simplified.faceColor, 'm3d');
+  const rendered = built.triangleCount;
+
+  let mode: Model3DConvertResult['mode'] = 'triangles';
+  let warning: string | undefined;
+  if (rendered < faceCount) {
+    mode = 'mixed';
+    warning = 'model_3d_decimated_hi';
   }
 
   const noteExpr: Desmos3DExpression = {
     id: 'm3d_note',
     type: 'text',
-    text: `3D mesh · V${mesh.vertices.length} F${faceCount} → tri ${renderedTriangles} / edge ${renderedEdges} · color:${colorSource}`,
+    text: `3D mesh · V${nV} F${faceCount} → QEM ${rendered} tri · ${built.chunkCount} list blocks · ${built.colorCount} colors`,
   };
 
   return {
-    expressions: [noteExpr, ...expressions],
-    vertexCount: mesh.vertices.length,
+    expressions: [noteExpr, ...built.expressions],
+    vertexCount: nV,
     faceCount,
     triangleCount: faceCount,
-    renderedTriangles,
-    renderedEdges,
-    analyticCount,
+    renderedTriangles: rendered,
+    renderedEdges: 0,
+    analyticCount: 0,
     mode,
     explanation: 'model_3d_complete_hi',
     warning,
@@ -768,39 +585,8 @@ export function meshToDesmos3D(
   };
 }
 
-/** 渐进写入：小批次 + 间歇让出主线程 */
-export async function applyModel3DExpressionsProgressively(
-  calculator: any,
-  expressions: Desmos3DExpression[],
-  options?: {
-    clearFirst?: boolean;
-    batchSize?: number;
-    signal?: AbortSignal;
-    onProgress?: (current: number, total: number) => void;
-  },
-): Promise<void> {
-  if (!calculator || !expressions.length) return;
-  const batchSize = options?.batchSize ?? 35;
-  const signal = options?.signal;
-
-  if (options?.clearFirst !== false) {
-    calculator.setBlank?.();
-  }
-
-  for (let i = 0; i < expressions.length; i += batchSize) {
-    if (signal?.aborted) {
-      const err = new Error('Aborted');
-      err.name = 'AbortError';
-      throw err;
-    }
-    const chunk = expressions.slice(i, i + batchSize);
-    pushBatch(calculator, chunk);
-    options?.onProgress?.(Math.min(i + chunk.length, expressions.length), expressions.length);
-    // 大批次时稍作停顿，降低 Desmos 渲染峰值
-    const pause = expressions.length > 1200 ? 12 : expressions.length > 600 ? 6 : 0;
-    await new Promise<void>(r => setTimeout(r, pause));
-  }
-}
+/** 渐进写入（getState / setState，以便 colorLatex 与参数区间生效） */
+export const applyModel3DExpressionsProgressively = applyDesmos3DExpressions;
 
 export async function processObjTextToDesmos3D(
   objText: string,

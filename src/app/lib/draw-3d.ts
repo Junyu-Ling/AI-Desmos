@@ -1,15 +1,20 @@
 /**
  * draw-3d.ts — 2D 图像 / Emoji → Desmos Calculator3D 立体重建
  *
- * 策略（非平面贴图）：
- *   1. 量化颜色网格 → 贪心合并同色矩形
- *   2. 每个色块挤出为棱柱（顶/底三角面 + 侧壁），高度随明度/区域变化
- *   3. 轮廓边界生成窄带竖墙（ribbon），保留描边色
- *   4. 预算控制 + 与 model-3d 相同的渐进注入接口
+ * 旧版：56×56 网格 → 贪心合并同色矩形 → 每个色块挤出成方柱（棱角分明、细节全丢）。
+ *
+ * 新版（借鉴 Colormap Canyon「高度场」与 The Meadow「列表 + 逐元素颜色」）：
+ *   1. 约 110×110 的单元格，每格取抗锯齿中位色（几乎 1:1 保留原图颜色）；
+ *      背景用「从边界泛洪」识别，所以眼白、高光这类内部白色不会被挖空。
+ *   2. 对前景做距离变换，高度场 h = T·√(1−(1−d/R)²)（圆润的「充气」截面）
+ *      再叠加明度浮雕（深色描边微微凸起）→ 平滑的充气立体，而不是方块。
+ *   3. 前后两张高度场曲面在轮廓处自然闭合；顶点共享，三角面逐个着色。
+ *   4. 全部写成「顶点列表 + 索引列表 + 颜色列表」，每块一条 triangle(V[A],V[B],V[D])，
+ *      3 万个三角面只需约 20 条表达式。
  */
 
-import type { Desmos3DExpression } from './model-3d';
-import { applyModel3DExpressionsProgressively } from './model-3d';
+import type { Desmos3DExpression } from './desmos-3d-lists';
+import { applyDesmos3DExpressions, meshToListExpressions, packRgb } from './desmos-3d-lists';
 
 export type Draw3DResult = {
   expressions: Desmos3DExpression[];
@@ -20,112 +25,85 @@ export type Draw3DResult = {
 };
 
 export type Draw3DOptions = {
-  /** 长边网格分辨率（越大越贴图，表达式越多） */
+  /** 长边网格分辨率（越大越贴图） */
   gridMax?: number;
   /** 三角面预算 */
   maxTriangles?: number;
-  /** 挤出基础厚度（Desmos 单位） */
+  /** 最大厚度（Desmos 单位） */
   baseDepth?: number;
-  /** 是否生成侧壁与描边墙 */
+  /** 兼容旧参数 */
   includeWalls?: boolean;
   mode?: 'both' | 'fill' | 'outline';
 };
 
-const DEFAULT_GRID = 56;
-const DEFAULT_MAX_TRIANGLES = 2200;
-const DEFAULT_DEPTH = 2.4;
-
-const fmt = (n: number): string => {
-  if (!Number.isFinite(n)) return '0';
-  const t = Math.round(n * 1e4) / 1e4;
-  return Object.is(t, -0) ? '0' : String(t);
-};
-
-const fmtPt = (x: number, y: number, z: number) =>
-  `\\left(${fmt(x)},${fmt(y)},${fmt(z)}\\right)`;
-
-const triangleLatex = (
-  ax: number, ay: number, az: number,
-  bx: number, by: number, bz: number,
-  cx: number, cy: number, cz: number,
-) =>
-  `\\operatorname{triangle}\\left(${fmtPt(ax, ay, az)},${fmtPt(bx, by, bz)},${fmtPt(cx, cy, cz)}\\right)`;
-
-const rgbToHex = (r: number, g: number, b: number): string => {
-  const to = (v: number) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0');
-  return `#${to(r)}${to(g)}${to(b)}`;
-};
-
-const isBackground = (r: number, g: number, b: number, a: number): boolean => {
-  if (a < 28) return true;
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  // 近白底
-  return min >= 245 && max - min <= 12;
-};
-
-const quantizeKey = (r: number, g: number, b: number): number =>
-  ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+const DEFAULT_GRID = 200;
+const DEFAULT_MAX_TRIANGLES = 30000;
+const DEFAULT_DEPTH = 2.8;
+const BACK_SCALE = 0.7;
+const BACK_SHADE = 0.85;
 
 type Cell = {
-  key: number;
   r: number;
   g: number;
   b: number;
   empty: boolean;
 };
 
-type RectRegion = {
-  x0: number;
-  y0: number;
-  x1: number; // exclusive
-  y1: number;
-  r: number;
-  g: number;
-  b: number;
+const luminance = (r: number, g: number, b: number): number =>
+  (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+
+const isNearWhite = (r: number, g: number, b: number): boolean =>
+  Math.min(r, g, b) >= 243 && Math.max(r, g, b) - Math.min(r, g, b) <= 14;
+
+const quant5 = (r: number, g: number, b: number): number =>
+  ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+
+const median = (arr: number[]): number => {
+  const s = [...arr].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
 };
 
-/** 从 ImageData 建量化网格（跳过背景） */
-function buildColorGrid(
+/** 采样成单元格，识别背景（透明 / 与边界相连的近白） */
+function buildCells(
   data: Uint8ClampedArray,
   width: number,
   height: number,
   gridMax: number,
-): { cells: Cell[]; gw: number; gh: number; cellW: number; cellH: number } {
+): { cells: Cell[]; gw: number; gh: number } {
   const scale = gridMax / Math.max(width, height);
   const gw = Math.max(8, Math.round(width * scale));
   const gh = Math.max(8, Math.round(height * scale));
   const cellW = width / gw;
   const cellH = height / gh;
+
   const cells: Cell[] = new Array(gw * gh);
+  const candidateBg = new Uint8Array(gw * gh);
 
   for (let gy = 0; gy < gh; gy++) {
     for (let gx = 0; gx < gw; gx++) {
       const x0 = Math.floor(gx * cellW);
       const y0 = Math.floor(gy * cellH);
-      const x1 = Math.min(width, Math.ceil((gx + 1) * cellW));
-      const y1 = Math.min(height, Math.ceil((gy + 1) * cellH));
+      const x1 = Math.max(x0 + 1, Math.min(width, Math.ceil((gx + 1) * cellW)));
+      const y1 = Math.max(y0 + 1, Math.min(height, Math.ceil((gy + 1) * cellH)));
+      const stepX = Math.max(1, Math.floor((x1 - x0) / 5));
+      const stepY = Math.max(1, Math.floor((y1 - y0) / 5));
 
-      // 中位数采样（抗锯齿更稳）
       const rs: number[] = [];
       const gs: number[] = [];
       const bs: number[] = [];
-      let bg = 0;
       let total = 0;
-      const stepX = Math.max(1, Math.floor((x1 - x0) / 4));
-      const stepY = Math.max(1, Math.floor((y1 - y0) / 4));
+      let transparent = 0;
+      let white = 0;
       for (let y = y0; y < y1; y += stepY) {
         for (let x = x0; x < x1; x += stepX) {
           const i = (y * width + x) * 4;
-          const r = data[i];
-          const g = data[i + 1];
-          const b = data[i + 2];
-          const a = data[i + 3];
           total++;
-          if (isBackground(r, g, b, a)) {
-            bg++;
+          if (data[i + 3] < 28) {
+            transparent++;
             continue;
           }
+          const r = data[i], g = data[i + 1], b = data[i + 2];
+          if (isNearWhite(r, g, b)) white++;
           rs.push(r);
           gs.push(g);
           bs.push(b);
@@ -133,308 +111,376 @@ function buildColorGrid(
       }
 
       const idx = gy * gw + gx;
-      if (rs.length === 0 || bg / Math.max(1, total) > 0.72) {
-        cells[idx] = { key: -1, r: 255, g: 255, b: 255, empty: true };
+      if (rs.length === 0) {
+        cells[idx] = { r: 255, g: 255, b: 255, empty: true };
+        candidateBg[idx] = 1;
         continue;
       }
-      const mid = (arr: number[]) => {
-        const s = [...arr].sort((a, b) => a - b);
-        return s[Math.floor(s.length / 2)];
-      };
-      const r = mid(rs);
-      const g = mid(gs);
-      const b = mid(bs);
-      cells[idx] = { key: quantizeKey(r, g, b), r, g, b, empty: false };
+      const r = median(rs), g = median(gs), b = median(bs);
+      cells[idx] = { r, g, b, empty: false };
+      if (transparent / Math.max(1, total) > 0.72 || white / Math.max(1, total) > 0.72) {
+        candidateBg[idx] = 1;
+      }
     }
   }
 
-  return { cells, gw, gh, cellW, cellH };
+  // 从边界泛洪：只有与图像边界相连的背景候选格才是真正的背景
+  const bg = new Uint8Array(gw * gh);
+  const stack: number[] = [];
+  const seed = (x: number, y: number) => {
+    const i = y * gw + x;
+    if (candidateBg[i] && !bg[i]) {
+      bg[i] = 1;
+      stack.push(i);
+    }
+  };
+  for (let x = 0; x < gw; x++) {
+    seed(x, 0);
+    seed(x, gh - 1);
+  }
+  for (let y = 0; y < gh; y++) {
+    seed(0, y);
+    seed(gw - 1, y);
+  }
+  while (stack.length) {
+    const i = stack.pop()!;
+    const x = i % gw, y = (i / gw) | 0;
+    if (x > 0) seed(x - 1, y);
+    if (x < gw - 1) seed(x + 1, y);
+    if (y > 0) seed(x, y - 1);
+    if (y < gh - 1) seed(x, y + 1);
+  }
+  for (let i = 0; i < cells.length; i++) {
+    if (bg[i]) cells[i].empty = true;
+  }
+
+  // 去掉孤立的单格噪点
+  for (let y = 0; y < gh; y++) {
+    for (let x = 0; x < gw; x++) {
+      const i = y * gw + x;
+      if (cells[i].empty) continue;
+      const n =
+        (x > 0 && !cells[i - 1].empty ? 1 : 0) +
+        (x < gw - 1 && !cells[i + 1].empty ? 1 : 0) +
+        (y > 0 && !cells[i - gw].empty ? 1 : 0) +
+        (y < gh - 1 && !cells[i + gw].empty ? 1 : 0);
+      if (n === 0) cells[i].empty = true;
+    }
+  }
+
+  return { cells, gw, gh };
 }
 
-/** 贪心矩形合并（同色连通） */
-function greedyMeshRects(cells: Cell[], gw: number, gh: number): RectRegion[] {
-  const used = new Uint8Array(gw * gh);
-  const rects: RectRegion[] = [];
+/** 到最近空格的距离（3-4 倒角距离，单位：格） */
+function distanceToEmpty(cells: Cell[], gw: number, gh: number): Float32Array {
+  const INF = 1e9;
+  const d = new Float32Array(gw * gh);
+  for (let i = 0; i < d.length; i++) d[i] = cells[i].empty ? 0 : INF;
+  const at = (x: number, y: number): number => (x < 0 || y < 0 || x >= gw || y >= gh ? 0 : d[y * gw + x]);
+  for (let y = 0; y < gh; y++) {
+    for (let x = 0; x < gw; x++) {
+      const i = y * gw + x;
+      if (d[i] === 0) continue;
+      d[i] = Math.min(
+        d[i],
+        at(x - 1, y) + 1,
+        at(x, y - 1) + 1,
+        at(x - 1, y - 1) + 1.4142,
+        at(x + 1, y - 1) + 1.4142,
+      );
+    }
+  }
+  for (let y = gh - 1; y >= 0; y--) {
+    for (let x = gw - 1; x >= 0; x--) {
+      const i = y * gw + x;
+      if (d[i] === 0) continue;
+      d[i] = Math.min(
+        d[i],
+        at(x + 1, y) + 1,
+        at(x, y + 1) + 1,
+        at(x + 1, y + 1) + 1.4142,
+        at(x - 1, y + 1) + 1.4142,
+      );
+    }
+  }
+  return d;
+}
 
+type ReliefBuild = {
+  positions: Float64Array;
+  faces: Int32Array;
+  faceColor: Int32Array;
+  insideCells: number;
+  colorSet: Set<number>;
+  gw: number;
+  gh: number;
+};
+
+/** 高度场平坦度容差：合并块内部角点偏离双线性插值不得超过它（Desmos 单位） */
+const MERGE_HEIGHT_EPS = 0.012;
+/** 合并块颜色容差（每通道，0–255） */
+const MERGE_COLOR_TOL = 5;
+
+function buildReliefAt(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  gridMax: number,
+  options: Draw3DOptions,
+): ReliefBuild {
+  const baseDepth = options.baseDepth ?? DEFAULT_DEPTH;
+  const mode = options.mode ?? 'both';
+  const { cells, gw, gh } = buildCells(data, width, height, gridMax);
+
+  // 仅描边模式：只保留轮廓与深色线条格
+  if (mode === 'outline') {
+    const keep = new Uint8Array(gw * gh);
+    for (let y = 0; y < gh; y++) {
+      for (let x = 0; x < gw; x++) {
+        const i = y * gw + x;
+        const c = cells[i];
+        if (c.empty) continue;
+        const dark = luminance(c.r, c.g, c.b) < 0.38;
+        const rim =
+          x === 0 || y === 0 || x === gw - 1 || y === gh - 1 ||
+          cells[i - 1].empty || cells[i + 1].empty || cells[i - gw].empty || cells[i + gw].empty;
+        if (dark || rim) keep[i] = 1;
+      }
+    }
+    for (let i = 0; i < cells.length; i++) if (!keep[i]) cells[i].empty = true;
+  }
+
+  const aspect = width / height;
+  const halfX = aspect >= 1 ? 10 : 10 * aspect;
+  const halfY = aspect >= 1 ? 10 / aspect : 10;
+  const toX = (gx: number) => -halfX + (gx / gw) * 2 * halfX;
+  const toY = (gy: number) => halfY - (gy / gh) * 2 * halfY;
+
+  // 高度场：距离变换 → 圆润截面 → 明度浮雕 → 3×3 平滑
+  const dist = distanceToEmpty(cells, gw, gh);
+  const R = Math.max(2.5, 0.11 * Math.max(gw, gh));
+  const h = new Float32Array(gw * gh);
+  for (let i = 0; i < h.length; i++) {
+    const c = cells[i];
+    if (c.empty) continue;
+    const t = Math.min(1, dist[i] / R);
+    const round = Math.sqrt(Math.max(0, 1 - (1 - t) * (1 - t)));
+    const bump = 0.14 * (1 - luminance(c.r, c.g, c.b));
+    h[i] = baseDepth * (round * (0.86 + bump)) + 0.02;
+  }
+  const hs = new Float32Array(h.length);
+  for (let y = 0; y < gh; y++) {
+    for (let x = 0; x < gw; x++) {
+      const i = y * gw + x;
+      if (cells[i].empty) continue;
+      let sum = 0, w = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx, yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= gw || yy >= gh) continue;
+          const j = yy * gw + xx;
+          if (cells[j].empty) continue;
+          const wt = dx === 0 && dy === 0 ? 2 : 1;
+          sum += h[j] * wt;
+          w += wt;
+        }
+      }
+      hs[i] = sum / w;
+    }
+  }
+
+  // 角点高度：四周全是前景格才取均值，否则贴地（轮廓处前后两面闭合）
+  const cw = gw + 1;
+  const cornerH = new Float32Array(cw * (gh + 1));
+  const cornerBoundary = new Uint8Array(cw * (gh + 1));
+  for (let j = 0; j <= gh; j++) {
+    for (let i = 0; i <= gw; i++) {
+      let sum = 0, n = 0, out = 0;
+      for (let dy = -1; dy <= 0; dy++) {
+        for (let dx = -1; dx <= 0; dx++) {
+          const x = i + dx, y = j + dy;
+          if (x < 0 || y < 0 || x >= gw || y >= gh || cells[y * gw + x].empty) {
+            out++;
+          } else {
+            sum += hs[y * gw + x];
+            n++;
+          }
+        }
+      }
+      const ci = j * cw + i;
+      if (n === 0) continue;
+      if (out > 0) {
+        cornerBoundary[ci] = 1;
+        cornerH[ci] = 0;
+      } else {
+        cornerH[ci] = sum / n;
+      }
+    }
+  }
+
+  const frontCount = cw * (gh + 1);
+  const positions = new Float64Array(frontCount * 2 * 3);
+  for (let j = 0; j <= gh; j++) {
+    for (let i = 0; i <= gw; i++) {
+      const ci = j * cw + i;
+      // 图像竖立在 xz 平面（z 向上），正面朝 −y（默认相机一侧），厚度沿 y
+      const x = toX(i), up = toY(j);
+      positions[ci * 3] = x;
+      positions[ci * 3 + 1] = -cornerH[ci];
+      positions[ci * 3 + 2] = up;
+      const bi = frontCount + ci;
+      positions[bi * 3] = x;
+      positions[bi * 3 + 1] = cornerH[ci] * BACK_SCALE;
+      positions[bi * 3 + 2] = up;
+    }
+  }
+
+  const faces: number[] = [];
+  const faceColor: number[] = [];
+  const colorSet = new Set<number>();
+  let insideCells = 0;
+
+  const emit = (a: number, b: number, c: number, col: number) => {
+    faces.push(a, b, c);
+    faceColor.push(col);
+  };
+
+  /** 以 (x,y) 为左上、边长 s 个细格的方块输出前后各 2 个三角形 */
+  const emitQuad = (x: number, y: number, s: number, r: number, g: number, b: number) => {
+    const c00 = y * cw + x;
+    const c10 = c00 + s;
+    const c01 = c00 + s * cw;
+    const c11 = c01 + s;
+    const frontCol = packRgb(r, g, b);
+    const backCol = packRgb(r * BACK_SHADE, g * BACK_SHADE, b * BACK_SHADE);
+    colorSet.add(quant5(r, g, b));
+    const diagA = Math.abs(cornerH[c00] - cornerH[c11]) <= Math.abs(cornerH[c10] - cornerH[c01]);
+    if (diagA) {
+      emit(c00, c10, c11, frontCol);
+      emit(c00, c11, c01, frontCol);
+    } else {
+      emit(c00, c10, c01, frontCol);
+      emit(c10, c11, c01, frontCol);
+    }
+    // 背面：轮廓贴地的角点与前面共用顶点 → 无缝闭合
+    const bk = (c: number) => (cornerBoundary[c] ? c : frontCount + c);
+    if (diagA) {
+      emit(bk(c00), bk(c11), bk(c10), backCol);
+      emit(bk(c00), bk(c01), bk(c11), backCol);
+    } else {
+      emit(bk(c00), bk(c01), bk(c10), backCol);
+      emit(bk(c10), bk(c01), bk(c11), backCol);
+    }
+  };
+
+  // 自适应合并（四叉树式）：同色且高度场近似平面的整块只用 2 个三角形，
+  // 细节与轮廓处保持 1 个细格，所以同样预算下有效分辨率远高于均匀网格。
+  const used = new Uint8Array(gw * gh);
+  const tryBlock = (bx: number, by: number, s: number): boolean => {
+    if (bx + s > gw || by + s > gh) return false;
+    let sr = 0, sg = 0, sb = 0;
+    for (let y = by; y < by + s; y++) {
+      for (let x = bx; x < bx + s; x++) {
+        const i = y * gw + x;
+        if (used[i] || cells[i].empty) return false;
+        sr += cells[i].r;
+        sg += cells[i].g;
+        sb += cells[i].b;
+      }
+    }
+    const n = s * s;
+    const mr = sr / n, mg = sg / n, mb = sb / n;
+    for (let y = by; y < by + s; y++) {
+      for (let x = bx; x < bx + s; x++) {
+        const c = cells[y * gw + x];
+        if (
+          Math.abs(c.r - mr) > MERGE_COLOR_TOL ||
+          Math.abs(c.g - mg) > MERGE_COLOR_TOL ||
+          Math.abs(c.b - mb) > MERGE_COLOR_TOL
+        ) return false;
+      }
+    }
+    // 角点平坦度
+    const h00 = cornerH[by * cw + bx];
+    const h10 = cornerH[by * cw + bx + s];
+    const h01 = cornerH[(by + s) * cw + bx];
+    const h11 = cornerH[(by + s) * cw + bx + s];
+    for (let j = 0; j <= s; j++) {
+      for (let i = 0; i <= s; i++) {
+        const u = i / s, v = j / s;
+        const interp = (1 - v) * ((1 - u) * h00 + u * h10) + v * ((1 - u) * h01 + u * h11);
+        if (Math.abs(cornerH[(by + j) * cw + bx + i] - interp) > MERGE_HEIGHT_EPS) return false;
+      }
+    }
+    for (let y = by; y < by + s; y++) for (let x = bx; x < bx + s; x++) used[y * gw + x] = 1;
+    insideCells += n;
+    emitQuad(bx, by, s, mr, mg, mb);
+    return true;
+  };
+
+  for (const s of [8, 4, 2]) {
+    for (let by = 0; by + s <= gh; by += s) {
+      for (let bx = 0; bx + s <= gw; bx += s) tryBlock(bx, by, s);
+    }
+  }
   for (let y = 0; y < gh; y++) {
     for (let x = 0; x < gw; x++) {
       const i = y * gw + x;
       if (used[i] || cells[i].empty) continue;
-      const key = cells[i].key;
-      const { r, g, b } = cells[i];
-
-      let maxX = x;
-      while (
-        maxX + 1 < gw &&
-        !used[y * gw + maxX + 1] &&
-        !cells[y * gw + maxX + 1].empty &&
-        cells[y * gw + maxX + 1].key === key
-      ) {
-        maxX++;
-      }
-
-      let maxY = y;
-      outer: while (maxY + 1 < gh) {
-        for (let xx = x; xx <= maxX; xx++) {
-          const j = (maxY + 1) * gw + xx;
-          if (used[j] || cells[j].empty || cells[j].key !== key) break outer;
-        }
-        maxY++;
-      }
-
-      for (let yy = y; yy <= maxY; yy++) {
-        for (let xx = x; xx <= maxX; xx++) {
-          used[yy * gw + xx] = 1;
-        }
-      }
-
-      rects.push({ x0: x, y0: y, x1: maxX + 1, y1: maxY + 1, r, g, b });
+      used[i] = 1;
+      insideCells++;
+      const c = cells[i];
+      emitQuad(x, y, 1, c.r, c.g, c.b);
     }
   }
 
-  return rects;
-}
-
-function luminance(r: number, g: number, b: number): number {
-  return (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-}
-
-function regionDepth(
-  rect: RectRegion,
-  baseDepth: number,
-  gw: number,
-  gh: number,
-): number {
-  const area = (rect.x1 - rect.x0) * (rect.y1 - rect.y0);
-  const lum = luminance(rect.r, rect.g, rect.b);
-  // 暗色更厚、小细节略薄，增加立体层次
-  const areaFactor = 0.55 + 0.45 * Math.min(1, area / ((gw * gh) / 40));
-  const lumFactor = 0.45 + (1 - lum) * 0.9;
-  return baseDepth * areaFactor * lumFactor;
-}
-
-type Tri = {
-  ax: number; ay: number; az: number;
-  bx: number; by: number; bz: number;
-  cx: number; cy: number; cz: number;
-  color: string;
-};
-
-function pushQuad(
-  out: Tri[],
-  x0: number, y0: number, z0: number,
-  x1: number, y1: number, z1: number,
-  x2: number, y2: number, z2: number,
-  x3: number, y3: number, z3: number,
-  color: string,
-) {
-  out.push({
-    ax: x0, ay: y0, az: z0,
-    bx: x1, by: y1, bz: z1,
-    cx: x2, cy: y2, cz: z2,
-    color,
-  });
-  out.push({
-    ax: x0, ay: y0, az: z0,
-    bx: x2, by: y2, bz: z2,
-    cx: x3, cy: y3, cz: z3,
-    color,
-  });
-}
-
-/** 矩形棱柱 → 三角面 */
-function extrudeRect(
-  rect: RectRegion,
-  toWorld: (gx: number, gy: number) => { x: number; y: number },
-  z0: number,
-  z1: number,
-  includeWalls: boolean,
-): Tri[] {
-  const color = rgbToHex(rect.r, rect.g, rect.b);
-  const p00 = toWorld(rect.x0, rect.y0);
-  const p10 = toWorld(rect.x1, rect.y0);
-  const p11 = toWorld(rect.x1, rect.y1);
-  const p01 = toWorld(rect.x0, rect.y1);
-  const out: Tri[] = [];
-
-  // 顶面
-  pushQuad(
-    out,
-    p00.x, p00.y, z1, p10.x, p10.y, z1, p11.x, p11.y, z1, p01.x, p01.y, z1,
-    color,
-  );
-  // 底面
-  pushQuad(
-    out,
-    p00.x, p00.y, z0, p01.x, p01.y, z0, p11.x, p11.y, z0, p10.x, p10.y, z0,
-    color,
-  );
-
-  if (includeWalls) {
-    // 四壁
-    pushQuad(out, p00.x, p00.y, z0, p10.x, p10.y, z0, p10.x, p10.y, z1, p00.x, p00.y, z1, color);
-    pushQuad(out, p10.x, p10.y, z0, p11.x, p11.y, z0, p11.x, p11.y, z1, p10.x, p10.y, z1, color);
-    pushQuad(out, p11.x, p11.y, z0, p01.x, p01.y, z0, p01.x, p01.y, z1, p11.x, p11.y, z1, color);
-    pushQuad(out, p01.x, p01.y, z0, p00.x, p00.y, z0, p00.x, p00.y, z1, p01.x, p01.y, z1, color);
-  }
-
-  return out;
-}
-
-/** 色块边界 → 竖墙 ribbon */
-function buildOutlineWalls(
-  cells: Cell[],
-  gw: number,
-  gh: number,
-  toWorld: (gx: number, gy: number) => { x: number; y: number },
-  wallZ0: number,
-  wallZ1: number,
-  maxWallTris: number,
-): Tri[] {
-  const out: Tri[] = [];
-  const tryEdge = (
-    gx0: number, gy0: number, gx1: number, gy1: number,
-    a: Cell, b: Cell | null,
-  ) => {
-    if (a.empty) return;
-    if (b && !b.empty && b.key === a.key) return;
-    const color = rgbToHex(a.r, a.g, a.b);
-    // 深色优先当描边
-    const lum = luminance(a.r, a.g, a.b);
-    if (lum > 0.85 && b && !b.empty) return;
-    const p0 = toWorld(gx0, gy0);
-    const p1 = toWorld(gx1, gy1);
-    pushQuad(
-      out,
-      p0.x, p0.y, wallZ0, p1.x, p1.y, wallZ0, p1.x, p1.y, wallZ1, p0.x, p0.y, wallZ1,
-      lum < 0.2 ? '#000000' : color,
-    );
+  return {
+    positions,
+    faces: Int32Array.from(faces),
+    faceColor: Int32Array.from(faceColor),
+    insideCells,
+    colorSet,
+    gw,
+    gh,
   };
-
-  for (let y = 0; y < gh; y++) {
-    for (let x = 0; x < gw; x++) {
-      const a = cells[y * gw + x];
-      if (a.empty) continue;
-      // 右邻
-      const right = x + 1 < gw ? cells[y * gw + x + 1] : null;
-      tryEdge(x + 1, y, x + 1, y + 1, a, right);
-      // 下邻
-      const down = y + 1 < gh ? cells[(y + 1) * gw + x] : null;
-      tryEdge(x, y + 1, x + 1, y + 1, a, down);
-      // 外边界
-      if (x === 0) tryEdge(x, y, x, y + 1, a, null);
-      if (y === 0) tryEdge(x, y, x + 1, y, a, null);
-      if (x === gw - 1) tryEdge(x + 1, y, x + 1, y + 1, a, null);
-      if (y === gh - 1) tryEdge(x, y + 1, x + 1, y + 1, a, null);
-      if (out.length >= maxWallTris) return out;
-    }
-  }
-  return out;
 }
 
-function canvasToDesmos3D(
+function buildRelief(
   data: Uint8ClampedArray,
   width: number,
   height: number,
-  options: Draw3DOptions = {},
+  options: Draw3DOptions,
 ): Draw3DResult {
-  const gridMax = options.gridMax ?? DEFAULT_GRID;
   const maxTriangles = options.maxTriangles ?? DEFAULT_MAX_TRIANGLES;
-  const baseDepth = options.baseDepth ?? DEFAULT_DEPTH;
-  const includeWalls = options.includeWalls !== false;
-  const mode = options.mode ?? 'both';
-  const includeFill = mode !== 'outline';
-  const includeOutline = mode !== 'fill';
 
-  const { cells, gw, gh } = buildColorGrid(data, width, height, gridMax);
-
-  // 映射到约 [-10,10]×[-10,10] 的 xy 平面（y 向上）
-  const aspect = width / height;
-  const halfX = aspect >= 1 ? 10 : 10 * aspect;
-  const halfY = aspect >= 1 ? 10 / aspect : 10;
-  const toWorld = (gx: number, gy: number) => ({
-    x: -halfX + (gx / gw) * 2 * halfX,
-    y: halfY - (gy / gh) * 2 * halfY,
-  });
-
-  const tris: Tri[] = [];
-  let regionCount = 0;
-  const colorSet = new Set<string>();
-
-  if (includeFill) {
-    const rects = greedyMeshRects(cells, gw, gh);
-    // 大区域先画（遮挡更自然）
-    rects.sort((a, b) =>
-      (b.x1 - b.x0) * (b.y1 - b.y0) - (a.x1 - a.x0) * (a.y1 - a.y0),
-    );
-    regionCount = rects.length;
-
-    for (const rect of rects) {
-      const depth = regionDepth(rect, baseDepth, gw, gh);
-      const z0 = 0;
-      const z1 = depth;
-      const piece = extrudeRect(rect, toWorld, z0, z1, includeWalls);
-      colorSet.add(rgbToHex(rect.r, rect.g, rect.b));
-      for (const t of piece) {
-        tris.push(t);
-        if (tris.length >= maxTriangles * 0.85) break;
-      }
-      if (tris.length >= maxTriangles * 0.85) break;
-    }
+  // 找到「预算内最细」的网格：先按目标细度试，超预算就按比例收缩（面数大致 ∝ 边界长度）
+  let gridMax = options.gridMax ?? DEFAULT_GRID;
+  let best = buildReliefAt(data, width, height, gridMax, options);
+  for (let attempt = 0; attempt < 8 && best.faces.length / 3 > maxTriangles; attempt++) {
+    const ratio = Math.max(0.55, Math.min(0.97, (maxTriangles / (best.faces.length / 3)) * 0.98));
+    gridMax = Math.max(32, Math.floor(gridMax * ratio));
+    best = buildReliefAt(data, width, height, gridMax, options);
   }
 
-  if (includeOutline) {
-    const wallBudget = Math.max(80, maxTriangles - tris.length);
-    const walls = buildOutlineWalls(
-      cells, gw, gh, toWorld,
-      0,
-      baseDepth * 1.15,
-      wallBudget,
-    );
-    for (const t of walls) {
-      tris.push(t);
-      colorSet.add(t.color);
-      if (tris.length >= maxTriangles) break;
-    }
-  }
-
-  // 若仍过多，均匀抽样保留外形
-  let kept = tris;
-  if (kept.length > maxTriangles) {
-    const step = kept.length / maxTriangles;
-    const sampled: Tri[] = [];
-    for (let i = 0; i < maxTriangles; i++) {
-      sampled.push(kept[Math.floor(i * step)]);
-    }
-    kept = sampled;
-  }
+  const built3d = meshToListExpressions(best.positions, best.faces, best.faceColor, 'd3d');
 
   const expressions: Desmos3DExpression[] = [
     {
       id: 'd3d_note',
       type: 'text',
-      text: `3D draw · regions ${regionCount} · tris ${kept.length} · colors ${colorSet.size}`,
+      text: `3D relief · grid ${best.gw}×${best.gh} · cells ${best.insideCells} · tris ${built3d.triangleCount} · colors ${best.colorSet.size}`,
     },
+    ...built3d.expressions,
   ];
-
-  kept.forEach((t, i) => {
-    expressions.push({
-      id: `d3d_t_${i}`,
-      latex: triangleLatex(t.ax, t.ay, t.az, t.bx, t.by, t.bz, t.cx, t.cy, t.cz),
-      color: t.color,
-      fillOpacity: 0.95,
-    });
-  });
 
   return {
     expressions,
-    regionCount,
-    triangleCount: kept.length,
-    colorCount: colorSet.size,
+    regionCount: best.insideCells,
+    triangleCount: built3d.triangleCount,
+    colorCount: best.colorSet.size,
     explanation: 'draw_3d_complete',
   };
 }
-
 function loadImageElement(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -455,7 +501,7 @@ function readFileAsDataURL(file: File): Promise<string> {
 
 function drawImageToCanvas(
   img: HTMLImageElement,
-  maxSide = 512,
+  maxSide = 768,
 ): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } {
   const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
   const w = Math.max(32, Math.round(img.width * scale));
@@ -463,10 +509,9 @@ function drawImageToCanvas(
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) throw new Error('No ctx');
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, w, h);
+  // 不预填白底：保留 PNG/Emoji 的透明通道，由 buildCells 识别背景
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(img, 0, 0, w, h);
@@ -481,7 +526,7 @@ export async function processImageToDesmos3D(
   const img = await loadImageElement(dataUrl);
   const { canvas, ctx } = drawImageToCanvas(img);
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  return canvasToDesmos3D(imageData.data, canvas.width, canvas.height, options);
+  return buildRelief(imageData.data, canvas.width, canvas.height, options);
 }
 
 export async function processEmojiToDesmos3D(
@@ -489,33 +534,65 @@ export async function processEmojiToDesmos3D(
   options: Draw3DOptions = {},
 ): Promise<Draw3DResult> {
   const size = 768;
+  const big = 1536;
+  const failed: Draw3DResult = {
+    expressions: [],
+    regionCount: 0,
+    triangleCount: 0,
+    colorCount: 0,
+    explanation: 'draw_3d_fail',
+  };
+
+  // 1) 在大画布上用较小字号绘制（不同系统的 Emoji 字形大小差异很大，避免被裁切）
+  const src = document.createElement('canvas');
+  src.width = big;
+  src.height = big;
+  const sctx = src.getContext('2d', { willReadFrequently: true });
+  if (!sctx) return failed;
+  // 透明底：Emoji 内部的白色（眼白、牙齿）才不会被当成背景挖掉
+  sctx.clearRect(0, 0, big, big);
+  sctx.font = `${big * 0.45}px "Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji",serif`;
+  sctx.textAlign = 'center';
+  sctx.textBaseline = 'middle';
+  sctx.fillText(emoji, big / 2, big / 2);
+
+  // 2) 求不透明像素包围盒
+  const full = sctx.getImageData(0, 0, big, big).data;
+  let minX = big, minY = big, maxX = -1, maxY = -1;
+  for (let y = 0; y < big; y += 2) {
+    for (let x = 0; x < big; x += 2) {
+      if (full[(y * big + x) * 4 + 3] > 24) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < 0) return failed;
+
+  // 3) 紧致裁剪后缩放到 768 画布（占 92%），让网格全部用在字形上
+  const bw = maxX - minX + 2;
+  const bh = maxY - minY + 2;
+  const fit = (size * 0.92) / Math.max(bw, bh);
   const canvas = document.createElement('canvas');
   canvas.width = size;
   canvas.height = size;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) {
-    return {
-      expressions: [],
-      regionCount: 0,
-      triangleCount: 0,
-      colorCount: 0,
-      explanation: 'draw_3d_fail',
-    };
-  }
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, size, size);
-  ctx.font = `${size * 0.72}px "Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji",serif`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(emoji, size / 2, size / 2 + size * 0.04);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return failed;
+  ctx.clearRect(0, 0, size, size);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  const dw = bw * fit;
+  const dh = bh * fit;
+  ctx.drawImage(src, minX, minY, bw, bh, (size - dw) / 2, (size - dh) / 2, dw, dh);
+
   const imageData = ctx.getImageData(0, 0, size, size);
-  // Emoji 细节多：略提高网格
-  return canvasToDesmos3D(imageData.data, size, size, {
-    gridMax: 64,
-    maxTriangles: 2400,
-    baseDepth: 2.8,
+  return buildRelief(imageData.data, size, size, {
+    gridMax: 220,
+    maxTriangles: 30000,
+    baseDepth: 3.2,
     ...options,
   });
 }
-
-export { applyModel3DExpressionsProgressively as applyDraw3DExpressionsProgressively };
+export { applyDesmos3DExpressions as applyDraw3DExpressionsProgressively };
