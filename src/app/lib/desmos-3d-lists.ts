@@ -210,10 +210,10 @@ export function chunkToExpressions(
 ): Desmos3DExpression[] {
   const out: Desmos3DExpression[] = [];
   const pt = (p: Vec3) => `\\left(${fmt(p.x)},${fmt(p.y)},${fmt(p.z)}\\right)`;
-  out.push({ id: `${idPrefix}_V`, latex: `V_{${tag}}=${lst(chunk.V.map(pt))}`, hidden: true });
-  out.push({ id: `${idPrefix}_A`, latex: `A_{${tag}}=${lst(chunk.A)}`, hidden: true });
-  out.push({ id: `${idPrefix}_B`, latex: `B_{${tag}}=${lst(chunk.B)}`, hidden: true });
-  out.push({ id: `${idPrefix}_C`, latex: `D_{${tag}}=${lst(chunk.C)}`, hidden: true });
+  out.push({ id: `${idPrefix}_V`, latex: `V_{${tag}}=${lst(chunk.V.map(pt))}`, hidden: true, secret: true });
+  out.push({ id: `${idPrefix}_A`, latex: `A_{${tag}}=${lst(chunk.A)}`, hidden: true, secret: true });
+  out.push({ id: `${idPrefix}_B`, latex: `B_{${tag}}=${lst(chunk.B)}`, hidden: true, secret: true });
+  out.push({ id: `${idPrefix}_C`, latex: `D_{${tag}}=${lst(chunk.C)}`, hidden: true, secret: true });
 
   const unique = new Set(chunk.Q);
   const tri = `\\operatorname{triangle}\\left(V_{${tag}}\\left[A_{${tag}}\\right],V_{${tag}}\\left[B_{${tag}}\\right],V_{${tag}}\\left[D_{${tag}}\\right]\\right)`;
@@ -228,7 +228,7 @@ export function chunkToExpressions(
     return out;
   }
 
-  out.push({ id: `${idPrefix}_Q`, latex: `Q_{${tag}}=${lst(chunk.Q)}`, hidden: true });
+  out.push({ id: `${idPrefix}_Q`, latex: `Q_{${tag}}=${lst(chunk.Q)}`, hidden: true, secret: true });
   out.push({
     id: `${idPrefix}_K`,
     latex:
@@ -236,6 +236,7 @@ export function chunkToExpressions(
       `\\operatorname{mod}\\left(\\operatorname{floor}\\left(Q_{${tag}}/256\\right),256\\right),` +
       `\\operatorname{mod}\\left(Q_{${tag}},256\\right)\\right)`,
     hidden: true,
+    secret: true,
   });
   out.push({
     id: `${idPrefix}_T`,
@@ -286,6 +287,7 @@ function toStateExpression(expr: Desmos3DExpression): Record<string, unknown> {
   if (expr.color) out.color = expr.color;
   if (expr.colorLatex) out.colorLatex = expr.colorLatex;
   if (expr.hidden || expr.secret) out.hidden = true;
+  if (expr.secret) out.secret = true;
   const fo = numStr(expr.fillOpacity);
   if (fo !== undefined) out.fillOpacity = fo;
   const lo = numStr(expr.lineOpacity);
@@ -388,9 +390,9 @@ export function downgradeColorLatex(expressions: Desmos3DExpression[]): Desmos3D
     groups.forEach((idxs, j) => {
       if (!idxs.length) return;
       const t = `${tag}x${j}`;
-      out.push({ id: `${prefix}_gA${j}`, latex: `A_{${t}}=${lst(idxs.map(i => A[i]))}`, hidden: true });
-      out.push({ id: `${prefix}_gB${j}`, latex: `B_{${t}}=${lst(idxs.map(i => B[i]))}`, hidden: true });
-      out.push({ id: `${prefix}_gC${j}`, latex: `D_{${t}}=${lst(idxs.map(i => C[i]))}`, hidden: true });
+      out.push({ id: `${prefix}_gA${j}`, latex: `A_{${t}}=${lst(idxs.map(i => A[i]))}`, hidden: true, secret: true });
+      out.push({ id: `${prefix}_gB${j}`, latex: `B_{${t}}=${lst(idxs.map(i => B[i]))}`, hidden: true, secret: true });
+      out.push({ id: `${prefix}_gC${j}`, latex: `D_{${t}}=${lst(idxs.map(i => C[i]))}`, hidden: true, secret: true });
       out.push({
         id: `${prefix}_gT${j}`,
         latex:

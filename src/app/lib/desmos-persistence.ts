@@ -9,15 +9,102 @@ import { migrateCalculatorToWindowedPlayback } from './gif-playback';
 
 const WORKSPACE_STORAGE_KEY = 'desmos_workspace_v1';
 
+export type WorkspaceMode = '2d' | '3d';
+const lsKey = (mode: WorkspaceMode) => (mode === '3d' ? WORKSPACE_STORAGE_KEY + '_3d' : WORKSPACE_STORAGE_KEY);
+const idbKey = (mode: WorkspaceMode) => (mode === '3d' ? 'current3d' : 'current');
+
+/** 从状态判断是 2D 还是 3D 画板（两种画板的状态互不兼容，必须分开存） */
+export function detectStateMode(state: any): WorkspaceMode {
+  const g = state?.graph;
+  if (g && (g.threeDMode === true || g.viewport?.zmin !== undefined || Object.keys(g).some(k => /3D$/.test(k)))) {
+    return '3d';
+  }
+  return '2d';
+}
+
+export function detectCalculatorMode(calculator: any): WorkspaceMode {
+  try {
+    return detectStateMode(calculator?.getState?.());
+  } catch {
+    return '2d';
+  }
+}
+
 export type PersistedWorkspace = {
   calculatorState: unknown;
   windowedGif?: boolean;
   savedAt: number;
+  /** 状态体积超过 localStorage 配额（如大型 3D 网格）→ 本体存在 IndexedDB，这里只留标记 */
+  inIdb?: boolean;
 };
 
-export function loadWorkspace(): PersistedWorkspace | null {
+// ─── 大状态走 IndexedDB（localStorage 约 5MB，大网格一份状态就几 MB）──────────────
+const WS_DB = 'ai-desmos-workspace-v1';
+const WS_STORE = 'ws';
+const LS_SOFT_LIMIT = 1_500_000; // 字符数，超过就改存 IndexedDB
+
+const openWsDb = (): Promise<IDBDatabase> =>
+  new Promise((resolve, reject) => {
+    const req = indexedDB.open(WS_DB, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(WS_STORE)) req.result.createObjectStore(WS_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+
+async function idbPutWorkspace(mode: WorkspaceMode, value: unknown): Promise<void> {
+  const db = await openWsDb();
   try {
-    const raw = localStorage.getItem(WORKSPACE_STORAGE_KEY);
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(WS_STORE, 'readwrite');
+      tx.objectStore(WS_STORE).put(value, idbKey(mode));
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function idbGetWorkspace(mode: WorkspaceMode): Promise<PersistedWorkspace | null> {
+  try {
+    const db = await openWsDb();
+    try {
+      return await new Promise<PersistedWorkspace | null>((resolve, reject) => {
+        const req = db.transaction(WS_STORE, 'readonly').objectStore(WS_STORE).get(idbKey(mode));
+        req.onsuccess = () => resolve((req.result as PersistedWorkspace | undefined) ?? null);
+        req.onerror = () => reject(req.error);
+      });
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+async function idbDeleteWorkspace(mode: WorkspaceMode): Promise<void> {
+  try {
+    const db = await openWsDb();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(WS_STORE, 'readwrite');
+        tx.objectStore(WS_STORE).delete(idbKey(mode));
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    } finally {
+      db.close();
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+export function loadWorkspace(mode: WorkspaceMode = '2d'): PersistedWorkspace | null {
+  try {
+    const raw = localStorage.getItem(lsKey(mode));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as PersistedWorkspace;
     if (!parsed?.calculatorState) return null;
@@ -27,14 +114,15 @@ export function loadWorkspace(): PersistedWorkspace | null {
   }
 }
 
-export async function clearWorkspaceAsync(): Promise<void> {
-  clearWorkspace();
+export async function clearWorkspaceAsync(mode: WorkspaceMode = '2d'): Promise<void> {
+  clearWorkspace(mode);
+  await idbDeleteWorkspace(mode);
   await clearGifArchiveIdb();
 }
 
-export function clearWorkspace(): void {
+export function clearWorkspace(mode: WorkspaceMode = '2d'): void {
   try {
-    localStorage.removeItem(WORKSPACE_STORAGE_KEY);
+    localStorage.removeItem(lsKey(mode));
   } catch {
     /* ignore */
   }
@@ -67,6 +155,7 @@ export async function saveWorkspaceAsync(calculator: any): Promise<boolean> {
     const manager = getActiveWindowedPlayback();
     const archive = manager?.getArchive();
     const rawState = calculator.getState();
+    const mode = detectStateMode(rawState);
     const payload: PersistedWorkspace = {
       calculatorState: archive && archive.size > 0 ? slimGifCalculatorState(rawState) : rawState,
       savedAt: Date.now(),
@@ -77,14 +166,27 @@ export async function saveWorkspaceAsync(calculator: any): Promise<boolean> {
       payload.windowedGif = true;
     }
 
-    localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(payload));
+    const json = JSON.stringify(payload);
+    if (json.length <= LS_SOFT_LIMIT) {
+      try {
+        localStorage.setItem(lsKey(mode), json);
+        void idbDeleteWorkspace(mode);
+        return true;
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === 'QuotaExceededError')) throw error;
+      }
+    }
+    // 大状态：本体进 IndexedDB，localStorage 只留标记（同时清掉旧的过期状态，避免刷新后恢复成旧画面）
+    await idbPutWorkspace(mode, payload);
+    localStorage.setItem(
+      lsKey(mode),
+      JSON.stringify({ calculatorState: {}, savedAt: payload.savedAt, inIdb: true, windowedGif: payload.windowedGif }),
+    );
     return true;
   } catch (error) {
-    if (error instanceof DOMException && error.name === 'QuotaExceededError') {
-      console.warn('[workspace] localStorage quota exceeded');
-    } else {
-      console.warn('[workspace] save failed', error);
-    }
+    console.warn('[workspace] save failed', error);
+    // 存不下就别留旧状态，免得刷新后恢复出过期画面
+    clearWorkspace(detectCalculatorMode(calculator));
     return false;
   }
 }
@@ -96,8 +198,12 @@ export function saveWorkspace(calculator: any): boolean {
 
 /** 刷新后恢复：优先 IndexedDB 归档 + 窗口化播放 */
 export async function restoreWorkspace(calculator: any): Promise<boolean> {
-  const workspace = loadWorkspace();
+  const mode = detectCalculatorMode(calculator);
+  let workspace = loadWorkspace(mode);
+  if (workspace?.inIdb) workspace = await idbGetWorkspace(mode);
   if (!workspace?.calculatorState || !calculator?.setState) return false;
+  // 旧版本把 3D 状态存进了 2D 的键：模式对不上就不恢复（否则 2D 画板会报 Error loading graph）
+  if (!workspace.inIdb && detectStateMode(workspace.calculatorState) !== mode) return false;
 
   try {
     calculator.setState(workspace.calculatorState);

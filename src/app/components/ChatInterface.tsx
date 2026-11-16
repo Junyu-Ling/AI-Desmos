@@ -82,6 +82,7 @@ import { extractGifFirstFrameAsPngFile } from '../lib/gif-decode';
 import { getActiveWindowedPlayback } from '../lib/gif-playback';
 import {
   clearWorkspaceAsync,
+  detectCalculatorMode,
   createDebouncedWorkspaceSaver,
   restoreWorkspace,
 } from '../lib/desmos-persistence';
@@ -245,7 +246,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
   const calculatorRef = useRef(calculator);
   /** 中央 3D/2D 模式引用：异步绘图路由以此为准 */
   const calculatorModeRef = useRef<CalculatorDimension>(calculatorMode);
-  const workspaceRestoredRef = useRef(false);
+  /** 每个画板实例只恢复一次（2D / 3D 各自一份工作区） */
+  const workspaceRestoredRef = useRef<WeakSet<object>>(new WeakSet());
   const workspaceSaverRef = useRef(createDebouncedWorkspaceSaver());
 
   const flushWorkspace = () => {
@@ -289,8 +291,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
 
     const saver = workspaceSaverRef.current;
 
-    if (!workspaceRestoredRef.current) {
-      workspaceRestoredRef.current = true;
+    if (!workspaceRestoredRef.current.has(calculator)) {
+      workspaceRestoredRef.current.add(calculator);
       void restoreWorkspace(calculator).catch(error => {
         console.warn('[workspace] restore failed', error);
       });
@@ -950,7 +952,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
    */
   const handleClearCanvas = () => {
     detachGifPlayback();
-    void clearWorkspaceAsync();
+    void clearWorkspaceAsync(detectCalculatorMode(calculatorRef.current));
     if (calculatorRef.current) {
       calculatorRef.current.setBlank(); // 清空画板（删除所有表达式）
 
