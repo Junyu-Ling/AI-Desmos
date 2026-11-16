@@ -10,7 +10,7 @@
  *      每块用一条 triangle(V[A],V[B],V[D]) 画出至多 9500 个三角形。
  *   3) 通过 calculator.setState 注入（colorLatex 只有状态注入才生效）。
  *
- * 精度：旧版 2800 条独立三角形（直接丢面、会开洞）→ 现在 30000 个折叠后的着色三角形，
+ * 精度：旧版 2800 条独立三角形（直接丢面、会开洞）→ 现在最多 250000 个折叠后的着色三角形（按 9500 面/块自动分块），
  *       表达式数量从数千条降到约 7·块数。
  */
 
@@ -64,8 +64,8 @@ export type Model3DConvertResult = {
   colorSource: 'vertex' | 'mtl' | 'none' | 'mixed' | 'texture';
 };
 
-/** 折叠后的三角形预算（每块 ≤ 9500，约 3 块） */
-export const MAX_TRIANGLES = 30000;
+/** 三角形预算：只是安全阀（每块 ≤ 9500 面，自动分块）。小于它的模型原样保留，不做减面 */
+export const MAX_TRIANGLES = 250000;
 /** 兼容旧导出（已不再使用线框回退） */
 export const MAX_EDGES = 0;
 export const TARGET_HALF_EXTENT = 9;
@@ -664,7 +664,7 @@ export function meshToDesmos3D(
 
   let mode: Model3DConvertResult['mode'] = 'triangles';
   let warning: string | undefined;
-  if (rendered < faceCount) {
+  if (rendered < faceCount * 0.97) {
     mode = 'mixed';
     warning = 'model_3d_decimated_hi';
   }
