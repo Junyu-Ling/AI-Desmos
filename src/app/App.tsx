@@ -112,7 +112,38 @@ function App() {
    * calculatorMode — Desmos 维度：'2d' 平面 / '3d' 立体
    * 切换时 DesmosCalculator 会销毁并重建实例（画板不跨维度保留）
    */
-  const [calculatorMode, setCalculatorMode] = useState<CalculatorDimension>('2d');
+  const [calculatorMode, setCalculatorModeRaw] = useState<CalculatorDimension>('2d');
+
+  // ── 3D 功能邀请制：网站暂时只公开 2D，3D 需要邀请码解锁（本地记住） ──
+  const THREE_D_INVITE_CODE = 'woweixinhao';
+  const THREE_D_UNLOCK_KEY = 'desmos_3d_unlocked_v2';
+  const [is3DUnlocked, setIs3DUnlocked] = useState<boolean>(() => {
+    try { return localStorage.getItem(THREE_D_UNLOCK_KEY) === '1'; } catch { return false; }
+  });
+  const [show3DLock, setShow3DLock] = useState(false);
+  const [lockCodeInput, setLockCodeInput] = useState('');
+  const [lockCodeError, setLockCodeError] = useState(false);
+  /** 所有切换维度的入口都走这里：未解锁时 3D 一律弹出邀请码框 */
+  const setCalculatorMode = (mode: CalculatorDimension) => {
+    if (mode === '3d' && !is3DUnlocked) {
+      setShow3DLock(true);
+      return;
+    }
+    setCalculatorModeRaw(mode);
+  };
+  const handleUnlock3D = () => {
+    if (lockCodeInput.trim() === THREE_D_INVITE_CODE) {
+      try { localStorage.setItem(THREE_D_UNLOCK_KEY, '1'); } catch { /* ignore */ }
+      setIs3DUnlocked(true);
+      setShow3DLock(false);
+      setLockCodeInput('');
+      setLockCodeError(false);
+      setCalculator(null);
+      setCalculatorModeRaw('3d');
+    } else {
+      setLockCodeError(true);
+    }
+  };
 
   /**
    * showOnboarding — 是否显示引导页
@@ -1050,6 +1081,53 @@ function App() {
           </div>
         )}
 
+        {/* 3D 邀请码解锁弹窗 */}
+        {show3DLock && (
+          <div
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 backdrop-blur-sm"
+            onClick={() => { setShow3DLock(false); setLockCodeError(false); }}
+          >
+            <div
+              className="w-[min(92vw,380px)] rounded-2xl bg-white p-6 shadow-2xl space-y-4"
+              onClick={e => e.stopPropagation()}
+            >
+              <div className="flex items-center gap-2 text-gray-900 font-bold text-base">
+                <Box size={18} className="text-blue-600" />
+                {t('mode_3d_lock_title')}
+              </div>
+              <p className="text-sm text-gray-500">{t('mode_3d_lock_desc')}</p>
+              <input
+                autoFocus
+                value={lockCodeInput}
+                onChange={e => { setLockCodeInput(e.target.value); setLockCodeError(false); }}
+                onKeyDown={e => e.key === 'Enter' && handleUnlock3D()}
+                placeholder={t('mode_3d_lock_placeholder')}
+                className={`w-full rounded-lg border px-3 py-2 text-sm outline-none transition-colors ${
+                  lockCodeError ? 'border-red-400 bg-red-50' : 'border-gray-200 focus:border-blue-500'
+                }`}
+              />
+              {lockCodeError && <p className="text-xs text-red-500">{t('mode_3d_lock_error')}</p>}
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => { setShow3DLock(false); setLockCodeError(false); }}
+                  className="px-3 py-2 text-sm text-gray-500 hover:bg-gray-100 rounded-lg"
+                >
+                  {t('mode_3d_lock_cancel')}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleUnlock3D}
+                  disabled={!lockCodeInput.trim()}
+                  className="px-4 py-2 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-40 rounded-lg"
+                >
+                  {t('mode_3d_lock_unlock')}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* 2D / 3D 切换 + 手绘（仅 2D） */}
         {desmosStatus === 'ready' && !showOnboarding && (
           <div className="absolute bottom-8 left-6 z-20 flex items-center gap-2">
@@ -1075,6 +1153,7 @@ function App() {
                 type="button"
                 onClick={() => {
                   if (calculatorMode === '3d') return;
+                  if (!is3DUnlocked) { setShow3DLock(true); return; }
                   if (drawMode) handleCancelDraw();
                   setCalculator(null);
                   setCalculatorMode('3d');
@@ -1254,6 +1333,7 @@ function App() {
             calculatorMode={calculatorMode}
             onRequestCalculatorMode={(mode) => {
               if (mode === calculatorMode) return;
+              if (mode === '3d' && !is3DUnlocked) { setShow3DLock(true); return; }
               if (drawMode) handleCancelDraw();
               setCalculator(null);
               setCalculatorMode(mode);
