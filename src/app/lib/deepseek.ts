@@ -548,9 +548,9 @@ const DESMOS_3D_MODE_ADDON_ZH = [
   '- 参考 Desmos 3D 高手作品（The Meadow / Colormap Canyon）的写法：',
   '  · 高度场曲面 (x,y,H(x,y))，H 可用 \\\\sin 叠加或 hash/fbm 噪声；用 \\\\left\\\\{a\\\\le x\\\\le b\\\\right\\\\} 限定范围',
   '  · 自定义函数/变量复用：f(x)=…、R(a)=旋转、lerp(a,b,t)=a+(b-a)t、\\\\operatorname{hsv}(h,s,v) / \\\\operatorname{rgb}(r,g,b) 取色',
-  '  · 大量重复物体用列表推导：\\\\left[ \\\\operatorname{sphere}((i,0,0),0.3) \\\\operatorname{for} i=[1...10]\\\\right]，少写表达式',
-  '  · 复杂网格用「顶点列表 V=[(x,y,z),…]、索引列表 F=[…]」再写 \\\\operatorname{triangle}(V[F],V[G],V[H])，一条表达式画出整块网格，而不是逐三角面一条',
-  '  · 优先“解析曲面/参数曲面 + 少量表达式”，而不是堆大量单独三角形',
+  '  · 大量重复物体用列表推导：\\\\left[ \\\\operatorname{sphere}((i,0,0),0.3) \\\\operatorname{for} i=[1...10]\\\\right]（推导式本身要完整写出，不得丢项）',
+  '  · 复杂网格用「顶点列表 V、索引列表 F、G、H」再写 \\\\operatorname{triangle}(V[F],V[G],V[H])；V、F、G、H 必须逐项完整写出，不得省略任何顶点或面；每块列表建议 ≤1000 项，网格大就分多块（V_{a}、V_{b}…）全部写出',
+  '  · 形状能用解析曲面/参数曲面精确表达时用之；否则用完整网格，禁止为了少写而简化、合并或丢弃几何',
   '- 颜色：通过表达式 color 无法在标签内直接设时，仍输出正确几何；优先用可区分的多条曲面表达不同部件。',
   '- 示例：',
   '  <DESMOS>\\\\operatorname{sphere}\\\\left((0,0,0),2\\\\right)</DESMOS>',
@@ -572,9 +572,9 @@ const DESMOS_3D_MODE_ADDON_EN = [
   '- Idioms from top Desmos 3D graphs (The Meadow / Colormap Canyon):',
   '  · heightfield surfaces (x,y,H(x,y)) with sin sums or hash/fbm noise, bounded by \\\\left\\\\{a\\\\le x\\\\le b\\\\right\\\\}',
   '  · reusable helpers: f(x)=…, lerp(a,b,t)=a+(b-a)t, rotation functions, \\\\operatorname{hsv}/\\\\operatorname{rgb} colors',
-  '  · list comprehension for repeats: \\\\left[\\\\operatorname{sphere}((i,0,0),0.3)\\\\operatorname{for}i=[1...10]\\\\right]',
-  '  · meshes as vertex list V and index lists F,G,H, then one \\\\operatorname{triangle}(V[F],V[G],V[H]) — never one expression per triangle',
-  '  · prefer analytic / parametric surfaces over piles of separate triangles',
+  '  · list comprehension for repeats: \\\\left[\\\\operatorname{sphere}((i,0,0),0.3)\\\\operatorname{for}i=[1...10]\\\\right] (write the comprehension in full; never drop items)',
+  '  · meshes as vertex list V and index lists F,G,H, then \\\\operatorname{triangle}(V[F],V[G],V[H]); write V,F,G,H IN FULL item by item, never omit any vertex or face; keep each list ≤1000 items and split big meshes into several blocks (V_{a}, V_{b}…), all written out',
+  '  · use analytic / parametric surfaces when they express the shape exactly; otherwise use the full mesh — never simplify, merge or drop geometry just to write less',
   '- Examples:',
   '  <DESMOS>\\\\operatorname{sphere}\\\\left((0,0,0),2\\\\right)</DESMOS>',
   '  <DESMOS>(\\\\cos(u),\\\\sin(u),v)\\\\left\\\\{0\\\\le u\\\\le 2\\\\pi\\\\right\\\\}\\\\left\\\\{0\\\\le v\\\\le 3\\\\right\\\\}</DESMOS>',
@@ -596,10 +596,34 @@ export const getDesmos3DModeAddon = (lang: string = 'zh') =>
  * @param dimension - '2d' | '3d'；3D 时追加 Calculator3D 语法
  * @returns 系统提示词字符串
  */
+/** 完整输出规则：所有代码必须完整写出，禁止省略 / 隐藏 / 压缩（2D 与 3D、所有模式都生效） */
+const COMPLETE_OUTPUT_RULES_ZH = [
+  '',
+  '【完整输出（最高优先级）】',
+  '- 所有 <DESMOS> 公式、列表、坐标必须逐项完整写出：禁止用「…」「等」「以此类推」「略」「同上」代替数据，禁止只写前几项。',
+  '- 禁止为了变短而丢点、合并点、降低精度或简化结构；用户要的精度优先于篇幅。数据很多时用列表完整写出，而不是省略。',
+  '- 禁止用隐藏、折叠、压缩、编码手段藏代码，也不要说「代码已省略 / 见上文」。',
+  '- 若篇幅放不下，就分成多个 <DESMOS> 标签继续完整输出，直到全部写完，不要中途收尾。',
+  '- 不隐瞒任何一条已写入画板的公式（公式会显示在公式卡片里）。',
+  '',
+].join('\n');
+
+const COMPLETE_OUTPUT_RULES_EN = [
+  '',
+  '[COMPLETE OUTPUT - highest priority]',
+  '- Write every <DESMOS> formula, list and coordinate IN FULL: never replace data with "...", "etc.", "and so on", "omitted" or "same as above"; never write only the first few items.',
+  '- Never drop, merge or round points, lower precision or simplify structure just to be shorter; the requested fidelity beats brevity. For lots of data, write complete lists instead of omitting.',
+  '- Never hide, fold, compress or encode code, and never say "code omitted / see above".',
+  '- If it does not fit in one tag, continue in more <DESMOS> tags until everything is written; do not stop halfway.',
+  '- Never conceal any formula written to the canvas (formulas appear in formula cards).',
+  '',
+].join('\n');
+
 export const getSystemPrompt = (lang: string = 'zh', dimension: '2d' | '3d' = '2d') => {
   const base = PROMPTS[lang] || PROMPTS['zh'];
   const addon3d = dimension === '3d' ? getDesmos3DModeAddon(lang) : '';
-  return base + getCreativityModeAddon(lang) + addon3d;
+  const complete = lang === 'en' ? COMPLETE_OUTPUT_RULES_EN : COMPLETE_OUTPUT_RULES_ZH;
+  return base + getCreativityModeAddon(lang) + addon3d + complete;
 };
 
 // ─── 非流式 AI 调用 ──────────────────────────────────────────────────────────
@@ -645,7 +669,7 @@ export const callDeepSeek = async (
       },
       body: JSON.stringify({       // JSON.stringify 把对象转成 JSON 字符串（请求体）
         model: cfg.model,          // 使用的模型名
-        max_tokens: 4096,          // 最大生成 token 数（约等于 3000 个英文单词）
+        max_tokens: 8192,          // 最大生成 token 数：调高以免长代码被输出上限截断
         system: fullSystem,        // 系统提示词
         messages: chatMessages.map(m => ({
           role: m.role as 'user' | 'assistant',
@@ -896,7 +920,7 @@ export const callClaudeStream = async (
       },
       body: JSON.stringify({
         model,
-        max_tokens: 4096,
+        max_tokens: 8192,
         system: fullSystem,
         messages: chatMessages.map(m => ({
           role: m.role as 'user' | 'assistant',
@@ -1296,7 +1320,7 @@ export const callDeepSeekSolveStream = async (
       },
       body: JSON.stringify({
         model: cfg.model,
-        max_tokens: 4096,
+        max_tokens: 8192,
         system: SOLVE_SYSTEM[l],
         messages: [{
           role: 'user',

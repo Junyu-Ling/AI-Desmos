@@ -998,10 +998,32 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
     const parts: string[] = [`${index + 1}.`];
     if (forAnalyze && expr.color) parts.push(`[color=${expr.color}]`);
     if (expr.hidden) parts.push('[hidden]');
-    const maxLen = forAnalyze ? 280 : 150;
-    const body = latex.length > maxLen ? `${latex.substring(0, maxLen)}...` : latex;
-    parts.push(body);
+    // 完整输出：不再截断公式（含上万元素的列表）。只有超过整体上下文预算时，才会在
+    // listExpressionsWithinBudget 里被明确标注为「未列出」，绝不静默截断。
+    parts.push(latex);
     return parts.join(' ');
+  };
+
+  /** 画板上下文总预算（字符）：模型上下文有物理上限；放不下时整条明确标注，而不是截成半截 */
+  const CANVAS_CONTEXT_CHAR_BUDGET = 90000;
+
+  const listExpressionsWithinBudget = (items: any[], forAnalyze: boolean, budget: number): string[] => {
+    const lines: string[] = [];
+    let used = 0;
+    items.forEach((e, i) => {
+      const line = formatExpressionLine(e, i, forAnalyze);
+      if (used + line.length <= budget) {
+        lines.push(line);
+        used += line.length + 1;
+      } else {
+        const latex = String(e.latex || '');
+        const elems = (latex.match(/,/g) || []).length + 1;
+        lines.push(
+          `${i + 1}. [NOT LISTED - over context budget: ${latex.length} chars, about ${elems} elements] ${latex.slice(0, 80)}`,
+        );
+      }
+    });
+    return lines;
   };
 
   /**
@@ -1021,9 +1043,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
     const visibleExpressions = withLatex.filter(
       (e: any) => !e.hidden && !isInternalHelperExpression(e),
     );
-    const omittedHelpers = withLatex.filter(
+    // 隐藏表达式（网格顶点/索引/颜色列表等）同样是代码：一并交给 AI，不再省略
+    const hiddenExpressions = withLatex.filter(
       (e: any) => e.hidden || isInternalHelperExpression(e),
     );
+    const omittedHelpers: any[] = [];
 
     console.log(
       `[Analyze] Live snapshot: ${visibleExpressions.length} visible, `
@@ -1038,14 +1062,10 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
       contextStr += `${t('context_visible_count', { count: String(visibleExpressions.length) })}\n\n`;
     }
 
-    if (visibleExpressions.length > 0) {
-      const maxItems = forAnalyze ? 50 : 20;
-      const listed = visibleExpressions.slice(0, maxItems);
+    if (visibleExpressions.length > 0 || hiddenExpressions.length > 0) {
+      const ordered = [...visibleExpressions, ...hiddenExpressions];
       contextStr += `${forAnalyze ? t('context_expressions_live') : t('context_expressions')}\n`;
-      contextStr += listed.map((e, i) => formatExpressionLine(e, i, forAnalyze)).join('\n');
-      if (visibleExpressions.length > maxItems) {
-        contextStr += `\n... and ${visibleExpressions.length - maxItems} more visible expressions`;
-      }
+      contextStr += listExpressionsWithinBudget(ordered, forAnalyze, CANVAS_CONTEXT_CHAR_BUDGET).join('\n');
       contextStr += '\n';
       if (forAnalyze && omittedHelpers.length > 0) {
         contextStr += `\n${t('context_hidden_note', { count: String(omittedHelpers.length) })}\n`;
@@ -1246,8 +1266,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
                 content = m.content || '';
                 content = content.replace(/<<FORMULA>>([\s\S]*?)<<\/FORMULA>>/g, '<DESMOS>$1</DESMOS>');
               }
-              if (content.length > 800) {
-                content = content.substring(0, 800) + "\n... (truncated)";
+              if (content.length > 30000) {
+                content = content.substring(0, 30000) + `\n... (truncated: message was ${content.length} chars)`;
               }
               return {
                 role: m.role as 'user' | 'assistant',
