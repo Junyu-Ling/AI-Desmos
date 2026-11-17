@@ -97,16 +97,19 @@ export default defineConfig(({ mode }) => {
   const serverDeepSeekKey = env.DEEPSEEK_API_KEY || env.VITE_DEEPSEEK_API_KEY || '';
   const serverGeminiKey = env.GEMINI_API_KEY || env.VITE_GEMINI_API_KEY || '';
 
-  const injectBearer = (
-    proxyReq: import('http').ClientRequest,
-    req: import('http').IncomingMessage,
-    fallbackKey: string,
-  ) => {
-    const auth = req.headers['authorization'];
-    const bearerMatch = typeof auth === 'string' && auth.match(/^Bearer\s+(.+)$/i);
-    const key = (bearerMatch?.[1]?.trim()) || fallbackKey;
-    if (key) proxyReq.setHeader('Authorization', `Bearer ${key}`);
-  };
+  /**
+   * 给代理补上 Authorization。
+   *
+   * 不能用 proxyReq 事件里的 setHeader：http-proxy 在 socket 事件里触发 proxyReq，
+   * 而 Node 对 keep-alive 连接会在 request() 返回前就把请求头写进 socket，
+   * 那时 headersSent 已为 true，setHeader 被静默丢弃，上游收到空鉴权返回 401，
+   * 前端就显示 "Cannot reach AI service"。
+   *
+   * 改用代理的 headers 选项：它在组装上游请求头时合并（setupOutgoing），每次都生效。
+   * 客户端自己带了 Key 时，请求头里已有 Authorization，这里不会覆盖。
+   */
+  const withBearer = (fallbackKey: string) =>
+    fallbackKey ? { headers: { Authorization: `Bearer ${fallbackKey}` } } : {};
 
   const openaiCompatDevProxy = () => ({
     name: 'openai-compat-dev-proxy',
@@ -219,26 +222,21 @@ export default defineConfig(({ mode }) => {
   },
 
   server: {
+    host: '127.0.0.1',
+    port: 5173,
+    strictPort: true,
     proxy: {
       '/api/deepseek': {
         target: 'https://api.deepseek.com',
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api\/deepseek/, ''),
-        configure: (proxy) => {
-          proxy.on('proxyReq', (proxyReq, req) => {
-            injectBearer(proxyReq, req, serverDeepSeekKey);
-          });
-        },
+        ...withBearer(serverDeepSeekKey),
       },
       '/api/gemini': {
         target: 'https://generativelanguage.googleapis.com',
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api\/gemini/, ''),
-        configure: (proxy) => {
-          proxy.on('proxyReq', (proxyReq, req) => {
-            injectBearer(proxyReq, req, serverGeminiKey);
-          });
-        },
+        ...withBearer(serverGeminiKey),
       },
     },
   },
