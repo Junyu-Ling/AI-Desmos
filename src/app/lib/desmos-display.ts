@@ -2,8 +2,22 @@
  * Desmos 标签规范化、画板注入语法 vs 聊天 LaTeX 展示
  */
 
-/** 匹配 <DESMOS>…</DESMOS>（允许标签名与斜杠两侧有空格） */
-export const DESMOS_TAG_PATTERN = /<\s*DESMOS\s*>([\s\S]*?)<\s*\/\s*DESMOS\s*>/i;
+/**
+ * 匹配 <DESMOS>…</DESMOS> 与带属性的 <DESMOS color="#c0392b">…</DESMOS>
+ * 第 1 组是公式内容；属性用 parseDesmosTagAttributes 从整段标签里取
+ */
+export const DESMOS_TAG_PATTERN = /<\s*DESMOS(?:\s+[a-zA-Z]+\s*=\s*"[^"]*")*\s*>([\s\S]*?)<\s*\/\s*DESMOS\s*>/i;
+
+/** 读取开始标签上的属性（color 等） */
+export function parseDesmosTagAttributes(fullTag: string): Record<string, string> {
+  const open = /^<\s*DESMOS((?:\s+[a-zA-Z]+\s*=\s*"[^"]*")*)\s*>/i.exec(fullTag);
+  const attrs: Record<string, string> = {};
+  if (!open) return attrs;
+  const re = /([a-zA-Z]+)\s*=\s*"([^"]*)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(open[1])) !== null) attrs[m[1].toLowerCase()] = m[2].trim();
+  return attrs;
+}
 
 const desmosTagGlobal = () => new RegExp(DESMOS_TAG_PATTERN.source, 'gi');
 
@@ -14,11 +28,14 @@ export const DESMOS_TAG_REGEX = desmosTagGlobal();
 export function normalizeDesmosTagsInText(text: string): string {
   let s = text
     .replace(/<\s*\/\s*desmos\s*>/gi, '</DESMOS>')
-    .replace(/<\s*desmos\s*>/gi, '<DESMOS>');
+    .replace(/<\s*desmos((?:\s+[a-zA-Z]+\s*=\s*"[^"]*")*)\s*>/gi, '<DESMOS$1>');
 
-  s = s.replace(desmosTagGlobal(), (_m, inner) => {
+  s = s.replace(desmosTagGlobal(), (m, inner) => {
     const body = String(inner).replace(/[\n\r]+/g, ' ').replace(/\s+/g, ' ').trim();
-    return body ? `<DESMOS>${body}</DESMOS>` : '';
+    const attrs = Object.entries(parseDesmosTagAttributes(m))
+      .map(([k, v]) => ` ${k}="${v}"`)
+      .join('');
+    return body ? `<DESMOS${attrs}>${body}</DESMOS>` : '';
   });
 
   return s;

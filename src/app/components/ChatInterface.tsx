@@ -76,6 +76,7 @@ import {
   processImageToDesmos3D,
   processEmojiToDesmos3D,
 } from '../lib/draw-3d';
+import { loadShanghaiScene } from '../lib/shanghai-scene';
 import type { CalculatorDimension } from './DesmosCalculator';
 import { detachGifPlayback } from '../lib/gif-animation';
 import { extractGifFirstFrameAsPngFile } from '../lib/gif-decode';
@@ -1232,6 +1233,27 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
         endTask();
         setIsLoading(false);
         return;
+    }
+
+    if (
+      !readOnlyCanvas &&
+      !correctionExprId &&
+      is3DMode() &&
+      /上海|陆家嘴|外滩|shanghai|lujiazui|the bund/i.test(textToSend) &&
+      /画|绘|做|生成|建|来一个|展示|draw|build|make|render|create|show/i.test(textToSend) &&
+      calculatorRef.current
+    ) {
+      const count = loadShanghaiScene(calculatorRef.current, /[\u4e00-\u9fff]/.test(textToSend) ? 'zh' : language);
+      setMessages(prev => [...prev, {
+        id: aiMsgId,
+        role: 'assistant',
+        content: t('shanghai_scene_loaded', { count: String(count) }),
+        translationKey: 'shanghai_scene_loaded',
+        translationParams: { count: String(count) },
+      }]);
+      endTask();
+      setIsLoading(false);
+      return;
     }
 
     setMessages(prev => [...prev, { id: aiMsgId, role: 'assistant', content: '' }]);

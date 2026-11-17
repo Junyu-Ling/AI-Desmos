@@ -413,6 +413,7 @@ export const translations = {
     draw_3d_inject_progress: '正在写入 3D 网格列表 {current}/{total}…',
     draw_3d_complete: '已在 3D 模式重建浮雕立体（网格单元 {regions}，自适应合并后三角面 {triangles}，颜色 {colors}）。可拖动旋转查看。',
     draw_3d_emoji_complete: '已将 {emoji} 重建为 3D 着色立体（网格单元 {regions}，三角面 {triangles}）。',
+    shanghai_scene_loaded: '已生成「上海陆家嘴 · 四季」3D 场景（{count} 条表达式，全部在左侧列表中明文列出）。1 单位 = 100 米，东方明珠、上海中心、环球金融中心、金茂大厦按真实高度建模；拖动滑块 t₀（0 春 → 0.25 夏 → 0.5 秋 → 0.75 冬），或点播放键让一年自动循环：春天樱花粉、夏天浓绿、秋天梧桐金黄、冬天落叶积雪。',
     draw_3d_fail: '3D 立体重建失败，请重试。',
     mode_3d_draw_hint: '当前为 3D 模式：智能绘图 / Emoji / GIF 首帧将自动挤出为立体着色模型。',
 
@@ -900,6 +901,7 @@ export const translations = {
     draw_3d_inject_progress: 'Writing 3D mesh lists {current}/{total}…',
     draw_3d_complete: '3D relief ready ({regions} cells, {triangles} adaptively merged triangles, {colors} colors). Drag to rotate.',
     draw_3d_emoji_complete: 'Rebuilt {emoji} as a colored 3D solid ({regions} cells, {triangles} triangles).',
+    shanghai_scene_loaded: 'Built the "Shanghai Lujiazui · Four Seasons" 3D scene ({count} expressions, all listed in full on the left). 1 unit = 100 m; the Oriental Pearl, Shanghai Tower, SWFC and Jin Mao use real heights. Drag t₀ (0 spring → 0.25 summer → 0.5 autumn → 0.75 winter) or press play to loop the year.',
     draw_3d_fail: '3D reconstruction failed. Please retry.',
     mode_3d_draw_hint: '3D mode is on: smart-draw / emoji / GIF first-frame will extrude into colored solids.',
 

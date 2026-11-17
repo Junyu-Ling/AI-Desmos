@@ -16,8 +16,11 @@ import {
   DESMOS_TAG_PATTERN,
   normalizeDesmosFormulaLatex,
   normalizeDesmosTagsInText,
+  parseDesmosTagAttributes,
   prepareChatMessageDisplay,
 } from './desmos-display';
+import { normalizeParametricDomains } from './desmos-parametric-domain';
+import { detectCalculatorMode } from './desmos-persistence';
 import {
   expandFormulaForInject,
   createVariableInjectState,
@@ -66,7 +69,7 @@ export const parseDesmosResponse = (text: string): { display: string; desmos: st
   let displayText = text;
 
   // ── 第一步：识别新格式 <DESMOS>...</DESMOS> ──────────────────────────────
-  const xmlRegex = /<DESMOS>([\s\S]*?)<\/DESMOS>/g;
+  const xmlRegex = new RegExp(DESMOS_TAG_PATTERN.source, 'gi');
 
   let match;
 
@@ -128,6 +131,11 @@ export interface DesmosInjectState {
   /** 已从画板同步过已有变量定义 */
   canvasSeeded: boolean;
   vars: VariableInjectState;
+  /** 画板是否为 3D（首次注入时探测一次） */
+  is3D?: boolean;
+  /** 等待写入的 colorLatex（setExpression 会丢弃该字段，需经 setState） */
+  pendingColorLatex: Map<string, string>;
+  colorFlushTimer?: ReturnType<typeof setTimeout>;
 }
 
 export function createDesmosInjectState(): DesmosInjectState {
@@ -135,12 +143,42 @@ export function createDesmosInjectState(): DesmosInjectState {
     executedTags: new Set(),
     canvasSeeded: false,
     vars: createVariableInjectState(),
+    pendingColorLatex: new Map(),
   };
+}
+
+const HEX_COLOR_RE = /^#(?:[0-9a-fA-F]{3}){1,2}$/;
+
+/** 把 color="C_{roof}" / color="\operatorname{rgb}(…)" 这类颜色表达式统一经 setState 写入 */
+function flushPendingColorLatex(calculator: any, state: DesmosInjectState) {
+  if (state.pendingColorLatex.size === 0 || !calculator?.getState) return;
+  const pending = new Map(state.pendingColorLatex);
+  state.pendingColorLatex.clear();
+  try {
+    const graph = calculator.getState();
+    let changed = false;
+    for (const e of graph?.expressions?.list ?? []) {
+      const c = pending.get(String(e?.id));
+      if (c && e.colorLatex !== c) {
+        e.colorLatex = c;
+        changed = true;
+      }
+    }
+    if (changed) calculator.setState(graph, { allowUndo: true });
+  } catch (e) {
+    console.error('[Desmos] colorLatex flush failed:', e);
+  }
+}
+
+function scheduleColorFlush(calculator: any, state: DesmosInjectState) {
+  if (state.colorFlushTimer) clearTimeout(state.colorFlushTimer);
+  state.colorFlushTimer = setTimeout(() => flushPendingColorLatex(calculator, state), 350);
 }
 
 /**
  * 从流式 AI 回复中解析 <DESMOS> 标签并注入画板
  * 默认**追加**到现有画板，不会 setBlank 清空 GIF/已有公式。
+ * 参数区间（{0\le u\le 2\pi} 等）会转成 Desmos 的区间字段，保证曲面/曲线完整画出。
  */
 export function processDesmosStreamChunk(
   fullRawContent: string,
@@ -161,41 +199,58 @@ export function processDesmosStreamChunk(
   const ensureCanvasContext = () => {
     if (state.canvasSeeded) return;
     seedVariableInjectStateFromCalculator(calculator, state.vars);
+    state.is3D = detectCalculatorMode(calculator) === '3d';
     state.canvasSeeded = true;
   };
 
-  const injectBatch = (cleanFormula: string, correctionExprId?: string | null) => {
-    const injectOne = (latex: string, exprId: string) => {
+  const buildExpression = (latex: string, exprId: string, color?: string) => {
+    if (state.is3D === undefined) state.is3D = detectCalculatorMode(calculator) === '3d';
+    const dom = normalizeParametricDomains(latex, !!state.is3D);
+    const expr: Record<string, unknown> = { id: exprId, latex: dom.latex };
+    if (dom.parametricDomain) expr.parametricDomain = dom.parametricDomain;
+    if (dom.parametricDomain3Du) expr.parametricDomain3Du = dom.parametricDomain3Du;
+    if (dom.parametricDomain3Dv) expr.parametricDomain3Dv = dom.parametricDomain3Dv;
+    if (color && HEX_COLOR_RE.test(color)) expr.color = color;
+    else if (color) {
+      state.pendingColorLatex.set(exprId, color);
+      scheduleColorFlush(calculator, state);
+    }
+    return expr;
+  };
+
+  const injectBatch = (cleanFormula: string, correctionExprId?: string | null, color?: string) => {
+    const injectOne = (latex: string, exprId: string, withColor: boolean) => {
       if (correctionExprId && correctionExprId !== 'unknown') {
-        calculator.setExpression({ id: correctionExprId, latex });
+        calculator.setExpression(buildExpression(latex, correctionExprId, withColor ? color : undefined));
         return;
       }
       const existingIds = calculator?.getState?.()?.expressions?.list
         ?.map((e: { id?: string }) => String(e?.id ?? '')) ?? [];
       if (existingIds.includes(exprId)) return;
-      calculator.setExpression({ id: exprId, latex });
+      calculator.setExpression(buildExpression(latex, exprId, withColor ? color : undefined));
     };
 
     if (correctionExprId && correctionExprId !== 'unknown') {
       const correctionKey = `__correction__:${correctionExprId}`;
       if (state.executedTags.has(correctionKey)) return;
       state.executedTags.add(correctionKey);
-      injectOne(cleanFormula, correctionExprId);
+      injectOne(cleanFormula, correctionExprId, true);
       return;
     }
 
     ensureCanvasContext();
 
     const toInject = expandFormulaForInject(cleanFormula, state.vars);
-    for (const { latex, exprId } of toInject) {
-      injectOne(latex, exprId);
-    }
+    toInject.forEach(({ latex, exprId }, i) => {
+      injectOne(latex, exprId, i === toInject.length - 1);
+    });
   };
 
   while ((match = tagRegex.exec(normalizedRaw)) !== null) {
     const fullTag = match[0];
     const formulaContent = match[1];
-    const tagKey = fullTag.toLowerCase();
+    // 不能转小写：R=2 与 r=2 是两条不同的公式
+    const tagKey = fullTag;
 
     if (state.executedTags.has(tagKey)) continue;
     state.executedTags.add(tagKey);
@@ -206,7 +261,7 @@ export function processDesmosStreamChunk(
     if (!cleanFormula) continue;
 
     try {
-      injectBatch(cleanFormula, options.correctionExprId);
+      injectBatch(cleanFormula, options.correctionExprId, parseDesmosTagAttributes(fullTag).color);
     } catch (e) {
       console.error('[Desmos] Injection failed:', e);
     }
@@ -215,7 +270,7 @@ export function processDesmosStreamChunk(
   while ((match = legacyRegex.exec(normalizedRaw)) !== null) {
     const fullTag = match[0];
     const formulaContent = match[1];
-    const tagKey = fullTag.toLowerCase();
+    const tagKey = fullTag;
     if (state.executedTags.has(tagKey)) continue;
     state.executedTags.add(tagKey);
     const cleanFormula = normalizeDesmosFormulaLatex(formulaContent);

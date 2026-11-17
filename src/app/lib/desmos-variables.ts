@@ -3,17 +3,66 @@
  */
 
 const RESERVED = new Set([
-  'x', 'y', 't', 'e', 'pi', 'tau', 'theta', 'infty', 'infinity',
+  'x', 'y', 'z', 't', 'u', 'v', 'e', 'pi', 'tau', 'theta', 'rho', 'phi', 'infty', 'infinity',
   'sin', 'cos', 'tan', 'cot', 'sec', 'csc', 'log', 'ln', 'exp',
   'min', 'max', 'mod', 'floor', 'ceil', 'round', 'total', 'gcd', 'lcm',
   'mean', 'median', 'stdev', 'corr', 'var', 'length', 'count',
 ]);
 
 const LATEX_CMD_RE = /\\[a-zA-Z]+/g;
-const IDENT_RE = /(?<![\\a-zA-Z_])([a-zA-Z](?:_\{?\d+\}?)?)(?![a-zA-Z_{])/g;
+const IDENT_RE = /(?<![\\a-zA-Z_])([a-zA-Z]_\{\d+\}|[a-zA-Z]_\d|[a-zA-Z](?![a-zA-Z_{]))/g;
 
-/** 匹配变量赋值：a=1、W=30、h_{1}=0 */
-const ASSIGN_RE = /^([a-zA-Z][a-zA-Z0-9]*(?:_\{[0-9]+\})?)\s*=/;
+/** 匹配变量赋值：a=1、W=30、h_{1}=0、C_{roof}=… */
+const ASSIGN_RE = /^([a-zA-Z](?:_\{[a-zA-Z0-9]+\}|_[a-zA-Z0-9])?)\s*=(?!=)/;
+
+/** 函数定义：f(x)=…、s_{phere}(u,v)=…、r_{x}\left(\theta,p\right)=… */
+const FUNC_DEF_RE = /^([a-zA-Z](?:_\{[a-zA-Z0-9]+\}|_[a-zA-Z0-9])?)\s*(?:\\left)?\(([^()]*?)(?:\\right)?\)\s*=(?!=)/;
+
+/** 坐标/参数名：x=3、y=x^2、z=…、r=… 是图形而不是变量赋值 */
+const GRAPH_LHS = new Set(['x', 'y', 'z', 'r']);
+
+const IDENT_TOKEN = String.raw`(?:[a-zA-Z]|\\[a-zA-Z]+)(?:_\{[a-zA-Z0-9]+\}|_[a-zA-Z0-9])?`;
+
+/** for / with 绑定的局部变量：\operatorname{for}i=[1...10]、\operatorname{with}k=2,s=.1 */
+function extractBoundVariables(latex: string): Set<string> {
+  const bound = new Set<string>();
+  const re = new RegExp(String.raw`\\operatorname\{(?:for|with)\}\s*`, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(latex)) !== null) {
+    let rest = latex.slice(m.index + m[0].length);
+    const bindRe = new RegExp(String.raw`^\s*(${IDENT_TOKEN})\s*=`);
+    let bm = bindRe.exec(rest);
+    while (bm) {
+      bound.add(bm[1].replace(/^\\/, ''));
+      rest = rest.slice(bm[0].length);
+      let depth = 0;
+      let i = 0;
+      for (; i < rest.length; i++) {
+        const ch = rest[i];
+        if (ch === '(' || ch === '[' || ch === '{') depth++;
+        else if (ch === ')' || ch === ']' || ch === '}') {
+          if (depth === 0) break;
+          depth--;
+        } else if (ch === ',' && depth === 0) break;
+      }
+      if (rest[i] !== ',') break;
+      rest = rest.slice(i + 1);
+      bm = bindRe.exec(rest);
+    }
+  }
+  return bound;
+}
+
+/** 解析函数定义，返回函数名与形参 */
+export function parseFunctionDefinition(latex: string): { name: string; params: string[] } | null {
+  const m = FUNC_DEF_RE.exec(latex.trim());
+  if (!m) return null;
+  const params = m[2]
+    .split(',')
+    .map(p => p.trim().replace(/^\\/, ''))
+    .filter(Boolean);
+  return { name: m[1], params };
+}
 
 const ZERO_DEFAULT = new Set(['h', 'k', 'c', 'd', 'o', 'u', 'v', 'x0', 'y0', 'cx', 'cy', 'ox', 'oy']);
 const SPAN_DEFAULT = new Set(['w', 'W']);
@@ -27,7 +76,8 @@ export function isReservedVariable(name: string): boolean {
 
 export function parseAssignmentVariable(latex: string): string | null {
   const m = ASSIGN_RE.exec(latex.trim());
-  return m ? m[1] : null;
+  if (!m || GRAPH_LHS.has(m[1])) return null;
+  return m[1];
 }
 
 export function isVariableAssignment(latex: string): boolean {
@@ -35,16 +85,26 @@ export function isVariableAssignment(latex: string): boolean {
 }
 
 export function extractUsedVariables(latex: string): string[] {
+  const local = extractBoundVariables(latex);
+  const fn = parseFunctionDefinition(latex);
+  if (fn) fn.params.forEach(p => local.add(p));
   const stripped = latex
+    .replace(/\\operatorname\{[a-zA-Z]+\}/g, ' ')
     .replace(LATEX_CMD_RE, ' ')
-    .replace(/[0-9.]+/g, ' ');
+    .replace(/\.(?:x|y|z)(?![a-zA-Z])/g, ' ')
+    .replace(/(?<![_{\w])[0-9.]+/g, ' ');
   const found = new Set<string>();
   let m: RegExpExecArray | null;
   const re = new RegExp(IDENT_RE.source, 'g');
   while ((m = re.exec(stripped)) !== null) {
     const id = m[1];
-    if (!isReservedVariable(id)) found.add(id);
+    if (isReservedVariable(id) || local.has(id)) continue;
+    // 紧跟括号的是函数调用（f(x)、g\left(…\right)），不自动补成变量
+    const after = stripped.slice(m.index + m[0].length);
+    if (/^\s*(?:\(|left\s*\()/.test(after) || /^\s*\(/.test(after)) continue;
+    found.add(id);
   }
+  if (fn) found.delete(fn.name);
   return Array.from(found);
 }
 
@@ -116,6 +176,15 @@ export function expandFormulaForInject(
     }
   };
 
+  const fnDef = parseFunctionDefinition(latex);
+  if (fnDef) {
+    ensureDefined(extractUsedVariables(latex));
+    state.definedVars.add(fnDef.name);
+    state.autoDefinedVars.delete(fnDef.name);
+    items.push({ latex, exprId: nextId() });
+    return items;
+  }
+
   if (assignVar) {
     ensureDefined(extractUsedVariables(latex).filter(v => v !== assignVar));
     if (state.definedVars.has(assignVar)) {
@@ -152,6 +221,11 @@ export function seedVariableInjectStateFromCalculator(
       maxAiSeq = Math.max(maxAiSeq, parseInt(aiMatch[1], 10));
     }
     const latex = String(expr?.latex ?? '').trim();
+    const fnDef = parseFunctionDefinition(latex);
+    if (fnDef) {
+      state.definedVars.add(fnDef.name);
+      continue;
+    }
     const assignVar = parseAssignmentVariable(latex);
     if (!assignVar || state.definedVars.has(assignVar)) continue;
     state.definedVars.add(assignVar);
