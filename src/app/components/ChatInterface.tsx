@@ -529,6 +529,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
 
   /** showExport — 是否显示导出面板（显示导出脚本和复制按钮） */
   const [showExport, setShowExport] = useState(false);
+  /** exportIs3D — 打开导出面板时画板是否处于 3D，用来指向 desmos.com/3d */
+  const [exportIs3D, setExportIs3D] = useState(false);
+  const exportTextRef = useRef<HTMLTextAreaElement>(null);
 
   /** showSettings — 是否显示设置面板（API Key、模型、语言等） */
   const [showSettings, setShowSettings] = useState(false);
@@ -807,16 +810,43 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
   const handleExport = () => {
     if (!calculatorRef.current) return;
 
-    // getState() 返回画板的完整状态对象（包含所有表达式、设置等）
-    const state = calculatorRef.current.getState();
+    const is3d = is3DMode();
+    setExportIs3D(is3d);
 
-    // 生成 JavaScript 代码：Calc.setState({...})
-    // JSON.stringify 把状态对象序列化成 JSON 字符串
-    const script = `Calc.setState(${JSON.stringify(state)})`;
+    // getState() 返回画板的完整状态。用字符串拼接把 JSON 放进脚本，
+    // 这样公式里的反斜杠会原样留给官网控制台解析。
+    let json: string;
+    try {
+      json = JSON.stringify(calculatorRef.current.getState());
+    } catch {
+      alert(t('export_fail'));
+      return;
+    }
 
-    setExportScript(script);  // 保存到状态
+    const zh = language !== 'en';
+    const alertFor = (message: string) => 'alert(' + JSON.stringify(message) + ')';
+    const script = [
+      '(() => {',
+      'const state = ' + json + ';',
+      'const want3d = !!(state.graph && state.graph.product === "graphing-3d");',
+      'const on3d = /\\/3d(\\/|$)/.test(location.pathname);',
+      'if (typeof Calc === "undefined" || !Calc.setState) { ' + alertFor(zh
+        ? '没有找到 Desmos。请在 desmos.com 页面按 F12 打开控制台再粘贴。'
+        : 'Desmos was not found. Open a desmos.com page, press F12, and paste this in the console.') + '; return; }',
+      'if (want3d && !on3d) { ' + alertFor(zh
+        ? '这是 3D 画板。请打开 https://www.desmos.com/3d ，再把这段代码粘贴到控制台。贴到 2D 计算器里图形会被丢掉。'
+        : 'This is a 3D graph. Open https://www.desmos.com/3d and paste there. The 2D calculator discards it.') + '; return; }',
+      'if (!want3d && on3d) { ' + alertFor(zh
+        ? '这是 2D 画板。请打开 https://www.desmos.com/calculator 再粘贴。'
+        : 'This is a 2D graph. Open https://www.desmos.com/calculator and paste there.') + '; return; }',
+      'try { Calc.setState(state, { allowUndo: true }); }',
+      'catch (e) { alert(' + JSON.stringify(zh ? '导入失败：' : 'Import failed: ') + ' + (e && e.message ? e.message : e)); }',
+      '})();',
+    ].join('\n');
+
+    setExportScript(script);
     setCopyCodeSuccess(false);
-    setShowExport(true);      // 打开导出面板
+    setShowExport(true);
   };
 
   const markCopyCodeSuccess = () => {
@@ -856,6 +886,13 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
 
     const finish = () => document.body.removeChild(textArea);
 
+    const selectScript = () => {
+      const box = exportTextRef.current;
+      if (!box) return;
+      box.focus();
+      box.select();
+    };
+
     try {
       const successful = document.execCommand('copy');
       if (successful) {
@@ -872,9 +909,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
           .then(() => markCopyCodeSuccess())
           .catch(e => {
             console.error('All copy methods failed', e);
+            selectScript();
             alert(t('copy_fail'));
           });
       } else {
+        selectScript();
         alert(t('copy_fail'));
       }
     }
@@ -2995,7 +3034,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
                         <ol className="space-y-1.5 list-none p-0 m-0">
                             {([
                                 { num: '1', key: 'step_copy' as const },
-                                { num: '2', key: 'step_open' as const },
+                                { num: '2', key: (exportIs3D ? 'step_open_3d' : 'step_open') as const },
                                 { num: '3', key: 'step_console' as const },
                                 { num: '4', key: 'step_paste' as const },
                             ]).map(item => (
@@ -3008,8 +3047,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
                     </div>
 
                     {/* Script area */}
-                    <p className="text-xs text-gray-500 mb-1.5">{t('export_guide')}</p>
-                    <textarea 
+                    <p className="text-xs text-gray-500 mb-1.5">{t('export_guide', { url: exportIs3D ? 'https://www.desmos.com/3d' : 'https://www.desmos.com/calculator' })}</p>
+                    <textarea
+                        ref={exportTextRef}
                         className="flex-1 w-full p-4 bg-gray-50 border border-gray-200 rounded-xl font-mono text-xs text-gray-600 focus:ring-2 focus:ring-blue-500 focus:outline-none resize-none mb-4 min-h-[80px]"
                         readOnly
                         value={exportScript}

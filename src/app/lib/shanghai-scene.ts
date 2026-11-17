@@ -232,6 +232,16 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   ex('C_{snow}=\\operatorname{rgb}\\left(244,247,252\\right)');
   ex('k_{leaf}=M\\left(\\left[0.95,1.05,0.95,0.42\\right]\\right)');
   ex('s_{now}=M\\left(\\left[-0.03,-0.03,-0.03,0.045\\right]\\right)');
+  ex('s_{w}=\\max\\left(0,\\min\\left(1,\\frac{s_{now}}{0.04}\\right)\\right)', { hidden: true });
+
+  // 幕墙：f_ace 在窗框和楼层线处接近 1、玻璃中心接近 0。依赖 x,y,z，不隐藏会被画成一整张曲面。
+  text('🪟 幕墙：f_ace 用 x、y、z 的余弦峰画出竖梃和楼层线，用在上海中心、金茂、环球金融中心和陆家嘴最高的 8 栋上。这些颜色公式如果显示出来，Desmos 会把它们画成一整张曲面，所以标成隐藏。普通楼用挑出的楼层板表现分层。', '🪟 Facades: f_ace draws mullions and floor lines on Shanghai Tower, Jin Mao, SWFC and the 8 tallest Lujiazui towers. Those color formulas are hidden, otherwise Desmos plots them as a giant surface. Other blocks get protruding floor plates.');
+  ex('f_{ace}=\\min\\left(1,\\max\\left(0,\\cos\\left(\\frac{2\\pi x}{0.055}\\right)\\right)^{14}+\\max\\left(0,\\cos\\left(\\frac{2\\pi y}{0.055}\\right)\\right)^{14}+\\max\\left(0,\\cos\\left(\\frac{2\\pi z}{0.09}\\right)\\right)^{10}\\right)', { hidden: true });
+  ex('C_{glass}=\\operatorname{rgb}\\left(96+42\\sin\\left(2.2x\\right)-58f_{ace},138+22\\sin\\left(2.2y\\right)-42f_{ace},172-16f_{ace}\\right)', { hidden: true });
+  ex('C_{podium}=\\operatorname{rgb}\\left(150-28f_{ace},142-22f_{ace},132-14f_{ace}\\right)', { hidden: true });
+  ex('C_{roof}=\\operatorname{rgb}\\left(148+96s_{w},160+90s_{w},174+78s_{w}\\right)');
+  ex('C_{mullion}=\\operatorname{rgb}\\left(46,58,70\\right)');
+  ex('C_{jinmao}=\\operatorname{rgb}\\left(166+55\\max\\left(0,\\cos\\left(\\frac{26\\pi z}{4.02}\\right)\\right)^{6}-52f_{ace},140+40\\max\\left(0,\\cos\\left(\\frac{26\\pi z}{4.02}\\right)\\right)^{6}-36f_{ace},108-14f_{ace}\\right)', { hidden: true });
 
   // ── 工具函数 ──
   text('🧰 工具函数：U_a/U_b/U_c 是单位立方体 10 个三角面（不含底面）的顶点；B(p,c,w,d,h,k,l,a) 把单位立方体变成底心 c、半宽 w×d、高 h、顶部收分 k/l、转角 a 的楼块。', '🧰 Helpers: U_a/U_b/U_c are the 10 faces of a unit cube; B(p,c,w,d,h,k,l,a) maps it to a block with base center c, half sizes w×d, height h, top taper k/l, rotation a.');
@@ -277,31 +287,79 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
       const snowArgs = (U: string) =>
         `B\\left(U_{${U}}\\left[j\\right],P_{${tag}}\\left[i\\right]+\\left(0,0,H_{${tag}}\\left[i\\right]-0.03\\right),W_{${tag}}\\left[i\\right]K_{${tag}}\\left[i\\right]+0.004,D_{${tag}}\\left[i\\right]L_{${tag}}\\left[i\\right]+0.004,0.03+s_{now},1,1,A_{${tag}}\\left[i\\right]\\right)`;
       ex(`\\left[\\operatorname{triangle}\\left(${snowArgs('a')},${snowArgs('b')},${snowArgs('c')}\\right)\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...${n}\\right]\\right]`, { colorLatex: 'C_{snow}' });
+      // 楼层线只画侧面，避免和顶面、积雪叠在一起把采样拖死
+      const plate = (U: string) =>
+        `B\\left(U_{${U}}\\left[j\\right],P_{${tag}}\\left[i\\right]+\\left(0,0,H_{${tag}}\\left[i\\right]\\cdot\\frac{k}{5}\\right),1.04\\cdot W_{${tag}}\\left[i\\right],1.04\\cdot D_{${tag}}\\left[i\\right],0.012,1,1,A_{${tag}}\\left[i\\right]\\right)`;
+      ex(`\\left[\\operatorname{triangle}\\left(${plate('a')},${plate('b')},${plate('c')}\\right)\\operatorname{for}j=\\left[3...10\\right],k=\\left[1,3\\right],i=\\left[1...${n}\\right]\\right]`, { colorLatex: 'C_{mullion}' });
     }
   };
 
-  group('bund', ['🏛 外滩万国建筑群：沿江一排石材建筑，含海关大楼钟楼与和平饭店（绿色金字塔顶）。', '🏛 The Bund: a riverside row of stone buildings incl. the Customs House clock tower and the Peace Hotel.'], city.bund, true);
-  group('bt', ['海关大楼钟楼', 'Customs House clock tower'], city.bundTowers, true, () => 0);
+  // 方截面楼身：u 绕一圈，v 从下到上。列表广播成一整片楼。
+  const RHO = '\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)';
+  const putLists = (tag: string, bs: Building[]) => {
+    const num = (sel: (b: Building) => number) => list(bs.map(b => f(sel(b))));
+    ex(`X_{${tag}}=${num(b => b.x)}`);
+    ex(`Y_{${tag}}=${num(b => b.y)}`);
+    ex(`W_{${tag}}=${num(b => b.w)}`);
+    ex(`D_{${tag}}=${num(b => b.d)}`);
+    ex(`H_{${tag}}=${num(b => b.h)}`);
+    ex(`K_{${tag}}=${num(b => b.k)}`);
+    ex(`L_{${tag}}=${num(b => b.l)}`);
+    ex(`A_{${tag}}=${num(b => b.a)}`);
+  };
+  const wall = (tag: string, zLatex: string, wMul: string, dMul: string, taper: boolean) => {
+    const tx = taper ? `\\left(1-\\left(1-K_{${tag}}\\right)v\\right)` : '1';
+    const ty = taper ? `\\left(1-\\left(1-L_{${tag}}\\right)v\\right)` : '1';
+    return `\\left(X_{${tag}}+q_{x}\\cos\\left(A_{${tag}}\\right)-q_{y}\\sin\\left(A_{${tag}}\\right),Y_{${tag}}+q_{x}\\sin\\left(A_{${tag}}\\right)+q_{y}\\cos\\left(A_{${tag}}\\right),${zLatex}\\right)\\operatorname{with}q_{x}=${wMul}W_{${tag}}${RHO}\\cos\\left(2\\pi u\\right)${tx},q_{y}=${dMul}D_{${tag}}${RHO}\\sin\\left(2\\pi u\\right)${ty}`;
+  };
+  const lid = (tag: string, zLatex: string, wMul: string, dMul: string) =>
+    `\\left(X_{${tag}}+v\\cdot q_{x}\\cos\\left(A_{${tag}}\\right)-v\\cdot q_{y}\\sin\\left(A_{${tag}}\\right),Y_{${tag}}+v\\cdot q_{x}\\sin\\left(A_{${tag}}\\right)+v\\cdot q_{y}\\cos\\left(A_{${tag}}\\right),${zLatex}\\right)\\operatorname{with}q_{x}=${wMul}W_{${tag}}${RHO}\\cos\\left(2\\pi u\\right),q_{y}=${dMul}D_{${tag}}${RHO}\\sin\\left(2\\pi u\\right)`;
+
+  group('bund', ['🏛 外滩万国建筑群：石材楼身，挑出四道楼层线，含海关大楼钟楼与和平饭店（绿色金字塔顶）。', '🏛 The Bund: stone blocks with four floor plates, the Customs House clock tower and the Peace Hotel.'], city.bund, true);
+  group('bt', ['海关大楼钟楼。', 'Customs House clock tower.'], city.bundTowers, true);
   const p = city.peace;
   const top = p.h, ph = 0.22;
   ex(`\\operatorname{triangle}\\left(${list([pt(p.x - 0.12, p.y - 0.12, top), pt(p.x + 0.12, p.y - 0.12, top), pt(p.x + 0.12, p.y + 0.12, top), pt(p.x - 0.12, p.y + 0.12, top)])},${list([pt(p.x + 0.12, p.y - 0.12, top), pt(p.x + 0.12, p.y + 0.12, top), pt(p.x - 0.12, p.y + 0.12, top), pt(p.x - 0.12, p.y - 0.12, top)])},${pt(p.x, p.y, top + ph)}\\right)`, { color: '#3f8f6b' });
   ex(`\\operatorname{sphere}\\left(${pt(city.customs.x + 0.2, city.customs.y, 0.74)},0.04\\right)`, { color: '#f2ead2' });
 
-  group('px', ['🏙 浦西纵深的高楼。', '🏙 Puxi high-rises behind the Bund.'], city.puxi, true);
+  group('px', ['🏙 浦西纵深的高楼，楼身挑出楼层线。', '🏙 Puxi high-rises with floor plates.'], city.puxi, true);
   group('nb', ['🏙 北岸（北外滩、虹口）。', '🏙 North bank (North Bund, Hongkou).'], city.north, true);
-  group('lj', ['🏙 陆家嘴楼群：越靠近三塔越高，街区整体转角约 −24°。', '🏙 Lujiazui towers: taller near the super-tall trio, street grid rotated about −24°.'], city.lujiazui, true);
+  const heroes = [...city.lujiazui].sort((a, b) => b.h - a.h).slice(0, 8);
+  const heroSet = new Set(heroes);
+  group('lj', ['🏙 陆家嘴楼群：越靠近三塔越高，楼身有楼层线。其中最高的 8 栋改成带窗格的玻璃幕墙。', '🏙 Lujiazui towers, taller near the super-tall trio. The 8 tallest use a windowed glass curtain wall.'], city.lujiazui.filter(b => !heroSet.has(b)), true);
+  text('最高的 8 栋陆家嘴塔楼：方截面幕墙，竖梃和楼层线来自 f_ace，向上略收分。', 'The 8 tallest Lujiazui towers: square curtain walls, mullions and floor lines from f_ace, tapering toward the top.');
+  putLists('hero', heroes);
+  ex(wall('hero', 'H_{hero}v', '1', '1', true), { colorLatex: 'C_{glass}' });
+  ex(lid('hero', 'H_{hero}', 'K_{hero}', 'L_{hero}'), { colorLatex: 'C_{roof}' });
 
-  // ── 金茂 ──
-  group('jm', ['🗼 金茂大厦（421 m）：13 层塔式逐层收分 + 冠顶 + 尖塔。', '🗼 Jin Mao Tower (421 m): 13 pagoda-like setbacks, crown and spire.'], city.jinmao, false, b => (b as any).z);
-  ex(`\\left(${f(JINMAO.x)}+0.06\\left(1-v\\right)\\cos\\left(2\\pi u\\right),${f(JINMAO.y)}+0.06\\left(1-v\\right)\\sin\\left(2\\pi u\\right),${f(city.jinmaoTop)}+${f(4.21 - city.jinmaoTop)}v\\right)`, { color: '#c9b98c' });
+  // ── 金茂：八边形截面，逐层出檐 ──
+  text('🗼 金茂大厦（421 m）：八边形截面，沿高度 13 次出檐收分，青铜色幕墙，顶部金色尖塔。', '🗼 Jin Mao Tower (421 m): octagonal section with 13 eaves, bronze curtain wall and a gold spire.');
+  ex('r_{jm}\\left(v\\right)=0.30-0.15v+0.022\\max\\left(0,\\cos\\left(26\\pi v\\right)\\right)^{6}', { hidden: true });
+  ex(`\\left(${f(JINMAO.x)}+q_{x}\\cos\\left(-0.42\\right)-q_{y}\\sin\\left(-0.42\\right),${f(JINMAO.y)}+q_{x}\\sin\\left(-0.42\\right)+q_{y}\\cos\\left(-0.42\\right),4.02v\\right)\\operatorname{with}q_{x}=r_{jm}\\left(v\\right)\\sec\\left(\\operatorname{mod}\\left(2\\pi u,\\frac{\\pi}{4}\\right)-\\frac{\\pi}{8}\\right)\\cos\\left(2\\pi u\\right),q_{y}=r_{jm}\\left(v\\right)\\sec\\left(\\operatorname{mod}\\left(2\\pi u,\\frac{\\pi}{4}\\right)-\\frac{\\pi}{8}\\right)\\sin\\left(2\\pi u\\right)`, { colorLatex: 'C_{jinmao}' });
+  ex(`\\left(${f(JINMAO.x)}+0.42v\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)\\cos\\left(2\\pi u-0.42\\right),${f(JINMAO.y)}+0.42v\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)\\sin\\left(2\\pi u-0.42\\right),0.16\\right)`, { colorLatex: 'C_{podium}' });
+  ex(`\\left(${f(JINMAO.x)}+0.05\\left(1-v\\right)\\cos\\left(2\\pi u\\right),${f(JINMAO.y)}+0.05\\left(1-v\\right)\\sin\\left(2\\pi u\\right),4.02+0.19v\\right)`, { color: '#e6d7a2' });
 
-  // ── 环球金融中心 ──
-  group('sw', ['🗼 上海环球金融中心（492 m）：一个方向收窄成刀锋，顶部有「开瓶器」洞口（浅色面板表示透空）。', '🗼 Shanghai World Financial Center (492 m): tapers to a blade with the "bottle-opener" aperture.'], [city.swfc], true);
-  group('swh', ['开瓶器洞口', 'Aperture'], [{ x: SWFC.x, y: SWFC.y, w: 0.13, d: 0.088, h: 0.36, k: 1, l: 0.75, a: 0.35, c: [214, 232, 244] }], false, () => 4.38);
+  // ── 环球金融中心：一个方向收到刀锋，洞口用四根框而不是一块挡板 ──
+  text('🗼 上海环球金融中心（492 m）：梯形刀锋收分，幕墙有窗格，顶部「开瓶器」是透空的框。', '🗼 Shanghai World Financial Center (492 m): tapers to a blade, with a window grid and an open bottle-opener frame.');
+  ex(`\\left(${f(SWFC.x)}+q_{x}\\cos\\left(0.35\\right)-q_{y}\\sin\\left(0.35\\right),${f(SWFC.y)}+q_{x}\\sin\\left(0.35\\right)+q_{y}\\cos\\left(0.35\\right),4.92v\\right)\\operatorname{with}q_{x}=0.3\\left(1-0.12v\\right)${RHO}\\cos\\left(2\\pi u\\right),q_{y}=0.3\\left(1-0.82v\\right)${RHO}\\sin\\left(2\\pi u\\right)`, { colorLatex: 'C_{glass}' });
+  {
+    const a = 0.35, c = Math.cos(a), s = Math.sin(a);
+    const at = (lx: number, ly: number, z: number): Building => ({
+      x: SWFC.x + lx * c - ly * s, y: SWFC.y + lx * s + ly * c,
+      w: 0.02, d: 0.018, h: 0.04, k: 1, l: 1, a, c: [232, 240, 246],
+    });
+    const frame: Building[] = [
+      { ...at(-0.1, 0, 4.42), w: 0.016, d: 0.02, h: 0.36 },
+      { ...at(0.1, 0, 4.42), w: 0.016, d: 0.02, h: 0.36 },
+      { ...at(0, 0, 4.42), w: 0.11, d: 0.016, h: 0.028 },
+      { ...at(0, 0, 4.75), w: 0.1, d: 0.014, h: 0.028 },
+    ];
+    group('swh', ['开瓶器洞口：左右两根立柱加上下两根横梁，中间是空的。', 'Aperture: two posts and two beams, open in the middle.'], frame, false, b => [4.42, 4.42, 4.42, 4.75][frame.indexOf(b)]);
+  }
 
   // ── 上海中心 ──
-  text('🗼 上海中心大厦（632 m）：圆角三角形截面，自下而上收分并扭转 120°；颜色随高度 z 变化画出 9 个分区的设备层。', '🗼 Shanghai Tower (632 m): rounded-triangle section tapering and twisting 120°, colored by height to show its 9 zones.');
-  ex('C_{st}=\\operatorname{rgb}\\left(150+60\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30},178+50\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30},196+40\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}\\right)');
+  text('🗼 上海中心大厦（632 m）：圆角三角形截面，自下而上收分并扭转 120°。设备层是高度上的亮带，竖梃和楼层线来自 u 和 z。', '🗼 Shanghai Tower (632 m): rounded-triangle section tapering and twisting 120°, with zone bands, mullions and floor lines.');
+  ex('C_{st}=\\operatorname{rgb}\\left(150+70\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-42\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8}-22\\max\\left(0,\\cos\\left(\\frac{2\\pi z}{0.08}\\right)\\right)^{8},178+55\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-30\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8}-16\\max\\left(0,\\cos\\left(\\frac{2\\pi z}{0.08}\\right)\\right)^{8},196+45\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-18\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8}\\right)', { hidden: true });
   ex(`r_{st}\\left(u,v\\right)=0.43\\left(1-0.55v\\right)\\left(1+0.11\\cos\\left(3\\left(2\\pi u-\\frac{2\\pi}{3}v\\right)\\right)\\right)`, { hidden: true });
   ex(`\\left(${f(SHTOWER.x)}+r_{st}\\left(u,v\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+r_{st}\\left(u,v\\right)\\sin\\left(2\\pi u\\right),6.1v\\right)`, { colorLatex: 'C_{st}' });
   ex(`\\left(${f(SHTOWER.x)}+r_{st}\\left(u,1\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+r_{st}\\left(u,1\\right)\\sin\\left(2\\pi u\\right),6.1+0.22v\\left(1+\\cos\\left(2\\pi u-\\frac{2\\pi}{3}\\right)\\right)\\right)`, { color: '#a9c3d2' });
@@ -311,11 +369,13 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   const P = PEARL;
   text('🔴 东方明珠（468 m）：三根立柱 + 三根斜撑 + 下球（直径 50 m）+ 五颗小球 + 上球（直径 45 m）+ 太空舱 + 天线。', '🔴 Oriental Pearl Tower (468 m): three columns, three slanted legs, lower sphere, five small pearls, upper sphere, space module and antenna.');
   ex('C_{pearl}=\\operatorname{rgb}\\left(196,46,104\\right)');
-  ex(`\\left(${f(P.x)}+0.11\\cos\\left(\\frac{2\\pi}{3}\\left[0,1,2\\right]\\right)+0.045\\cos\\left(2\\pi u\\right),${f(P.y)}+0.11\\sin\\left(\\frac{2\\pi}{3}\\left[0,1,2\\right]\\right)+0.045\\sin\\left(2\\pi u\\right),2.75v\\right)`, { color: '#e3ddd6' });
-  ex(`\\left(${f(P.x)}+\\left(0.6-0.5v\\right)\\cos\\left(\\frac{2\\pi}{3}\\left[0,1,2\\right]+\\frac{\\pi}{3}\\right)+0.04\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.6-0.5v\\right)\\sin\\left(\\frac{2\\pi}{3}\\left[0,1,2\\right]+\\frac{\\pi}{3}\\right)+0.04\\sin\\left(2\\pi u\\right),0.95v\\right)`, { color: '#e3ddd6' });
+  ex(`\\left(${f(P.x)}+0.11\\cos\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]\\right)+0.045\\cos\\left(2\\pi u\\right),${f(P.y)}+0.11\\sin\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]\\right)+0.045\\sin\\left(2\\pi u\\right),2.75v\\right)`, { color: '#e3ddd6' });
+  ex(`\\left(${f(P.x)}+\\left(0.6-0.5v\\right)\\cos\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]+\\frac{\\pi}{3}\\right)+0.04\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.6-0.5v\\right)\\sin\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]+\\frac{\\pi}{3}\\right)+0.04\\sin\\left(2\\pi u\\right),0.95v\\right)`, { color: '#e3ddd6' });
   ex(`\\operatorname{sphere}\\left(${pt(P.x, P.y, 0.93)},0.25\\right)`, { colorLatex: 'C_{pearl}' });
-  ex(`\\operatorname{sphere}\\left(\\left(${f(P.x)}+0.11\\cos\\left(\\frac{2\\pi}{3}\\left[0,1,2,0,1\\right]\\right),${f(P.y)}+0.11\\sin\\left(\\frac{2\\pi}{3}\\left[0,1,2,0,1\\right]\\right),\\left[1.45,1.62,1.79,1.96,2.13\\right]\\right),0.07\\right)`, { colorLatex: 'C_{pearl}' });
+  ex(`\\left(${f(P.x)}+\\left(0.25+0.012\\cos\\left(2\\pi v\\right)\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.25+0.012\\cos\\left(2\\pi v\\right)\\right)\\sin\\left(2\\pi u\\right),0.93+0.012\\sin\\left(2\\pi v\\right)\\right)`, { color: '#f7e7ee' });
+  ex(`\\operatorname{sphere}\\left(\\left(${f(P.x)}+0.11\\cos\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2,0,1\\right]\\right),${f(P.y)}+0.11\\sin\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2,0,1\\right]\\right),\\left[1.45,1.62,1.79,1.96,2.13\\right]\\right),0.07\\right)`, { colorLatex: 'C_{pearl}' });
   ex(`\\operatorname{sphere}\\left(${pt(P.x, P.y, 2.63)},0.225\\right)`, { colorLatex: 'C_{pearl}' });
+  ex(`\\left(${f(P.x)}+\\left(0.225+0.012\\cos\\left(2\\pi v\\right)\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.225+0.012\\cos\\left(2\\pi v\\right)\\right)\\sin\\left(2\\pi u\\right),2.63+0.012\\sin\\left(2\\pi v\\right)\\right)`, { color: '#f7e7ee' });
   ex(`\\left(${f(P.x)}+0.05\\cos\\left(2\\pi u\\right),${f(P.y)}+0.05\\sin\\left(2\\pi u\\right),2.75+0.75v\\right)`, { color: '#e3ddd6' });
   ex(`\\operatorname{sphere}\\left(${pt(P.x, P.y, 3.5)},0.08\\right)`, { colorLatex: 'C_{pearl}' });
   ex(`\\left(${f(P.x)}+0.03\\left(1-v\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+0.03\\left(1-v\\right)\\sin\\left(2\\pi u\\right),3.55+1.13v\\right)`, { color: '#d9d9d9' });
