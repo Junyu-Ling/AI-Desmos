@@ -514,8 +514,8 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   ex('\\operatorname{sphere}\\left(T_{r}+\\left(0,0,0.2\\right),0.1k_{leaf}\\right)', { colorLatex: 'C_{leaf}' });
 
   // ── 渡轮沿江航行（默认不自动播放，避免进场时每帧重算）──
-  text('⛴ 渡轮：点 b_t 播放，两艘船沿黄浦江心线南→北→东循环。航道函数 R_x/R_y/R_a 完整列出。', '⛴ Ferries: press play on b_t. Path helpers R_x/R_y/R_a are fully listed.');
-  ex('b_{t}=0.2', { slider: { hardMin: true, hardMax: true, min: '0', max: '1', step: '0.002', animationPeriod: 32000, loopMode: 'LOOP_FORWARD', isPlaying: false } } as any);
+  text('⛴ 渡轮：b_t 默认自动播放，两艘船沿黄浦江心线南→北→东循环；可点滑块暂停。', '⛴ Ferries: b_t auto-plays along the Huangpu; pause on the slider if needed.');
+  ex('b_{t}=0.2', { slider: { hardMin: true, hardMax: true, min: '0', max: '1', step: '0.002', animationPeriod: 28000, loopMode: 'LOOP_FORWARD', isPlaying: true } } as any);
   ex('s_{1}=0.387');
   ex('s_{2}=0.699');
   // 航道函数若开绘图会铺成怪曲线；船位点列同理会变成点
@@ -584,6 +584,18 @@ export function loadShanghaiScene(calculator: any, lang: string = 'zh'): number 
   st.expressions = { ...(st.expressions || {}), list };
   applyShanghaiViewport(st);
   calculator.setState(st, { allowUndo: true });
+  try {
+    const boat = list.find((e: any) => typeof e.latex === 'string' && /^b_\{t\}=/.test(e.latex));
+    if (boat?.id && typeof calculator.setExpression === 'function') {
+      calculator.setExpression({
+        id: boat.id,
+        latex: boat.latex,
+        slider: { ...(boat.slider || {}), isPlaying: true, loopMode: 'LOOP_FORWARD' },
+      });
+    }
+  } catch {
+    /* ignore */
+  }
   return list.length;
 }
 
@@ -657,5 +669,23 @@ export async function loadShanghaiSceneProgressive(
   }
   options?.onProgress?.(list.length, list.length);
   await yieldToRenderer(60);
+
+  // 部分 Desmos 版本 setState 会丢掉 isPlaying，再点一次确保渡轮动起来
+  try {
+    const st = calculator.getState();
+    const boat = ((st.expressions && st.expressions.list) || []).find(
+      (e: any) => typeof e.latex === 'string' && /^b_\{t\}=/.test(e.latex),
+    );
+    if (boat?.id && typeof calculator.setExpression === 'function') {
+      calculator.setExpression({
+        id: boat.id,
+        latex: boat.latex,
+        slider: { ...(boat.slider || {}), isPlaying: true, loopMode: 'LOOP_FORWARD' },
+      });
+    }
+  } catch {
+    /* ignore */
+  }
+
   return list.length;
 }
