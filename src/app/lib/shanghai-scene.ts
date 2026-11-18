@@ -123,7 +123,7 @@ function buildCity() {
   // 陆家嘴楼群：越靠近三塔越高
   const keep = [PEARL, JINMAO, SWFC, SHTOWER];
   const lujiazui = scatterBuildings(
-    rnd, 52,
+    rnd, 68,
     { x0: -0.6, x1: 8.9, y0: -8.1, y1: 4.6 },
     (x, y) =>
       riverDist(x, y) > RIVER_HALF + 0.75 &&
@@ -133,16 +133,16 @@ function buildCity() {
     (x, y) => {
       const near = Math.exp(-((x - 4.6) ** 2 + (y + 2) ** 2) / 14);
       const t = rnd();
-      const glass = t > 0.3;
+      const glass = t > 0.28;
       return {
-        w: 0.2 + rnd() * 0.18, d: 0.2 + rnd() * 0.18,
-        h: 0.5 + near * (0.9 + 1.3 * t) + t * 0.5,
+        w: 0.18 + rnd() * 0.2, d: 0.18 + rnd() * 0.2,
+        h: 0.55 + near * (1.05 + 1.45 * t) + t * 0.55,
         k: 0.85 + rnd() * 0.15, l: 0.85 + rnd() * 0.15,
         a: -0.42 + (rnd() - 0.5) * 0.2,
-        c: shade(glass ? [120, 150, 172] : [190, 186, 178], rnd, 16),
+        c: shade(glass ? [118, 148, 170] : [188, 184, 176], rnd, 16),
       };
     },
-    0.7, [],
+    0.62, [],
   );
 
   // 金茂大厦：塔式逐层收分
@@ -393,10 +393,10 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   return out;
 }
 
-/** 摄像机：从外滩上空向东望陆家嘴 */
+/** 摄像机：贴近外滩西岸、略抬高，向东望陆家嘴天际线（明信片构图） */
 export const SHANGHAI_VIEW = {
   viewport: { xmin: -7.5, xmax: 9, ymin: -8.25, ymax: 8.25, zmin: -5, zmax: 11.5 },
-  rotation: () => uprightViewMatrix(-104, 17),
+  rotation: () => uprightViewMatrix(-98, 14),
 };
 
 /** 一次性写入整个场景（colorLatex、滑块、视角只有 setState 才能生效） */

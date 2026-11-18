@@ -2314,20 +2314,23 @@ const detectBorderBackgroundKey = (
 /**
  * 提取填色 polygon：更密的颜色网格，尽量贴齐勾线精度
  */
-const MAX_FILL_POLYGONS = 7200;
+const MAX_FILL_POLYGONS = 36000;
 
 /** 单张图片 / GIF 每帧共用的最高分辨率与填色精度 */
 export const SINGLE_IMAGE_MAX_DIM = 1280;
 export const SINGLE_IMAGE_MAX_FILL_POLYGONS = MAX_FILL_POLYGONS;
 
 const computeOptimalFillGrid = (width: number, height: number, maxCells = MAX_FILL_POLYGONS): number => {
-  let lo = 96;
-  let hi = Math.min(1024, Math.max(width, height));
-  let best = 160;
+  const maxSide = Math.max(1, Math.max(width, height));
+  // 之前 lo 固定从 96 起：当 maxCells < 96² 时二分永远不更新，会退回默认 160 → 超预算、边缘填不满
+  const maxByCells = Math.max(8, Math.floor(Math.sqrt(Math.max(1, maxCells))));
+  let lo = 8;
+  let hi = Math.min(1024, maxSide, maxByCells);
+  let best = Math.min(160, hi);
 
   while (lo <= hi) {
     const mid = Math.floor((lo + hi) / 2);
-    const scale = Math.min(1, mid / Math.max(width, height));
+    const scale = Math.min(1, mid / maxSide);
     const gw = Math.max(1, Math.round(width * scale));
     const gh = Math.max(1, Math.round(height * scale));
     if (gw * gh <= maxCells) {
@@ -4751,7 +4754,7 @@ export type ProgressiveDrawOptions = {
 };
 
 /** 小批量快速注入：进度更新更密、主线程不易卡死 */
-const DESMOS_EXPR_BATCH = 20;
+const DESMOS_EXPR_BATCH = 80;
 
 const pushExprBatch = (calculator: any, chunk: any[]) => {
   if (!chunk.length) return;
@@ -5311,7 +5314,8 @@ export const processEmojiToFourier = (
 
     ctx.fillStyle = 'white';
     ctx.fillRect(0, 0, size, size);
-    ctx.font = `${size * 0.75}px serif`;
+    // 与 3D 路径一致：强制彩色 Emoji 字体，避免 serif 回退成单色/残缺字形
+    ctx.font = `${size * 0.72}px "Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji","Segoe UI Symbol",serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = 'black';
