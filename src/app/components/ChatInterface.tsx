@@ -76,7 +76,7 @@ import {
   processImageToDesmos3D,
   processEmojiToDesmos3D,
 } from '../lib/draw-3d';
-import { loadShanghaiScene } from '../lib/shanghai-scene';
+import { loadShanghaiSceneProgressive } from '../lib/shanghai-scene';
 import type { CalculatorDimension } from './DesmosCalculator';
 import { detachGifPlayback } from '../lib/gif-animation';
 import { extractGifFirstFrameAsPngFile } from '../lib/gif-decode';
@@ -1309,7 +1309,25 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
             ));
           } else {
             const sceneLang = /[\u4e00-\u9fff]/.test(textToSend) ? 'zh' : language;
-            const count = loadShanghaiScene(calc, sceneLang);
+            const count = await loadShanghaiSceneProgressive(calc, sceneLang, {
+              signal: task.signal,
+              onProgress: (current, total) => {
+                setMessages(prev => prev.map(m =>
+                  m.id === aiMsgId
+                    ? {
+                        ...m,
+                        content: t('shanghai_scene_progress', {
+                          current: String(current),
+                          total: String(total),
+                        }),
+                        translationKey: 'shanghai_scene_progress',
+                        translationParams: { current: String(current), total: String(total) },
+                      }
+                    : m,
+                ));
+              },
+            });
+            if (task.signal.aborted) return;
             setMessages(prev => prev.map(m =>
               m.id === aiMsgId
                 ? {
@@ -1322,6 +1340,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
             ));
           }
         } catch (e) {
+          if ((e as any)?.name === 'AbortError') {
+            endTask();
+            setIsLoading(false);
+            return;
+          }
           console.error('[Shanghai] load failed:', e);
           setMessages(prev => {
             const has = prev.some(m => m.id === aiMsgId);
