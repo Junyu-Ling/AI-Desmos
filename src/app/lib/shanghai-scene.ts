@@ -251,8 +251,8 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   const ex = (latex: string, extra: Partial<Desmos3DExpression> = {}) => out.push({ id: id('e'), latex, ...extra });
 
   text(
-    '上海陆家嘴 · 四季·昼夜｜1 单位 = 100 米。t₀=四季，d_ay=昼夜（自动），b_t=渡轮。辅助点列只关绘图。',
-    'Shanghai Lujiazui · Seasons & Day/Night | t₀=seasons, d_ay=day/night (auto), b_t=ferries. Helper point lists plot-off only.',
+    '上海陆家嘴 · 四季｜1 单位 = 100 米。t₀=四季，b_t=渡轮。辅助点列只关绘图。',
+    'Shanghai Lujiazui · Four Seasons | t₀=seasons, b_t=ferries. Helper point lists plot-off only.',
   );
 
   // ── 四季 ──
@@ -264,15 +264,10 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   ex('g_{s}=f_{s}^{2}\\left(3-2f_{s}\\right)');
   ex('M\\left(L\\right)=L\\left[n_{0}\\right]+\\left(L\\left[n_{1}\\right]-L\\left[n_{0}\\right]\\right)g_{s}');
   ex('S_{c}\\left(R,G,B\\right)=\\operatorname{rgb}\\left(M\\left(R\\right),M\\left(G\\right),M\\left(B\\right)\\right)');
-  // ── 昼夜 ──
-  text('🌓 昼夜：d_ay 自动循环（0/1 正午，0.5 午夜）；f_n 为夜晚权重，幕墙会变成暗面+暖窗灯。', '🌓 Day/night: d_ay auto-loops (0/1 noon, 0.5 midnight); f_n drives dark glass + warm window glow.');
-  ex('d_{ay}=0.18', { slider: { hardMin: true, hardMax: true, min: '0', max: '1', step: '0.002', animationPeriod: 42000, loopMode: 'LOOP_FORWARD', isPlaying: true } } as any);
-  ex('f_{n}=\\left(0.5-0.5\\cos\\left(2\\pi d_{ay}\\right)\\right)^{1.15}');
-  ex('L_{erp}\\left(a,b\\right)=a+\\left(b-a\\right)f_{n}');
-  text('季节颜色：地面、草坪、江水、树冠；再经 f_n 做昼夜明暗。', 'Season colors for ground/lawn/river/foliage, then day/night via f_n.');
-  ex('C_{ground}=\\operatorname{rgb}\\left(L_{erp}\\left(M\\left(\\left[186,182,178,226\\right]\\right),42\\right),L_{erp}\\left(M\\left(\\left[180,178,170,229\\right]\\right),48\\right),L_{erp}\\left(M\\left(\\left[172,166,150,236\\right]\\right),62\\right)\\right)');
-  ex('C_{grass}=\\operatorname{rgb}\\left(L_{erp}\\left(M\\left(\\left[150,62,196,232\\right]\\right),28\\right),L_{erp}\\left(M\\left(\\left[200,138,156,236\\right]\\right),48\\right),L_{erp}\\left(M\\left(\\left[96,58,62,240\\right]\\right),36\\right)\\right)');
-  ex('C_{water}=\\operatorname{rgb}\\left(L_{erp}\\left(M\\left(\\left[72,58,78,110\\right]\\right),18\\right),L_{erp}\\left(M\\left(\\left[138,128,124,148\\right]\\right),32\\right),L_{erp}\\left(M\\left(\\left[148,136,128,160\\right]\\right),48\\right)\\right)');
+  text('季节颜色：地面、草坪、江水、树冠；k_leaf 是树冠大小，s_now 是屋顶积雪厚度。', 'Season colors for ground, lawn, river, foliage; k_leaf = crown size, s_now = roof snow depth.');
+  ex('C_{ground}=S_{c}\\left(\\left[186,182,178,226\\right],\\left[180,178,170,229\\right],\\left[172,166,150,236\\right]\\right)');
+  ex('C_{grass}=S_{c}\\left(\\left[150,62,196,232\\right],\\left[200,138,156,236\\right],\\left[96,58,62,240\\right]\\right)');
+  ex('C_{water}=S_{c}\\left(\\left[72,58,78,110\\right],\\left[138,128,124,148\\right],\\left[148,136,128,160\\right]\\right)');
   ex('C_{leaf}=S_{c}\\left(\\left[246,58,222,128\\right],\\left[188,132,158,104\\right],\\left[214,52,48,84\\right]\\right)');
   ex('C_{trunk}=\\operatorname{rgb}\\left(110,84,64\\right)');
   ex('C_{snow}=\\operatorname{rgb}\\left(244,247,252\\right)');
@@ -280,15 +275,14 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   ex('s_{now}=M\\left(\\left[-0.03,-0.03,-0.03,0.045\\right]\\right)');
   ex('s_{w}=\\max\\left(0,\\min\\left(1,\\frac{s_{now}}{0.04}\\right)\\right)');
 
-  // 幕墙色场：依赖 x,y,z / u，若「画出来」Desmos 会当成曲面铺满屏幕，所以只关绘图、仍完整出现在左侧列表。
-  text('🪟 幕墙色场：白天玻璃蓝；夜晚 f_ace 竖梃变暗、窗格暖黄灯。公式完整列出，只关绘图。', '🪟 Facades: day blue glass; night dark mullions + warm windows. Listed in full, plot off.');
+  // 幕墙色场：只关绘图，公式仍完整列出
+  text('🪟 幕墙色场 f_ace / C_glass / C_podium / C_jinmao / C_st：公式完整写在列表里；仅关闭「绘图」避免被当成曲面。', '🪟 Facade color fields stay fully listed; plotting is off so Desmos does not treat them as surfaces.');
   ex('f_{ace}=\\min\\left(1,\\max\\left(0,\\cos\\left(\\frac{2\\pi x}{0.06}\\right)\\right)^{12}+\\max\\left(0,\\cos\\left(\\frac{2\\pi y}{0.06}\\right)\\right)^{12}+\\max\\left(0,\\cos\\left(\\frac{2\\pi z}{0.1}\\right)\\right)^{8}\\right)', { hidden: true });
-  ex('w_{lit}=\\left(1-f_{ace}\\right)f_{n}');
-  ex('C_{glass}=\\operatorname{rgb}\\left(L_{erp}\\left(96+42\\sin\\left(2.2x\\right)-58f_{ace},24+210w_{lit}+10f_{ace}\\right),L_{erp}\\left(138+22\\sin\\left(2.2y\\right)-42f_{ace},32+150w_{lit}+14f_{ace}\\right),L_{erp}\\left(172-16f_{ace},48+55w_{lit}+55f_{ace}\\right)\\right)', { hidden: true });
-  ex('C_{podium}=\\operatorname{rgb}\\left(L_{erp}\\left(150-28f_{ace},48\\right),L_{erp}\\left(142-22f_{ace},52\\right),L_{erp}\\left(132-14f_{ace},58\\right)\\right)', { hidden: true });
-  ex('C_{roof}=\\operatorname{rgb}\\left(L_{erp}\\left(148+96s_{w},58\\right),L_{erp}\\left(160+90s_{w},62\\right),L_{erp}\\left(174+78s_{w},72\\right)\\right)');
-  ex('C_{mullion}=\\operatorname{rgb}\\left(L_{erp}\\left(46,22\\right),L_{erp}\\left(58,28\\right),L_{erp}\\left(70,36\\right)\\right)');
-  ex('C_{jinmao}=\\operatorname{rgb}\\left(L_{erp}\\left(166+55\\max\\left(0,\\cos\\left(\\frac{26\\pi z}{4.02}\\right)\\right)^{6}-52f_{ace},36+180w_{lit}\\right),L_{erp}\\left(140+40\\max\\left(0,\\cos\\left(\\frac{26\\pi z}{4.02}\\right)\\right)^{6}-36f_{ace},32+120w_{lit}\\right),L_{erp}\\left(108-14f_{ace},28+50w_{lit}\\right)\\right)', { hidden: true });
+  ex('C_{glass}=\\operatorname{rgb}\\left(96+42\\sin\\left(2.2x\\right)-58f_{ace},138+22\\sin\\left(2.2y\\right)-42f_{ace},172-16f_{ace}\\right)', { hidden: true });
+  ex('C_{podium}=\\operatorname{rgb}\\left(150-28f_{ace},142-22f_{ace},132-14f_{ace}\\right)', { hidden: true });
+  ex('C_{roof}=\\operatorname{rgb}\\left(148+96s_{w},160+90s_{w},174+78s_{w}\\right)');
+  ex('C_{mullion}=\\operatorname{rgb}\\left(46,58,70\\right)');
+  ex('C_{jinmao}=\\operatorname{rgb}\\left(166+55\\max\\left(0,\\cos\\left(\\frac{26\\pi z}{4.02}\\right)\\right)^{6}-52f_{ace},140+40\\max\\left(0,\\cos\\left(\\frac{26\\pi z}{4.02}\\right)\\right)^{6}-36f_{ace},108-14f_{ace}\\right)', { hidden: true });
 
   // ── 工具函数 ──
   text('🧰 工具函数：U_a/U_b/U_c 是单位立方体 10 个三角面顶点；B(p,c,w,d,h,k,l,a) 把单位立方体变成楼块。全部明文列出。', '🧰 Helpers: unit-cube face lists and block mapper B(...). All listed in full.');
@@ -679,7 +673,7 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
 
   // ── 上海中心 ──
   text('🗼 上海中心大厦（632 m）：圆角三角形截面，自下而上收分并扭转 120°。设备层亮带与竖梃来自 C_st。', '🗼 Shanghai Tower (632 m): rounded-triangle taper + 120° twist; C_st for bands/mullions.');
-  ex('C_{st}=\\operatorname{rgb}\\left(L_{erp}\\left(150+70\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-42\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8}-22\\max\\left(0,\\cos\\left(\\frac{2\\pi z}{0.08}\\right)\\right)^{8},30+190\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{4}f_{n}\\right),L_{erp}\\left(178+55\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-30\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8}-16\\max\\left(0,\\cos\\left(\\frac{2\\pi z}{0.08}\\right)\\right)^{8},36+140\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{4}f_{n}\\right),L_{erp}\\left(196+45\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-18\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8},52+60\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{4}f_{n}\\right)\\right)', { hidden: true });
+  ex('C_{st}=\\operatorname{rgb}\\left(150+70\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-42\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8}-22\\max\\left(0,\\cos\\left(\\frac{2\\pi z}{0.08}\\right)\\right)^{8},178+55\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-30\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8}-16\\max\\left(0,\\cos\\left(\\frac{2\\pi z}{0.08}\\right)\\right)^{8},196+45\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-18\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8}\\right)', { hidden: true });
   ex(`r_{st}\\left(u,v\\right)=0.43\\left(1-0.55v\\right)\\left(1+0.11\\cos\\left(3\\left(2\\pi u-\\frac{2\\pi}{3}v\\right)\\right)\\right)`);
   // 裙楼底座
   ex(`\\left(${f(SHTOWER.x)}+0.55v\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+0.55v\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)\\sin\\left(2\\pi u\\right),0.22\\right)`, { colorLatex: 'C_{podium}' });
@@ -851,16 +845,13 @@ export function loadShanghaiScene(calculator: any, lang: string = 'zh'): number 
   applyShanghaiViewport(st);
   calculator.setState(st, { allowUndo: true });
   try {
-    if (typeof calculator.setExpression === 'function') {
-      for (const e of list as any[]) {
-        if (typeof e.latex !== 'string') continue;
-        if (!/^(b_\{t\}|d_\{ay\})=/.test(e.latex)) continue;
-        calculator.setExpression({
-          id: e.id,
-          latex: e.latex,
-          slider: { ...(e.slider || {}), isPlaying: true, loopMode: 'LOOP_FORWARD' },
-        });
-      }
+    const boat = (list as any[]).find((e: any) => typeof e.latex === 'string' && /^b_\{t\}=/.test(e.latex));
+    if (boat?.id && typeof calculator.setExpression === 'function') {
+      calculator.setExpression({
+        id: boat.id,
+        latex: boat.latex,
+        slider: { ...(boat.slider || {}), isPlaying: true, loopMode: 'LOOP_FORWARD' },
+      });
     }
   } catch {
     /* ignore */
@@ -939,20 +930,18 @@ export async function loadShanghaiSceneProgressive(
   options?.onProgress?.(list.length, list.length);
   await yieldToRenderer(60);
 
-  // 部分 Desmos 版本 setState 会丢掉 isPlaying，再点一次确保渡轮/昼夜动起来
+  // 部分 Desmos 版本 setState 会丢掉 isPlaying，再点一次确保渡轮动起来
   try {
     const st = calculator.getState();
-    const playing = ((st.expressions && st.expressions.list) || []).filter(
-      (e: any) => typeof e.latex === 'string' && /^(b_\{t\}|d_\{ay\})=/.test(e.latex),
+    const boat = ((st.expressions && st.expressions.list) || []).find(
+      (e: any) => typeof e.latex === 'string' && /^b_\{t\}=/.test(e.latex),
     );
-    if (typeof calculator.setExpression === 'function') {
-      for (const e of playing) {
-        calculator.setExpression({
-          id: e.id,
-          latex: e.latex,
-          slider: { ...(e.slider || {}), isPlaying: true, loopMode: 'LOOP_FORWARD' },
-        });
-      }
+    if (boat?.id && typeof calculator.setExpression === 'function') {
+      calculator.setExpression({
+        id: boat.id,
+        latex: boat.latex,
+        slider: { ...(boat.slider || {}), isPlaying: true, loopMode: 'LOOP_FORWARD' },
+      });
     }
   } catch {
     /* ignore */
