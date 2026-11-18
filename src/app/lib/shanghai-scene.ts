@@ -194,37 +194,31 @@ const BRIDGE = { x0: -5.7, x1: 0.45, y0: -5.85, y1: -4.55, y: -5.2 };
  * 行道树：参考 Ultra OBJ 的滨江布局，但强制最小间距、避开建筑/桥/江，
  * 杜绝「扎堆球体」与穿楼。
  */
+/** 树的几何模型不变（树干 segment + 树冠 sphere）；这里只疏间隔、避开桥/楼/江 */
 function buildTrees(obstacles: { x: number; y: number; r: number }[]) {
+  const rnd = mulberry32(42);
   const raw: [number, number][] = [];
-  // 外滩：西岸陆地 x≈-4.6（江缘约 -4.3），与楼群/桥走廊留空
-  for (let y = -7.5; y <= 0.3; y += 0.78) raw.push([-4.62, y]);
-  // 陆家嘴滨江：弯道内侧偏南 + 南段东岸，躲开明珠与桥走廊
-  for (let a = 2.75; a <= 3.2; a += 0.22) {
-    const r = 4.6 - RIVER_HALF - 0.5;
+  for (let y = -7.9; y <= 0.6; y += 0.55) raw.push([-4.62, y]);
+  for (let a = 1.75; a <= 3.05; a += 0.16) {
+    const r = 4.6 - RIVER_HALF - 0.35;
     raw.push([2 + r * Math.cos(a), 1 + r * Math.sin(a)]);
   }
-  for (const p of [[0.9, -3.2], [1.5, -3.9], [2.1, -4.5], [3.0, 3.9], [4.0, 4.5]] as [number, number][]) {
-    raw.push(p);
+  for (let i = 0; i < 12; i++) {
+    const ang = rnd() * Math.PI * 2;
+    const rr = Math.sqrt(rnd()) * (GREEN.r - 0.12);
+    raw.push([GREEN.x + rr * Math.cos(ang), GREEN.y + rr * Math.sin(ang)]);
   }
-  // 中心绿地：外圈 4 棵
-  for (let i = 0; i < 4; i++) {
-    const ang = -0.35 + i * (Math.PI / 2);
-    raw.push([GREEN.x + 0.55 * Math.cos(ang), GREEN.y + 0.55 * Math.sin(ang)]);
-  }
-  // 世纪大道两侧
   const ax = PEARL.x + 0.6, ay = PEARL.y - 0.5, dx = Math.cos(-0.72), dy = Math.sin(-0.72);
-  for (let s = 1.4; s < 7.4; s += 1.4) {
-    raw.push([ax + dx * s - dy * 0.45, ay + dy * s + dx * 0.45]);
-    raw.push([ax + dx * s + dy * 0.45, ay + dy * s - dx * 0.45]);
+  for (let s = 0.4; s < 9; s += 0.7) {
+    for (const side of [-0.3, 0.3]) raw.push([ax + dx * s - dy * side, ay + dy * s + dx * side]);
   }
 
-  const minGap = 0.65;
+  const minGap = 0.5;
   const out: [number, number][] = [];
   for (const [x, y] of raw) {
-    // 只要离开水面即可；岸上外滩树距江心 ≈1.9–2.0
-    if (riverDist(x, y) <= RIVER_HALF + 0.12) continue;
-    if (x < -7.2 || x > 8.6 || y < -8 || y > 7.8) continue;
-    if (Math.hypot(x - PEARL.x, y - PEARL.y) < 1.1) continue;
+    if (riverDist(x, y) <= RIVER_HALF + 0.15) continue;
+    if (x <= -7.4 || x >= 8.9 || Math.abs(y) >= 8.15) continue;
+    if (Math.hypot(x - PEARL.x, y - PEARL.y) <= 0.8) continue;
     if (x > BRIDGE.x0 && x < BRIDGE.x1 && y > BRIDGE.y0 && y < BRIDGE.y1) continue;
     if (obstacles.some(o => Math.hypot(o.x - x, o.y - y) < o.r)) continue;
     if (out.some(([ox, oy]) => Math.hypot(ox - x, oy - y) < minGap)) continue;
@@ -257,8 +251,8 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   const ex = (latex: string, extra: Partial<Desmos3DExpression> = {}) => out.push({ id: id('e'), latex, ...extra });
 
   text(
-    '上海陆家嘴 · 四季（完稿）｜1 单位 = 100 米。公式全部明文列出、不压缩。t₀=四季，b_t=渡轮。南浦桥为实体桥面；行道树已疏植并避开建筑/桥，减少穿模。',
-    'Shanghai Lujiazui · Four Seasons (final) | 1 unit = 100 m. All formulas listed. Solid Nanpu deck; trees spaced clear of buildings/bridge.',
+    '上海陆家嘴 · 四季（完稿）｜1 单位 = 100 米。公式全部明文列出。辅助点列/色场只关「绘图」（不是 secret），避免 Desmos 把 P_*/U_*/T_r 画成满屏的点。',
+    'Shanghai Lujiazui · Four Seasons (final) | Helper point lists keep plot off (not secret) so Desmos does not scatter dots.',
   );
 
   // ── 四季 ──
@@ -299,8 +293,9 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
     [[0, 0, 0], [0, 1, 0], [0, 1, 1]], [[0, 0, 0], [0, 1, 1], [0, 0, 1]],
     [[1, 0, 0], [1, 1, 0], [1, 1, 1]], [[1, 0, 0], [1, 1, 1], [1, 0, 1]],
   ];
+  // 点列若开着绘图，Desmos 3D 会铺满「莫名其妙的点」；公式仍完整留在列表，只关绘图
   (['a', 'b', 'c'] as const).forEach((n, k) =>
-    ex(`U_{${n}}=${list(faces.map(t => `\\left(${t[k].join(',')}\\right)`))}`),
+    ex(`U_{${n}}=${list(faces.map(t => `\\left(${t[k].join(',')}\\right)`))}`, { hidden: true }),
   );
   ex('B\\left(p,c,w,d,h,k,l,a\\right)=c+\\left(Q.x\\cos\\left(a\\right)-Q.y\\sin\\left(a\\right),Q.x\\sin\\left(a\\right)+Q.y\\cos\\left(a\\right),hp.z\\right)\\operatorname{with}Q=\\left(\\left(2p.x-1\\right)w\\left(1-\\left(1-k\\right)p.z\\right),\\left(2p.y-1\\right)d\\left(1-\\left(1-l\\right)p.z\\right)\\right)');
   // d_r(x,y) 若绘图会铺成曲面，只关绘图、公式仍在列表
@@ -335,7 +330,7 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   const group = (tag: string, title: [string, string], bs: Building[], detail: 'full' | 'simple' = 'simple', zOf?: (b: Building) => number) => {
     text(title[0], title[1]);
     const P = list(bs.map(b => pt(b.x, b.y, zOf ? zOf(b) : 0)));
-    ex(`P_{${tag}}=${P}`);
+    ex(`P_{${tag}}=${P}`, { hidden: true });
     ex(`W_{${tag}}=${list(bs.map(b => f(b.w)))}`);
     ex(`D_{${tag}}=${list(bs.map(b => f(b.d)))}`);
     ex(`H_{${tag}}=${list(bs.map(b => f(b.h)))}`);
@@ -509,26 +504,27 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
     ex(`\\operatorname{segment}\\left(${list(hangTop)},${list(hangBot)}\\right)`, { color: '#b7bdc4' });
   }
 
-  // ── 行道树（已去重、避开建筑与桥）──
+  // ── 行道树（模型不变；T_r 点列关绘图，否则每个树脚都会变成一个点）──
   text(
-    `🌳 行道树 ${trees.length} 棵：最小间距约 58 m，避开建筑轮廓与南浦桥走廊；树冠随季节变色。`,
-    `🌳 ${trees.length} street trees with min spacing; clear of buildings and the bridge corridor.`,
+    `🌳 行道树 ${trees.length} 棵：模型仍是树干+球形树冠；只加大间距并避开建筑/桥。T_r 公式在列表中，关闭绘图避免脚点。`,
+    `🌳 ${trees.length} trees: same trunk+sphere model; spacing only. T_r listed but plot off so bases are not dots.`,
   );
-  ex(`T_{r}=${list(trees.map(([x, y]) => pt(x, y, 0)))}`);
-  ex('\\operatorname{segment}\\left(T_{r},T_{r}+\\left(0,0,0.14\\right)\\right)', { colorLatex: 'C_{trunk}' });
-  ex('\\operatorname{sphere}\\left(T_{r}+\\left(0,0,0.18\\right),0.085k_{leaf}\\right)', { colorLatex: 'C_{leaf}' });
+  ex(`T_{r}=${list(trees.map(([x, y]) => pt(x, y, 0)))}`, { hidden: true });
+  ex('\\operatorname{segment}\\left(T_{r},T_{r}+\\left(0,0,0.16\\right)\\right)', { colorLatex: 'C_{trunk}' });
+  ex('\\operatorname{sphere}\\left(T_{r}+\\left(0,0,0.2\\right),0.1k_{leaf}\\right)', { colorLatex: 'C_{leaf}' });
 
   // ── 渡轮沿江航行（默认不自动播放，避免进场时每帧重算）──
   text('⛴ 渡轮：点 b_t 播放，两艘船沿黄浦江心线南→北→东循环。航道函数 R_x/R_y/R_a 完整列出。', '⛴ Ferries: press play on b_t. Path helpers R_x/R_y/R_a are fully listed.');
   ex('b_{t}=0.2', { slider: { hardMin: true, hardMax: true, min: '0', max: '1', step: '0.002', animationPeriod: 32000, loopMode: 'LOOP_FORWARD', isPlaying: false } } as any);
   ex('s_{1}=0.387');
   ex('s_{2}=0.699');
-  ex('R_{x}\\left(s\\right)=\\left\\{s<s_{1}:-2.6,s<s_{2}:2+4.6\\cos\\left(\\pi-\\frac{\\pi\\left(s-s_{1}\\right)}{2\\left(s_{2}-s_{1}\\right)}\\right),2+\\frac{7\\left(s-s_{2}\\right)}{1-s_{2}}\\right\\}');
-  ex('R_{y}\\left(s\\right)=\\left\\{s<s_{1}:-8+\\frac{9s}{s_{1}},s<s_{2}:1+4.6\\sin\\left(\\pi-\\frac{\\pi\\left(s-s_{1}\\right)}{2\\left(s_{2}-s_{1}\\right)}\\right),5.6\\right\\}');
-  ex('R_{a}\\left(s\\right)=\\left\\{s<s_{1}:0,s<s_{2}:-\\frac{\\pi\\left(s-s_{1}\\right)}{2\\left(s_{2}-s_{1}\\right)},-\\frac{\\pi}{2}\\right\\}');
+  // 航道函数若开绘图会铺成怪曲线；船位点列同理会变成点
+  ex('R_{x}\\left(s\\right)=\\left\\{s<s_{1}:-2.6,s<s_{2}:2+4.6\\cos\\left(\\pi-\\frac{\\pi\\left(s-s_{1}\\right)}{2\\left(s_{2}-s_{1}\\right)}\\right),2+\\frac{7\\left(s-s_{2}\\right)}{1-s_{2}}\\right\\}', { hidden: true });
+  ex('R_{y}\\left(s\\right)=\\left\\{s<s_{1}:-8+\\frac{9s}{s_{1}},s<s_{2}:1+4.6\\sin\\left(\\pi-\\frac{\\pi\\left(s-s_{1}\\right)}{2\\left(s_{2}-s_{1}\\right)}\\right),5.6\\right\\}', { hidden: true });
+  ex('R_{a}\\left(s\\right)=\\left\\{s<s_{1}:0,s<s_{2}:-\\frac{\\pi\\left(s-s_{1}\\right)}{2\\left(s_{2}-s_{1}\\right)},-\\frac{\\pi}{2}\\right\\}', { hidden: true });
   ex('\\Phi=\\left[0,0.5\\right]');
   ex('S_{bo}=\\left[\\operatorname{mod}\\left(b_{t}+\\Phi\\left[i\\right],1\\right)\\operatorname{for}i=\\left[1...2\\right]\\right]');
-  ex('P_{bo}=\\left[\\left(R_{x}\\left(S_{bo}\\left[i\\right]\\right),R_{y}\\left(S_{bo}\\left[i\\right]\\right),-0.03\\right)\\operatorname{for}i=\\left[1...2\\right]\\right]');
+  ex('P_{bo}=\\left[\\left(R_{x}\\left(S_{bo}\\left[i\\right]\\right),R_{y}\\left(S_{bo}\\left[i\\right]\\right),-0.03\\right)\\operatorname{for}i=\\left[1...2\\right]\\right]', { hidden: true });
   ex('A_{bo}=\\left[R_{a}\\left(S_{bo}\\left[i\\right]\\right)\\operatorname{for}i=\\left[1...2\\right]\\right]');
   ex('W_{bo}=\\left[0.11,0.095\\right]');
   ex('D_{bo}=\\left[0.34,0.28\\right]');
@@ -542,8 +538,6 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
     const cabin = (U: string) =>
       `B\\left(U_{${U}}\\left[j\\right],P_{bo}\\left[i\\right]+\\left(0,0,H_{bo}\\left[i\\right]\\right),0.5\\cdot W_{bo}\\left[i\\right],0.32\\cdot D_{bo}\\left[i\\right],0.045,1,1,A_{bo}\\left[i\\right]\\right)`;
     ex(`\\left[\\operatorname{triangle}\\left(${cabin('a')},${cabin('b')},${cabin('c')}\\right)\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...2\\right]\\right]`, { color: '#3d7ea6' });
-    // 船头灯，方便演示时辨认航向
-    ex('\\operatorname{sphere}\\left(\\left[P_{bo}\\left[i\\right]+\\left(0.02\\cos\\left(A_{bo}\\left[i\\right]\\right),0.02\\sin\\left(A_{bo}\\left[i\\right]\\right),H_{bo}\\left[i\\right]+0.05\\right)\\operatorname{for}i=\\left[1...2\\right]\\right],0.02\\right)', { color: '#ffe08a' });
   }
 
   return out;
