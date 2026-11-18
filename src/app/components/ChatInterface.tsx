@@ -1274,25 +1274,70 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
         return;
     }
 
-    if (
-      !readOnlyCanvas &&
-      !correctionExprId &&
-      is3DMode() &&
-      /上海|陆家嘴|外滩|shanghai|lujiazui|the bund/i.test(textToSend) &&
-      /画|绘|做|生成|建|来一个|展示|draw|build|make|render|create|show/i.test(textToSend) &&
-      calculatorRef.current
-    ) {
-      const count = loadShanghaiScene(calculatorRef.current, /[\u4e00-\u9fff]/.test(textToSend) ? 'zh' : language);
-      setMessages(prev => [...prev, {
-        id: aiMsgId,
-        role: 'assistant',
-        content: t('shanghai_scene_loaded', { count: String(count) }),
-        translationKey: 'shanghai_scene_loaded',
-        translationParams: { count: String(count) },
-      }]);
-      endTask();
-      setIsLoading(false);
-      return;
+    // 指令：直接发 shanghai / 上海（或「画上海」一类）即可加载陆家嘴四季场景
+    {
+      const shanghaiBare = /^(shanghai|上海|陆家嘴|外滩|lujiazui|the\s*bund)[.!?！？。]*$/i.test(textToSend.trim());
+      const shanghaiPhrase =
+        /上海|陆家嘴|外滩|shanghai|lujiazui|the bund/i.test(textToSend) &&
+        /画|绘|做|生成|建|来一个|展示|看|draw|build|make|render|create|show|view/i.test(textToSend);
+      if (!readOnlyCanvas && !correctionExprId && (shanghaiBare || shanghaiPhrase)) {
+        try {
+          if (!is3DMode()) {
+            onRequestCalculatorMode?.('3d');
+            setMessages(prev => [...prev, {
+              id: aiMsgId,
+              role: 'assistant',
+              content: t('model_3d_switching'),
+              translationKey: 'model_3d_switching',
+            }]);
+          } else {
+            setMessages(prev => [...prev, {
+              id: aiMsgId,
+              role: 'assistant',
+              content: t('shanghai_scene_loaded', { count: '…' }),
+              translationKey: 'shanghai_scene_loaded',
+              translationParams: { count: '…' },
+            }]);
+          }
+          const calc = await waitForCalculatorReady(task.signal);
+          if (task.signal.aborted) return;
+          if (!calc) {
+            setMessages(prev => prev.map(m =>
+              m.id === aiMsgId
+                ? { ...m, content: t('draw_3d_fail'), translationKey: 'draw_3d_fail' }
+                : m,
+            ));
+          } else {
+            const sceneLang = /[\u4e00-\u9fff]/.test(textToSend) ? 'zh' : language;
+            const count = loadShanghaiScene(calc, sceneLang);
+            setMessages(prev => prev.map(m =>
+              m.id === aiMsgId
+                ? {
+                    ...m,
+                    content: t('shanghai_scene_loaded', { count: String(count) }),
+                    translationKey: 'shanghai_scene_loaded',
+                    translationParams: { count: String(count) },
+                  }
+                : m,
+            ));
+          }
+        } catch (e) {
+          console.error('[Shanghai] load failed:', e);
+          setMessages(prev => {
+            const has = prev.some(m => m.id === aiMsgId);
+            const msg = {
+              id: aiMsgId,
+              role: 'assistant' as const,
+              content: t('draw_3d_fail'),
+              translationKey: 'draw_3d_fail',
+            };
+            return has ? prev.map(m => (m.id === aiMsgId ? { ...m, ...msg } : m)) : [...prev, msg];
+          });
+        }
+        endTask();
+        setIsLoading(false);
+        return;
+      }
     }
 
     setMessages(prev => [...prev, { id: aiMsgId, role: 'assistant', content: '' }]);
