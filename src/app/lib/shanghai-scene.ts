@@ -267,7 +267,7 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   text('季节颜色：地面、草坪、江水、树冠；k_leaf 是树冠大小（冬季落叶缩小），s_now 是屋顶积雪厚度（非冬季藏在屋顶里）。', 'Season colors for ground, lawn, river, foliage; k_leaf = crown size, s_now = roof snow depth.');
   ex('C_{ground}=S_{c}\\left(\\left[186,182,178,226\\right],\\left[180,178,170,229\\right],\\left[172,166,150,236\\right]\\right)');
   ex('C_{grass}=S_{c}\\left(\\left[150,62,196,232\\right],\\left[200,138,156,236\\right],\\left[96,58,62,240\\right]\\right)');
-  ex('C_{water}=S_{c}\\left(\\left[96,78,104,128\\right],\\left[128,116,116,140\\right],\\left[112,104,100,150\\right]\\right)');
+  ex('C_{water}=S_{c}\\left(\\left[72,58,78,110\\right],\\left[138,128,124,148\\right],\\left[148,136,128,160\\right]\\right)');
   ex('C_{leaf}=S_{c}\\left(\\left[246,58,222,128\\right],\\left[188,132,158,104\\right],\\left[214,52,48,84\\right]\\right)');
   ex('C_{trunk}=\\operatorname{rgb}\\left(110,84,64\\right)');
   ex('C_{snow}=\\operatorname{rgb}\\left(244,247,252\\right)');
@@ -303,91 +303,128 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
 
   // ── 地面与黄浦江 ──
   text(
-    '🌊 地面、江面、护岸、世纪大道与外滩步道都用三角贴片，避免隐式窄带缩放时采成断线。',
-    '🌊 Ground, river, embankment, Century Avenue and Bund walk use triangle tiles so roads stay solid when zooming.',
+    '🌊 河道：整幅地面底板 + 沿航道光滑三角江面 + 浅色护岸（对照早期干净岸线，去掉格子锯齿和灰条带跨江）。',
+    '🌊 River: full ground slab + smooth channel mesh + light embankments (cleaner banks like the earlier look).',
   );
-  // 三角贴片：按格子中心落在陆地/水面决定，避免整幅隐式曲面缩放丢面
   {
-    const zG = -0.02;
-    const zW = -0.055;
-    const xs = [-7.5, -5.9, -4.35, -2.6, -0.9, 0.6, 2.2, 4.0, 6.2, 9];
-    const ys = [-8.25, -6.2, -4.0, -1.8, 0.2, 1.9, 3.7, 5.55, 7.3, 8.25];
-    const gA: string[] = [];
-    const gB: string[] = [];
-    const gC: string[] = [];
-    const wA: string[] = [];
-    const wB: string[] = [];
-    const wC: string[] = [];
-    for (let ix = 0; ix < xs.length - 1; ix++) {
-      for (let iy = 0; iy < ys.length - 1; iy++) {
-        const x0 = xs[ix], x1 = xs[ix + 1], y0 = ys[iy], y1 = ys[iy + 1];
-        const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-        const d = riverDist(cx, cy);
-        const push = (A: string[], B: string[], C: string[], z: number) => {
-          A.push(pt(x0, y0, z), pt(x0, y0, z));
-          B.push(pt(x1, y0, z), pt(x1, y1, z));
-          C.push(pt(x1, y1, z), pt(x0, y1, z));
-        };
-        if (d > RIVER_HALF) push(gA, gB, gC, zG);
-        else push(wA, wB, wC, zW);
-      }
-    }
-    ex(`G_{ga}=${list(gA)}`, { hidden: true });
-    ex(`G_{gb}=${list(gB)}`, { hidden: true });
-    ex(`G_{gc}=${list(gC)}`, { hidden: true });
-    ex(`\\operatorname{triangle}\\left(G_{ga},G_{gb},G_{gc}\\right)`, { colorLatex: 'C_{ground}', fillOpacity: '1' });
-    ex(`G_{wa}=${list(wA)}`, { hidden: true });
-    ex(`G_{wb}=${list(wB)}`, { hidden: true });
-    ex(`G_{wc}=${list(wC)}`, { hidden: true });
-    ex(`\\operatorname{triangle}\\left(G_{wa},G_{wb},G_{wc}\\right)`, { colorLatex: 'C_{water}', fillOpacity: '1' });
-  }
-  // 护岸三角带：沿江心线两侧各一条，缩放不丢面
-  {
-    const zE = 0.032;
-    const w = 0.14;
-    const eA: string[] = [];
-    const eB: string[] = [];
-    const eC: string[] = [];
-    const pushBand = (
-      chain: { x: number; y: number }[],
-      normalAt: (p: { x: number; y: number }) => { x: number; y: number },
+    const pushQuad = (
+      A: string[], B: string[], C: string[],
+      x0: number, y0: number, x1: number, y1: number,
+      x2: number, y2: number, x3: number, y3: number, z: number,
     ) => {
-      for (let i = 0; i < chain.length - 1; i++) {
-        const p0 = chain[i], p1 = chain[i + 1];
-        const n0 = normalAt(p0), n1 = normalAt(p1);
-        const a0 = pt(p0.x, p0.y, zE);
-        const a1 = pt(p1.x, p1.y, zE);
-        const b0 = pt(p0.x + n0.x * w, p0.y + n0.y * w, zE);
-        const b1 = pt(p1.x + n1.x * w, p1.y + n1.y * w, zE);
-        eA.push(a0, a0);
-        eB.push(a1, b1);
-        eC.push(b1, b0);
-      }
+      A.push(pt(x0, y0, z), pt(x0, y0, z));
+      B.push(pt(x1, y1, z), pt(x2, y2, z));
+      C.push(pt(x2, y2, z), pt(x3, y3, z));
     };
-    const south: { x: number; y: number }[] = [];
-    for (let y = -8.2; y <= 1.05; y += 0.55) south.push({ x: -2.6, y });
-    pushBand(south.map(p => ({ x: p.x - RIVER_HALF, y: p.y })), () => ({ x: -1, y: 0 }));
-    pushBand(south.map(p => ({ x: p.x + RIVER_HALF, y: p.y })), () => ({ x: 1, y: 0 }));
-    for (const side of [-1, 1] as const) {
-      const chain: { x: number; y: number }[] = [];
-      for (let t = 0; t <= 1.001; t += 0.08) {
-        const a = Math.PI - (Math.PI / 2) * t;
-        chain.push({ x: 2 + (4.6 + side * RIVER_HALF) * Math.cos(a), y: 1 + (4.6 + side * RIVER_HALF) * Math.sin(a) });
-      }
-      pushBand(chain, p => {
-        const dx = p.x - 2, dy = p.y - 1;
-        const L = Math.hypot(dx, dy) || 1;
-        return { x: side * dx / L, y: side * dy / L };
-      });
+    const zG = -0.02;
+    const zW = -0.04;
+    const zE = 0.012;
+
+    // 1) 整幅地面底板：缩放/换角不会缺一块
+    {
+      const gA = [pt(-7.5, -8.25, zG), pt(-7.5, -8.25, zG)];
+      const gB = [pt(9, -8.25, zG), pt(9, 8.25, zG)];
+      const gC = [pt(9, 8.25, zG), pt(-7.5, 8.25, zG)];
+      ex(`G_{ga}=${list(gA)}`, { hidden: true });
+      ex(`G_{gb}=${list(gB)}`, { hidden: true });
+      ex(`G_{gc}=${list(gC)}`, { hidden: true });
+      ex(`\\operatorname{triangle}\\left(G_{ga},G_{gb},G_{gc}\\right)`, { colorLatex: 'C_{ground}', fillOpacity: '1' });
     }
-    const east: { x: number; y: number }[] = [];
-    for (let x = 2; x <= 9; x += 0.55) east.push({ x, y: 5.6 });
-    pushBand(east.map(p => ({ x: p.x, y: p.y - RIVER_HALF })), () => ({ x: 0, y: -1 }));
-    pushBand(east.map(p => ({ x: p.x, y: p.y + RIVER_HALF })), () => ({ x: 0, y: 1 }));
-    ex(`G_{ea}=${list(eA)}`, { hidden: true });
-    ex(`G_{eb}=${list(eB)}`, { hidden: true });
-    ex(`G_{ec}=${list(eC)}`, { hidden: true });
-    ex(`\\operatorname{triangle}\\left(G_{ea},G_{eb},G_{ec}\\right)`, { color: '#8a8278', fillOpacity: '1' });
+
+    // 2) 江面：沿心线南段→弯道→东段密采样，岸线圆滑（不再用粗格子）
+    {
+      const wA: string[] = [];
+      const wB: string[] = [];
+      const wC: string[] = [];
+      const hw = RIVER_HALF;
+      // 南段
+      for (let i = 0; i < 18; i++) {
+        const y0 = -8.25 + (9.25 * i) / 18;
+        const y1 = -8.25 + (9.25 * (i + 1)) / 18;
+        pushQuad(wA, wB, wC, -2.6 - hw, y0, -2.6 + hw, y0, -2.6 + hw, y1, -2.6 - hw, y1, zW);
+      }
+      // 弯道（π → π/2）
+      for (let i = 0; i < 20; i++) {
+        const t0 = i / 20, t1 = (i + 1) / 20;
+        const a0 = Math.PI - (Math.PI / 2) * t0;
+        const a1 = Math.PI - (Math.PI / 2) * t1;
+        const i0x = 2 + (4.6 - hw) * Math.cos(a0), i0y = 1 + (4.6 - hw) * Math.sin(a0);
+        const o0x = 2 + (4.6 + hw) * Math.cos(a0), o0y = 1 + (4.6 + hw) * Math.sin(a0);
+        const i1x = 2 + (4.6 - hw) * Math.cos(a1), i1y = 1 + (4.6 - hw) * Math.sin(a1);
+        const o1x = 2 + (4.6 + hw) * Math.cos(a1), o1y = 1 + (4.6 + hw) * Math.sin(a1);
+        pushQuad(wA, wB, wC, i0x, i0y, o0x, o0y, o1x, o1y, i1x, i1y, zW);
+      }
+      // 东段
+      for (let i = 0; i < 14; i++) {
+        const x0 = 2 + (7 * i) / 14;
+        const x1 = 2 + (7 * (i + 1)) / 14;
+        pushQuad(wA, wB, wC, x0, 5.6 - hw, x1, 5.6 - hw, x1, 5.6 + hw, x0, 5.6 + hw, zW);
+      }
+      ex(`G_{wa}=${list(wA)}`, { hidden: true });
+      ex(`G_{wb}=${list(wB)}`, { hidden: true });
+      ex(`G_{wc}=${list(wC)}`, { hidden: true });
+      ex(`\\operatorname{triangle}\\left(G_{wa},G_{wb},G_{wc}\\right)`, { colorLatex: 'C_{water}', fillOpacity: '1' });
+    }
+
+    // 3) 浅色护岸（对照早期白边）：贴在江缘外侧，不跨江、不画成灰马路
+    {
+      const eA: string[] = [];
+      const eB: string[] = [];
+      const eC: string[] = [];
+      const band = 0.16;
+      const pushShore = (
+        chain: { x: number; y: number }[],
+        outward: (p: { x: number; y: number }) => { x: number; y: number },
+      ) => {
+        for (let i = 0; i < chain.length - 1; i++) {
+          const p0 = chain[i], p1 = chain[i + 1];
+          const n0 = outward(p0), n1 = outward(p1);
+          pushQuad(
+            eA, eB, eC,
+            p0.x, p0.y,
+            p0.x + n0.x * band, p0.y + n0.y * band,
+            p1.x + n1.x * band, p1.y + n1.y * band,
+            p1.x, p1.y,
+            zE,
+          );
+        }
+      };
+      const southL: { x: number; y: number }[] = [];
+      const southR: { x: number; y: number }[] = [];
+      for (let y = -8.25; y <= 1.02; y += 0.35) {
+        southL.push({ x: -2.6 - RIVER_HALF, y });
+        southR.push({ x: -2.6 + RIVER_HALF, y });
+      }
+      pushShore(southL, () => ({ x: -1, y: 0 }));
+      pushShore(southR, () => ({ x: 1, y: 0 }));
+      for (const side of [-1, 1] as const) {
+        const chain: { x: number; y: number }[] = [];
+        for (let t = 0; t <= 1.001; t += 0.05) {
+          const a = Math.PI - (Math.PI / 2) * t;
+          chain.push({
+            x: 2 + (4.6 + side * RIVER_HALF) * Math.cos(a),
+            y: 1 + (4.6 + side * RIVER_HALF) * Math.sin(a),
+          });
+        }
+        pushShore(chain, p => {
+          const dx = p.x - 2, dy = p.y - 1;
+          const L = Math.hypot(dx, dy) || 1;
+          return { x: side * dx / L, y: side * dy / L };
+        });
+      }
+      const eastS: { x: number; y: number }[] = [];
+      const eastN: { x: number; y: number }[] = [];
+      for (let x = 2; x <= 9.01; x += 0.35) {
+        eastS.push({ x, y: 5.6 - RIVER_HALF });
+        eastN.push({ x, y: 5.6 + RIVER_HALF });
+      }
+      pushShore(eastS, () => ({ x: 0, y: -1 }));
+      pushShore(eastN, () => ({ x: 0, y: 1 }));
+      ex(`G_{ea}=${list(eA)}`, { hidden: true });
+      ex(`G_{eb}=${list(eB)}`, { hidden: true });
+      ex(`G_{ec}=${list(eC)}`, { hidden: true });
+      ex(`\\operatorname{triangle}\\left(G_{ea},G_{eb},G_{ec}\\right)`, { color: '#e6e1d8', fillOpacity: '1' });
+    }
   }
   // 绿地：正多边形贴片（避免隐式圆盘缩放变稀）
   {
@@ -438,8 +475,9 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
         const s1 = 0.35 + (len * (i + 1)) / steps;
         const p0x = ax + dx * s0, p0y = ay + dy * s0;
         const p1x = ax + dx * s1, p1y = ay + dy * s1;
-        if (riverDist(p0x, p0y) < RIVER_HALF + 0.25 || riverDist(p1x, p1y) < RIVER_HALF + 0.25) continue;
-        if (Math.hypot(p0x - PEARL.x, p0y - PEARL.y) < 0.95) continue;
+        // 大道绝不画进河道/护岸
+        if (riverDist(p0x, p0y) < RIVER_HALF + 0.45 || riverDist(p1x, p1y) < RIVER_HALF + 0.45) continue;
+        if (Math.hypot(p0x - PEARL.x, p0y - PEARL.y) < 1.05) continue;
         pushQuad(
           rdA, rdB, rdC,
           p0x - nx * halfW, p0y - ny * halfW,
@@ -689,10 +727,10 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   ex('S_{bo}=\\left[\\operatorname{mod}\\left(b_{t}+\\Phi\\left[i\\right],1\\right)\\operatorname{for}i=\\left[1...3\\right]\\right]');
   ex('P_{bo}=\\left[\\left(R_{x}\\left(S_{bo}\\left[i\\right]\\right),R_{y}\\left(S_{bo}\\left[i\\right]\\right),-0.03\\right)\\operatorname{for}i=\\left[1...3\\right]\\right]', { hidden: true });
   ex('A_{bo}=\\left[R_{a}\\left(S_{bo}\\left[i\\right]\\right)\\operatorname{for}i=\\left[1...3\\right]\\right]');
-  ex('W_{bo}=\\left[0.11,0.095,0.07\\right]');
-  ex('D_{bo}=\\left[0.34,0.28,0.2\\right]');
-  ex('H_{bo}=\\left[0.075,0.065,0.05\\right]');
-  ex('G_{bo}=\\operatorname{rgb}\\left(\\left[240,248,220\\right],\\left[240,248,56\\right],\\left[236,240,48\\right]\\right)');
+  ex('W_{bo}=\\left[0.11,0.095,0.085\\right]');
+  ex('D_{bo}=\\left[0.34,0.28,0.24\\right]');
+  ex('H_{bo}=\\left[0.075,0.065,0.055\\right]');
+  ex('G_{bo}=\\operatorname{rgb}\\left(\\left[240,248,210\\right],\\left[240,248,48\\right],\\left[236,240,42\\right]\\right)');
   {
     const hull = (U: string) =>
       `B\\left(U_{${U}}\\left[j\\right],P_{bo}\\left[i\\right],W_{bo}\\left[i\\right],D_{bo}\\left[i\\right],H_{bo}\\left[i\\right],0.7,0.55,A_{bo}\\left[i\\right]\\right)`;
