@@ -87,13 +87,21 @@ function buildCity() {
     bund.push({ x: -5.45, y: yc, w: 0.42, d: w * 0.92, h: 0.28 + rnd() * 0.3, k: 1, l: 1, a: 0, c: shade(stone[Math.floor(rnd() * stone.length)], rnd, 10) });
     y += 2 * w + 0.04;
   }
-  // 海关大楼钟楼、和平饭店（绿色金字塔顶在单独的表达式里）
+  // 海关大楼钟楼、和平饭店、汇丰银行风格（绿色金字塔顶在单独的表达式里）
   const customs = bund.reduce((best, b) => (Math.abs(b.y + 3.2) < Math.abs(best.y + 3.2) ? b : best), bund[0]);
-  customs.h = 0.42;
+  customs.h = 0.48;
+  customs.w = 0.48;
+  customs.c = [218, 204, 176];
   const peace = bund.reduce((best, b) => (Math.abs(b.y + 1.6) < Math.abs(best.y + 1.6) ? b : best), bund[0]);
-  peace.h = 0.62;
+  peace.h = 0.72;
+  peace.w = 0.5;
+  peace.c = [232, 224, 208];
+  const hsbc = bund.reduce((best, b) => (Math.abs(b.y + 2.4) < Math.abs(best.y + 2.4) ? b : best), bund[0]);
+  hsbc.h = 0.55;
+  hsbc.w = 0.5;
+  hsbc.c = [210, 198, 172];
   const bundTowers: Building[] = [
-    { x: customs.x + 0.12, y: customs.y, w: 0.1, d: 0.1, h: 0.42 + 0.48, k: 0.8, l: 0.8, a: 0, c: [222, 210, 182] },
+    { x: customs.x + 0.12, y: customs.y, w: 0.1, d: 0.1, h: 0.48 + 0.52, k: 0.75, l: 0.75, a: 0, c: [222, 210, 182] },
   ];
 
   // 浦西纵深：现代高楼
@@ -121,13 +129,13 @@ function buildCity() {
   );
 
   // 陆家嘴楼群：越靠近三塔越高
-  const keep = [PEARL, JINMAO, SWFC, SHTOWER];
+  const keep = [PEARL, JINMAO, SWFC, SHTOWER, { x: 3.15, y: -2.55 }, { x: 3.55, y: -2.25 }, { x: 2.55, y: -3.35 }];
   const lujiazui = scatterBuildings(
     rnd, 68,
     { x0: -0.6, x1: 8.9, y0: -8.1, y1: 4.6 },
     (x, y) =>
       riverDist(x, y) > RIVER_HALF + 0.75 &&
-      keep.every(p => Math.hypot(p.x - x, p.y - y) > 0.95) &&
+      keep.every(p => Math.hypot(p.x - x, p.y - y) > 0.85) &&
       Math.hypot(GREEN.x - x, GREEN.y - y) > GREEN.r + 0.35 &&
       Math.abs(centuryAvenueDist(x, y)) > 0.4,
     (x, y) => {
@@ -163,14 +171,14 @@ function buildCity() {
   // 环球金融中心：一侧收窄成刀锋，顶部「开瓶器」洞口
   const swfc: Building = { x: SWFC.x, y: SWFC.y, w: 0.29, d: 0.29, h: 4.92, k: 1, l: 0.16, a: 0.35, c: [132, 158, 178] };
 
-  // 江上渡轮
-  const boats: Building[] = [
-    { x: -2.2, y: -3.5, w: 0.08, d: 0.26, h: 0.08, k: 0.9, l: 0.8, a: 0.05, c: [236, 236, 230] },
-    { x: -3.0, y: -0.8, w: 0.07, d: 0.22, h: 0.07, k: 0.9, l: 0.8, a: -0.05, c: [210, 60, 50] },
-    { x: 5.5, y: 5.4, w: 0.24, d: 0.08, h: 0.08, k: 0.8, l: 0.9, a: 0, c: [236, 236, 230] },
+  // 陆家嘴特色裙楼 / 国金中心风格双塔底座附近的中高层
+  const ifc: Building[] = [
+    { x: 3.15, y: -2.55, w: 0.22, d: 0.22, h: 2.45, k: 0.92, l: 0.92, a: -0.35, c: [132, 158, 176] },
+    { x: 3.55, y: -2.25, w: 0.2, d: 0.2, h: 2.15, k: 0.94, l: 0.94, a: -0.35, c: [140, 164, 180] },
+    { x: 2.55, y: -3.35, w: 0.28, d: 0.18, h: 0.42, k: 1, l: 1, a: -0.4, c: [176, 168, 158] },
   ];
 
-  return { bund, bundTowers, puxi, north, lujiazui, jinmao, jinmaoTop, swfc, boats, peace, customs };
+  return { bund, bundTowers, puxi, north, lujiazui, jinmao, jinmaoTop, swfc, ifc, peace, customs };
 }
 
 /** 世纪大道：从东方明珠向东南延伸 */
@@ -210,8 +218,8 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   const ex = (latex: string, extra: Partial<Desmos3DExpression> = {}) => out.push({ id: id('e'), latex, ...extra });
 
   text(
-    '上海陆家嘴 · 四季｜1 单位 = 100 米，建筑按真实高度：东方明珠 468 m、上海中心 632 m、环球金融中心 492 m、金茂 421 m。拖动 t₀ 看一年四季：0 春 → 0.25 夏 → 0.5 秋 → 0.75 冬（点滑块的播放键可自动循环）。',
-    'Shanghai Lujiazui · Four Seasons | 1 unit = 100 m with real heights. Drag t₀ through the year: 0 spring → 0.25 summer → 0.5 autumn → 0.75 winter (press play to loop).',
+    '上海陆家嘴 · 四季｜1 单位 = 100 米，建筑按真实高度：东方明珠 468 m、上海中心 632 m、环球金融中心 492 m、金茂 421 m。t₀ 控制四季，b_t 控制渡轮沿黄浦江航行（点滑块播放可循环）。',
+    'Shanghai Lujiazui · Four Seasons | 1 unit = 100 m. t₀ = seasons, b_t = ferries sailing the Huangpu (press play to loop).',
   );
 
   // ── 四季 ──
@@ -259,12 +267,17 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   ex('d_{r}\\left(x,y\\right)=\\left\\{y<1:\\left|x+2.6\\right|,x>2:\\left|y-5.6\\right|,\\left|\\sqrt{\\left(x-2\\right)^{2}+\\left(y-1\\right)^{2}}-4.6\\right|\\right\\}', { hidden: true });
 
   // ── 地面与黄浦江 ──
-  text('🌊 地面与黄浦江：d_r 是到江心线的距离（自南向北流经外滩，在陆家嘴北侧折向东），江面半宽 170 m；平面 + 区域限制得到陆地、江面、草坪和世纪大道。', '🌊 Ground & Huangpu River: d_r = distance to the river centerline; planes + region restrictions give land, water, lawn and Century Avenue.');
+  text('🌊 地面与黄浦江：d_r 是到江心线的距离（自南向北流经外滩，在陆家嘴北侧折向东），江面半宽 170 m；滨江有石砌护岸，世纪大道与外滩步道分层。', '🌊 Ground & Huangpu River: d_r = distance to the centerline; stone embankments, Century Avenue and the Bund promenade.');
   ex(`z=0\\left\\{d_{r}\\left(x,y\\right)>${RIVER_HALF}\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { colorLatex: 'C_{ground}' });
   ex(`z=-0.06+0.012\\sin\\left(5x+3y\\right)\\sin\\left(4y-2x\\right)\\left\\{d_{r}\\left(x,y\\right)<${RIVER_HALF}\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { colorLatex: 'C_{water}' });
+  // 滨江护岸：略高出水面的窄条
+  ex(`z=0.035\\left\\{${RIVER_HALF}<d_{r}\\left(x,y\\right)<${f(RIVER_HALF + 0.11)}\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { color: '#9a9082' });
+  ex(`z=0.055\\left\\{${f(RIVER_HALF + 0.11)}<d_{r}\\left(x,y\\right)<${f(RIVER_HALF + 0.18)}\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { color: '#7d766c' });
   ex(`z=0.012\\left\\{\\left(x-${f(GREEN.x)}\\right)^{2}+\\left(y-${f(GREEN.y)}\\right)^{2}<${f(GREEN.r ** 2)}\\right\\}`, { colorLatex: 'C_{grass}' });
   ex(`z=0.008\\left\\{\\left|\\left(x-${f(PEARL.x + 0.6)}\\right)\\sin\\left(0.72\\right)+\\left(y-${f(PEARL.y - 0.5)}\\right)\\cos\\left(0.72\\right)\\right|<0.14\\right\\}\\left\\{\\left(x-${f(PEARL.x + 0.6)}\\right)\\cos\\left(0.72\\right)-\\left(y-${f(PEARL.y - 0.5)}\\right)\\sin\\left(0.72\\right)>0\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { color: '#55585e' });
-  ex('z=0.006\\left\\{-4.92<x<-4.35\\right\\}\\left\\{-8.2<y<0.9\\right\\}', { color: '#b9ab94' });
+  ex('z=0.01\\left\\{-4.92<x<-4.35\\right\\}\\left\\{-8.2<y<0.9\\right\\}', { color: '#b9ab94' });
+  // 外滩观景平台（略宽的滨江带）
+  ex('z=0.02\\left\\{-4.55<x<-4.15\\right\\}\\left\\{-7.6<y<0.55\\right\\}', { color: '#cfc4b2' });
 
   // ── 楼群 ──
   const group = (tag: string, title: [string, string], bs: Building[], withSnow: boolean, zOf?: (b: Building) => number) => {
@@ -327,6 +340,7 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   const heroes = [...city.lujiazui].sort((a, b) => b.h - a.h).slice(0, 8);
   const heroSet = new Set(heroes);
   group('lj', ['🏙 陆家嘴楼群：越靠近三塔越高，楼身有楼层线。其中最高的 8 栋改成带窗格的玻璃幕墙。', '🏙 Lujiazui towers, taller near the super-tall trio. The 8 tallest use a windowed glass curtain wall.'], city.lujiazui.filter(b => !heroSet.has(b)), true);
+  group('ifc', ['🏙 国金中心风格双塔与裙楼（陆家嘴环路内侧）。', '🏙 IFC-style twin towers and podium inside the Lujiazui loop.'], city.ifc, true);
   text('最高的 8 栋陆家嘴塔楼：方截面幕墙，竖梃和楼层线来自 f_ace，向上略收分。', 'The 8 tallest Lujiazui towers: square curtain walls, mullions and floor lines from f_ace, tapering toward the top.');
   putLists('hero', heroes);
   ex(wall('hero', 'H_{hero}v', '1', '1', true), { colorLatex: 'C_{glass}' });
@@ -361,25 +375,39 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   text('🗼 上海中心大厦（632 m）：圆角三角形截面，自下而上收分并扭转 120°。设备层是高度上的亮带，竖梃和楼层线来自 u 和 z。', '🗼 Shanghai Tower (632 m): rounded-triangle section tapering and twisting 120°, with zone bands, mullions and floor lines.');
   ex('C_{st}=\\operatorname{rgb}\\left(150+70\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-42\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8}-22\\max\\left(0,\\cos\\left(\\frac{2\\pi z}{0.08}\\right)\\right)^{8},178+55\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-30\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8}-16\\max\\left(0,\\cos\\left(\\frac{2\\pi z}{0.08}\\right)\\right)^{8},196+45\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-18\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8}\\right)', { hidden: true });
   ex(`r_{st}\\left(u,v\\right)=0.43\\left(1-0.55v\\right)\\left(1+0.11\\cos\\left(3\\left(2\\pi u-\\frac{2\\pi}{3}v\\right)\\right)\\right)`, { hidden: true });
-  ex(`\\left(${f(SHTOWER.x)}+r_{st}\\left(u,v\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+r_{st}\\left(u,v\\right)\\sin\\left(2\\pi u\\right),6.1v\\right)`, { colorLatex: 'C_{st}' });
+  // 裙楼底座
+  ex(`\\left(${f(SHTOWER.x)}+0.55v\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+0.55v\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)\\sin\\left(2\\pi u\\right),0.22\\right)`, { colorLatex: 'C_{podium}' });
+  ex(`\\left(${f(SHTOWER.x)}+r_{st}\\left(u,v\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+r_{st}\\left(u,v\\right)\\sin\\left(2\\pi u\\right),0.22+5.88v\\right)`, { colorLatex: 'C_{st}' });
   ex(`\\left(${f(SHTOWER.x)}+r_{st}\\left(u,1\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+r_{st}\\left(u,1\\right)\\sin\\left(2\\pi u\\right),6.1+0.22v\\left(1+\\cos\\left(2\\pi u-\\frac{2\\pi}{3}\\right)\\right)\\right)`, { color: '#a9c3d2' });
   ex(`\\left(${f(SHTOWER.x)}+vr_{st}\\left(u,1\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+vr_{st}\\left(u,1\\right)\\sin\\left(2\\pi u\\right),6.1\\right)`, { color: '#8fa9b8' });
 
   // ── 东方明珠 ──
   const P = PEARL;
-  text('🔴 东方明珠（468 m）：三根立柱 + 三根斜撑 + 下球（直径 50 m）+ 五颗小球 + 上球（直径 45 m）+ 太空舱 + 天线。', '🔴 Oriental Pearl Tower (468 m): three columns, three slanted legs, lower sphere, five small pearls, upper sphere, space module and antenna.');
+  text('🔴 东方明珠（468 m）：三根立柱 + 三根斜撑 + 下球（直径 50 m）+ 五颗小球 + 上球（直径 45 m）+ 太空舱 + 天线；底部有圆形观景平台。', '🔴 Oriental Pearl Tower (468 m): columns, slanted legs, spheres, space module, antenna and a circular podium.');
   ex('C_{pearl}=\\operatorname{rgb}\\left(196,46,104\\right)');
+  // 底座圆环平台
+  ex(`\\left(${f(P.x)}+\\left(0.55+0.12v\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.55+0.12v\\right)\\sin\\left(2\\pi u\\right),0.02+0.06v\\right)`, { color: '#d8d0c6' });
   ex(`\\left(${f(P.x)}+0.11\\cos\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]\\right)+0.045\\cos\\left(2\\pi u\\right),${f(P.y)}+0.11\\sin\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]\\right)+0.045\\sin\\left(2\\pi u\\right),2.75v\\right)`, { color: '#e3ddd6' });
   ex(`\\left(${f(P.x)}+\\left(0.6-0.5v\\right)\\cos\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]+\\frac{\\pi}{3}\\right)+0.04\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.6-0.5v\\right)\\sin\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]+\\frac{\\pi}{3}\\right)+0.04\\sin\\left(2\\pi u\\right),0.95v\\right)`, { color: '#e3ddd6' });
   ex(`\\operatorname{sphere}\\left(${pt(P.x, P.y, 0.93)},0.25\\right)`, { colorLatex: 'C_{pearl}' });
-  ex(`\\left(${f(P.x)}+\\left(0.25+0.012\\cos\\left(2\\pi v\\right)\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.25+0.012\\cos\\left(2\\pi v\\right)\\right)\\sin\\left(2\\pi u\\right),0.93+0.012\\sin\\left(2\\pi v\\right)\\right)`, { color: '#f7e7ee' });
+  ex(`\\left(${f(P.x)}+\\left(0.25+0.014\\cos\\left(2\\pi v\\right)\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.25+0.014\\cos\\left(2\\pi v\\right)\\right)\\sin\\left(2\\pi u\\right),0.93+0.014\\sin\\left(2\\pi v\\right)\\right)`, { color: '#f7e7ee' });
   ex(`\\operatorname{sphere}\\left(\\left(${f(P.x)}+0.11\\cos\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2,0,1\\right]\\right),${f(P.y)}+0.11\\sin\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2,0,1\\right]\\right),\\left[1.45,1.62,1.79,1.96,2.13\\right]\\right),0.07\\right)`, { colorLatex: 'C_{pearl}' });
   ex(`\\operatorname{sphere}\\left(${pt(P.x, P.y, 2.63)},0.225\\right)`, { colorLatex: 'C_{pearl}' });
-  ex(`\\left(${f(P.x)}+\\left(0.225+0.012\\cos\\left(2\\pi v\\right)\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.225+0.012\\cos\\left(2\\pi v\\right)\\right)\\sin\\left(2\\pi u\\right),2.63+0.012\\sin\\left(2\\pi v\\right)\\right)`, { color: '#f7e7ee' });
+  ex(`\\left(${f(P.x)}+\\left(0.225+0.014\\cos\\left(2\\pi v\\right)\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.225+0.014\\cos\\left(2\\pi v\\right)\\right)\\sin\\left(2\\pi u\\right),2.63+0.014\\sin\\left(2\\pi v\\right)\\right)`, { color: '#f7e7ee' });
   ex(`\\left(${f(P.x)}+0.05\\cos\\left(2\\pi u\\right),${f(P.y)}+0.05\\sin\\left(2\\pi u\\right),2.75+0.75v\\right)`, { color: '#e3ddd6' });
   ex(`\\operatorname{sphere}\\left(${pt(P.x, P.y, 3.5)},0.08\\right)`, { colorLatex: 'C_{pearl}' });
   ex(`\\left(${f(P.x)}+0.03\\left(1-v\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+0.03\\left(1-v\\right)\\sin\\left(2\\pi u\\right),3.55+1.13v\\right)`, { color: '#d9d9d9' });
+  ex(`\\operatorname{sphere}\\left(${pt(P.x, P.y, 4.68)},0.025\\right)`, { color: '#c8c8c8' });
   ex(`\\left(${f(P.x)}+0.75v\\cos\\left(2\\pi u\\right),${f(P.y)}+0.75v\\sin\\left(2\\pi u\\right),0.014\\right)`, { color: '#cfc6bb' });
+
+  // ── 南浦大桥风格拱桥（黄浦江南段）──
+  text('🌉 南浦大桥风格：黄浦江南段的拱形主桥。', '🌉 Nanpu-style arch bridge over the southern Huangpu.');
+  {
+    const by = -5.2;
+    ex(`\\left(-2.6+3.4\\left(2u-1\\right),${by}+0.16\\left(2v-1\\right),0.12\\right)`, { color: '#6a727a' });
+    ex(`\\left(-2.6+3.1\\left(2u-1\\right),${by}+0.5,0.12+1.1\\left(1-\\left(2u-1\\right)^{2}\\right)\\right)`, { color: '#d4543a' });
+    ex(`\\left(-2.6+3.1\\left(2u-1\\right),${by}-0.5,0.12+1.1\\left(1-\\left(2u-1\\right)^{2}\\right)\\right)`, { color: '#d4543a' });
+  }
 
   // ── 行道树 ──
   text('🌳 行道树与公园：外滩滨江、陆家嘴滨江、中心绿地、世纪大道两侧。树冠大小 k_leaf 与颜色 C_leaf 随季节变化：春樱粉、夏浓绿、秋梧桐金黄、冬季落叶。', '🌳 Street trees & parks; crown size k_leaf and color C_leaf follow the season.');
@@ -387,8 +415,32 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   ex('\\operatorname{segment}\\left(T_{r},T_{r}+\\left(0,0,0.16\\right)\\right)', { colorLatex: 'C_{trunk}' });
   ex('\\operatorname{sphere}\\left(T_{r}+\\left(0,0,0.2\\right),0.1k_{leaf}\\right)', { colorLatex: 'C_{leaf}' });
 
-  // ── 江上渡轮 ──
-  group('bo', ['⛴ 黄浦江上的渡轮。', '⛴ Ferries on the Huangpu.'], city.boats, false, () => -0.04);
+  // ── 渡轮沿江航行 ──
+  // 航道：南段 x=-2.6 → 弯道圆心(2,1)r=4.6 → 东段 y=5.6；弧长归一 s1≈0.387,s2≈0.699
+  text('⛴ 渡轮：拖动或播放 b_t，三艘船沿黄浦江心线从南往北再折向东循环。', '⛴ Ferries: play b_t to sail three boats south→north→east along the Huangpu.');
+  ex('b_{t}=0.18', { slider: { hardMin: true, hardMax: true, min: '0', max: '1', step: '0.002', animationPeriod: 28000, loopMode: 'LOOP_FORWARD', isPlaying: true } } as any);
+  ex('s_{1}=0.387', { hidden: true });
+  ex('s_{2}=0.699', { hidden: true });
+  ex('R_{x}\\left(s\\right)=\\left\\{s<s_{1}:-2.6,s<s_{2}:2+4.6\\cos\\left(\\pi-\\frac{\\pi\\left(s-s_{1}\\right)}{2\\left(s_{2}-s_{1}\\right)}\\right),2+\\frac{7\\left(s-s_{2}\\right)}{1-s_{2}}\\right\\}', { hidden: true });
+  ex('R_{y}\\left(s\\right)=\\left\\{s<s_{1}:-8+\\frac{9s}{s_{1}},s<s_{2}:1+4.6\\sin\\left(\\pi-\\frac{\\pi\\left(s-s_{1}\\right)}{2\\left(s_{2}-s_{1}\\right)}\\right),5.6\\right\\}', { hidden: true });
+  ex('R_{a}\\left(s\\right)=\\left\\{s<s_{1}:0,s<s_{2}:-\\frac{\\pi\\left(s-s_{1}\\right)}{2\\left(s_{2}-s_{1}\\right)},-\\frac{\\pi}{2}\\right\\}', { hidden: true });
+  ex('\\Phi=\\left[0,0.34,0.68\\right]');
+  ex('S_{bo}=\\left[\\operatorname{mod}\\left(b_{t}+\\Phi\\left[i\\right],1\\right)\\operatorname{for}i=\\left[1...3\\right]\\right]', { hidden: true });
+  ex('P_{bo}=\\left[\\left(R_{x}\\left(S_{bo}\\left[i\\right]\\right),R_{y}\\left(S_{bo}\\left[i\\right]\\right),-0.03\\right)\\operatorname{for}i=\\left[1...3\\right]\\right]', { hidden: true });
+  ex('A_{bo}=\\left[R_{a}\\left(S_{bo}\\left[i\\right]\\right)\\operatorname{for}i=\\left[1...3\\right]\\right]', { hidden: true });
+  ex('W_{bo}=\\left[0.1,0.085,0.11\\right]');
+  ex('D_{bo}=\\left[0.32,0.26,0.36\\right]');
+  ex('H_{bo}=\\left[0.07,0.06,0.08\\right]');
+  ex('G_{bo}=\\operatorname{rgb}\\left(\\left[240,220,248\\right],\\left[240,72,248\\right],\\left[236,48,240\\right]\\right)');
+  {
+    const hull = (U: string) =>
+      `B\\left(U_{${U}}\\left[j\\right],P_{bo}\\left[i\\right],W_{bo}\\left[i\\right],D_{bo}\\left[i\\right],H_{bo}\\left[i\\right],0.7,0.55,A_{bo}\\left[i\\right]\\right)`;
+    ex(`Q_{bo}=\\left[G_{bo}\\left[i\\right]\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...3\\right]\\right]`, { hidden: true });
+    ex(`\\left[\\operatorname{triangle}\\left(${hull('a')},${hull('b')},${hull('c')}\\right)\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...3\\right]\\right]`, { colorLatex: 'Q_{bo}' });
+    const cabin = (U: string) =>
+      `B\\left(U_{${U}}\\left[j\\right],P_{bo}\\left[i\\right]+\\left(0,0,H_{bo}\\left[i\\right]\\right),0.5\\cdot W_{bo}\\left[i\\right],0.32\\cdot D_{bo}\\left[i\\right],0.045,1,1,A_{bo}\\left[i\\right]\\right)`;
+    ex(`\\left[\\operatorname{triangle}\\left(${cabin('a')},${cabin('b')},${cabin('c')}\\right)\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...3\\right]\\right]`, { color: '#3d7ea6' });
+  }
 
   return out;
 }
