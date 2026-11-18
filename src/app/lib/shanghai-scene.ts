@@ -302,16 +302,98 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   ex('d_{r}\\left(x,y\\right)=\\left\\{y<1:\\left|x+2.6\\right|,x>2:\\left|y-5.6\\right|,\\left|\\sqrt{\\left(x-2\\right)^{2}+\\left(y-1\\right)^{2}}-4.6\\right|\\right\\}', { hidden: true });
 
   // ── 地面与黄浦江 ──
-  text('🌊 地面与黄浦江：d_r 到江心线距离，半宽 170 m；护岸、世纪大道、外滩步道分层。水面用轻微波纹。', '🌊 Ground & river with embankments, Century Avenue, Bund promenade, light ripples.');
-  // 地面 / 水面高度错开，减少与桥面、护岸的深度冲突
-  ex(`z=-0.02\\left\\{d_{r}\\left(x,y\\right)>${RIVER_HALF}\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { colorLatex: 'C_{ground}' });
-  ex(`z=-0.06+0.004\\sin\\left(2.6x+1.5y\\right)\\left\\{d_{r}\\left(x,y\\right)<${RIVER_HALF}\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { colorLatex: 'C_{water}' });
-  // 单层护岸（避免双层边界闪烁穿模）
-  ex(`z=0.035\\left\\{${RIVER_HALF}<d_{r}\\left(x,y\\right)<${f(RIVER_HALF + 0.15)}\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { color: '#8a8278' });
-  ex(`z=0.01\\left\\{\\left(x-${f(GREEN.x)}\\right)^{2}+\\left(y-${f(GREEN.y)}\\right)^{2}<${f(GREEN.r ** 2)}\\right\\}`, { colorLatex: 'C_{grass}' });
-  ex(`z=0.006\\left\\{\\left|\\left(x-${f(PEARL.x + 0.6)}\\right)\\sin\\left(0.72\\right)+\\left(y-${f(PEARL.y - 0.5)}\\right)\\cos\\left(0.72\\right)\\right|<0.14\\right\\}\\left\\{\\left(x-${f(PEARL.x + 0.6)}\\right)\\cos\\left(0.72\\right)-\\left(y-${f(PEARL.y - 0.5)}\\right)\\sin\\left(0.72\\right)>0\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { color: '#55585e' });
-  ex('z=0.008\\left\\{-4.92<x<-4.35\\right\\}\\left\\{-8.2<y<0.9\\right\\}', { color: '#b9ab94' });
-  ex('z=0.018\\left\\{-4.55<x<-4.15\\right\\}\\left\\{-7.6<y<0.55\\right\\}', { color: '#d2c6b4' });
+  text(
+    '🌊 地面与黄浦江：大块隐式 z=… 缩放时会被 Desmos 采样裁切，所以陆地/江面改成三角贴片（缩放仍完整）；护岸与步道仍用小范围曲面。',
+    '🌊 Ground/river use triangle tiles so zoom does not drop faces; promenade keeps small surfaces.',
+  );
+  // 三角贴片：按格子中心落在陆地/水面决定，避免整幅隐式曲面缩放丢面
+  {
+    const zG = -0.02;
+    const zW = -0.055;
+    const xs = [-7.5, -5.9, -4.35, -2.6, -0.9, 0.6, 2.2, 4.0, 6.2, 9];
+    const ys = [-8.25, -6.2, -4.0, -1.8, 0.2, 1.9, 3.7, 5.55, 7.3, 8.25];
+    const gA: string[] = [];
+    const gB: string[] = [];
+    const gC: string[] = [];
+    const wA: string[] = [];
+    const wB: string[] = [];
+    const wC: string[] = [];
+    for (let ix = 0; ix < xs.length - 1; ix++) {
+      for (let iy = 0; iy < ys.length - 1; iy++) {
+        const x0 = xs[ix], x1 = xs[ix + 1], y0 = ys[iy], y1 = ys[iy + 1];
+        const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+        const d = riverDist(cx, cy);
+        const push = (A: string[], B: string[], C: string[], z: number) => {
+          A.push(pt(x0, y0, z), pt(x0, y0, z));
+          B.push(pt(x1, y0, z), pt(x1, y1, z));
+          C.push(pt(x1, y1, z), pt(x0, y1, z));
+        };
+        if (d > RIVER_HALF) push(gA, gB, gC, zG);
+        else push(wA, wB, wC, zW);
+      }
+    }
+    ex(`G_{ga}=${list(gA)}`, { hidden: true });
+    ex(`G_{gb}=${list(gB)}`, { hidden: true });
+    ex(`G_{gc}=${list(gC)}`, { hidden: true });
+    ex(`\\operatorname{triangle}\\left(G_{ga},G_{gb},G_{gc}\\right)`, { colorLatex: 'C_{ground}', fillOpacity: '1' });
+    ex(`G_{wa}=${list(wA)}`, { hidden: true });
+    ex(`G_{wb}=${list(wB)}`, { hidden: true });
+    ex(`G_{wc}=${list(wC)}`, { hidden: true });
+    ex(`\\operatorname{triangle}\\left(G_{wa},G_{wb},G_{wc}\\right)`, { colorLatex: 'C_{water}', fillOpacity: '1' });
+  }
+  // 护岸三角带：沿江心线两侧各一条，缩放不丢面
+  {
+    const zE = 0.032;
+    const w = 0.14;
+    const eA: string[] = [];
+    const eB: string[] = [];
+    const eC: string[] = [];
+    const pushBand = (
+      chain: { x: number; y: number }[],
+      normalAt: (p: { x: number; y: number }) => { x: number; y: number },
+    ) => {
+      for (let i = 0; i < chain.length - 1; i++) {
+        const p0 = chain[i], p1 = chain[i + 1];
+        const n0 = normalAt(p0), n1 = normalAt(p1);
+        const a0 = pt(p0.x, p0.y, zE);
+        const a1 = pt(p1.x, p1.y, zE);
+        const b0 = pt(p0.x + n0.x * w, p0.y + n0.y * w, zE);
+        const b1 = pt(p1.x + n1.x * w, p1.y + n1.y * w, zE);
+        eA.push(a0, a0);
+        eB.push(a1, b1);
+        eC.push(b1, b0);
+      }
+    };
+    const south: { x: number; y: number }[] = [];
+    for (let y = -8.2; y <= 1.05; y += 0.55) south.push({ x: -2.6, y });
+    pushBand(south.map(p => ({ x: p.x - RIVER_HALF, y: p.y })), () => ({ x: -1, y: 0 }));
+    pushBand(south.map(p => ({ x: p.x + RIVER_HALF, y: p.y })), () => ({ x: 1, y: 0 }));
+    for (const side of [-1, 1] as const) {
+      const chain: { x: number; y: number }[] = [];
+      for (let t = 0; t <= 1.001; t += 0.08) {
+        const a = Math.PI - (Math.PI / 2) * t;
+        chain.push({ x: 2 + (4.6 + side * RIVER_HALF) * Math.cos(a), y: 1 + (4.6 + side * RIVER_HALF) * Math.sin(a) });
+      }
+      pushBand(chain, p => {
+        const dx = p.x - 2, dy = p.y - 1;
+        const L = Math.hypot(dx, dy) || 1;
+        return { x: side * dx / L, y: side * dy / L };
+      });
+    }
+    const east: { x: number; y: number }[] = [];
+    for (let x = 2; x <= 9; x += 0.55) east.push({ x, y: 5.6 });
+    pushBand(east.map(p => ({ x: p.x, y: p.y - RIVER_HALF })), () => ({ x: 0, y: -1 }));
+    pushBand(east.map(p => ({ x: p.x, y: p.y + RIVER_HALF })), () => ({ x: 0, y: 1 }));
+    ex(`G_{ea}=${list(eA)}`, { hidden: true });
+    ex(`G_{eb}=${list(eB)}`, { hidden: true });
+    ex(`G_{ec}=${list(eC)}`, { hidden: true });
+    ex(`\\operatorname{triangle}\\left(G_{ea},G_{eb},G_{ec}\\right)`, { color: '#8a8278', fillOpacity: '1' });
+  }
+  // 绿地 / 世纪大道 / 外滩步道：范围小，隐式曲面缩放仍稳
+  ex(`z=0.01\\left\\{\\left(x-${f(GREEN.x)}\\right)^{2}+\\left(y-${f(GREEN.y)}\\right)^{2}<${f(GREEN.r ** 2)}\\right\\}`, { colorLatex: 'C_{grass}', fillOpacity: '1' });
+  ex(`z=0.006\\left\\{\\left|\\left(x-${f(PEARL.x + 0.6)}\\right)\\sin\\left(0.72\\right)+\\left(y-${f(PEARL.y - 0.5)}\\right)\\cos\\left(0.72\\right)\\right|<0.14\\right\\}\\left\\{\\left(x-${f(PEARL.x + 0.6)}\\right)\\cos\\left(0.72\\right)-\\left(y-${f(PEARL.y - 0.5)}\\right)\\sin\\left(0.72\\right)>0\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { color: '#55585e', fillOpacity: '1' });
+  ex('z=0.008\\left\\{-4.92<x<-4.35\\right\\}\\left\\{-8.2<y<0.9\\right\\}', { color: '#b9ab94', fillOpacity: '1' });
+  ex('z=0.018\\left\\{-4.55<x<-4.15\\right\\}\\left\\{-7.6<y<0.55\\right\\}', { color: '#d2c6b4', fillOpacity: '1' });
   // 外滩路灯：躲开南浦桥走廊
   {
     const bases: string[] = [];
@@ -555,6 +637,9 @@ function toStateList(exprs: Desmos3DExpression[]): Record<string, unknown>[] {
     const o: Record<string, unknown> = { type: 'expression', id: e.id, latex: e.latex };
     if (e.color) o.color = e.color;
     if (e.colorLatex) o.colorLatex = e.colorLatex;
+    if (e.fillOpacity !== undefined) o.fillOpacity = e.fillOpacity;
+    if (e.parametricDomain3Du) o.parametricDomain3Du = e.parametricDomain3Du;
+    if (e.parametricDomain3Dv) o.parametricDomain3Dv = e.parametricDomain3Dv;
     // hidden 只关「绘图」，左侧列表仍完整展示每一行（绝不 secret / 压缩省略）
     if (e.hidden) o.hidden = true;
     if ((e as any).slider) o.slider = (e as any).slider;
