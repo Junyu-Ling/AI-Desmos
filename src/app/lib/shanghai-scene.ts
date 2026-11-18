@@ -303,8 +303,8 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
 
   // ── 地面与黄浦江 ──
   text(
-    '🌊 地面与黄浦江：大块隐式 z=… 缩放时会被 Desmos 采样裁切，所以陆地/江面改成三角贴片（缩放仍完整）；护岸与步道仍用小范围曲面。',
-    '🌊 Ground/river use triangle tiles so zoom does not drop faces; promenade keeps small surfaces.',
+    '🌊 地面、江面、护岸、世纪大道与外滩步道都用三角贴片，避免隐式窄带缩放时采成断线。',
+    '🌊 Ground, river, embankment, Century Avenue and Bund walk use triangle tiles so roads stay solid when zooming.',
   );
   // 三角贴片：按格子中心落在陆地/水面决定，避免整幅隐式曲面缩放丢面
   {
@@ -389,11 +389,91 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
     ex(`G_{ec}=${list(eC)}`, { hidden: true });
     ex(`\\operatorname{triangle}\\left(G_{ea},G_{eb},G_{ec}\\right)`, { color: '#8a8278', fillOpacity: '1' });
   }
-  // 绿地 / 世纪大道 / 外滩步道：范围小，隐式曲面缩放仍稳
-  ex(`z=0.01\\left\\{\\left(x-${f(GREEN.x)}\\right)^{2}+\\left(y-${f(GREEN.y)}\\right)^{2}<${f(GREEN.r ** 2)}\\right\\}`, { colorLatex: 'C_{grass}', fillOpacity: '1' });
-  ex(`z=0.006\\left\\{\\left|\\left(x-${f(PEARL.x + 0.6)}\\right)\\sin\\left(0.72\\right)+\\left(y-${f(PEARL.y - 0.5)}\\right)\\cos\\left(0.72\\right)\\right|<0.14\\right\\}\\left\\{\\left(x-${f(PEARL.x + 0.6)}\\right)\\cos\\left(0.72\\right)-\\left(y-${f(PEARL.y - 0.5)}\\right)\\sin\\left(0.72\\right)>0\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { color: '#55585e', fillOpacity: '1' });
-  ex('z=0.008\\left\\{-4.92<x<-4.35\\right\\}\\left\\{-8.2<y<0.9\\right\\}', { color: '#b9ab94', fillOpacity: '1' });
-  ex('z=0.018\\left\\{-4.55<x<-4.15\\right\\}\\left\\{-7.6<y<0.55\\right\\}', { color: '#d2c6b4', fillOpacity: '1' });
+  // 绿地：正多边形贴片（避免隐式圆盘缩放变稀）
+  {
+    const zGr = 0.012;
+    const n = 16;
+    const gA: string[] = [];
+    const gB: string[] = [];
+    const gC: string[] = [];
+    const c = pt(GREEN.x, GREEN.y, zGr);
+    for (let i = 0; i < n; i++) {
+      const a0 = (i / n) * Math.PI * 2;
+      const a1 = ((i + 1) / n) * Math.PI * 2;
+      gA.push(c);
+      gB.push(pt(GREEN.x + GREEN.r * Math.cos(a0), GREEN.y + GREEN.r * Math.sin(a0), zGr));
+      gC.push(pt(GREEN.x + GREEN.r * Math.cos(a1), GREEN.y + GREEN.r * Math.sin(a1), zGr));
+    }
+    ex(`G_{gra}=${list(gA)}`, { hidden: true });
+    ex(`G_{grb}=${list(gB)}`, { hidden: true });
+    ex(`G_{grc}=${list(gC)}`, { hidden: true });
+    ex(`\\operatorname{triangle}\\left(G_{gra},G_{grb},G_{grc}\\right)`, { colorLatex: 'C_{grass}', fillOpacity: '1' });
+  }
+  // 世纪大道 + 外滩步道：三角条带，避免隐式窄带被采样成「崩掉的细线」
+  {
+    const pushQuad = (
+      A: string[], B: string[], C: string[],
+      x0: number, y0: number, x1: number, y1: number,
+      x2: number, y2: number, x3: number, y3: number, z: number,
+    ) => {
+      // (x0,y0)-(x1,y1)-(x2,y2)-(x3,y3) 四边形，两三角
+      A.push(pt(x0, y0, z), pt(x0, y0, z));
+      B.push(pt(x1, y1, z), pt(x2, y2, z));
+      C.push(pt(x2, y2, z), pt(x3, y3, z));
+    };
+    const rdA: string[] = [];
+    const rdB: string[] = [];
+    const rdC: string[] = [];
+    // 世纪大道：从明珠东南延伸，躲开江面
+    {
+      const ax = PEARL.x + 0.6, ay = PEARL.y - 0.5;
+      const dx = Math.cos(-0.72), dy = Math.sin(-0.72);
+      const nx = -dy, ny = dx;
+      const halfW = 0.15;
+      const zR = 0.014;
+      const steps = 28;
+      const len = 8.2;
+      for (let i = 0; i < steps; i++) {
+        const s0 = 0.35 + (len * i) / steps;
+        const s1 = 0.35 + (len * (i + 1)) / steps;
+        const p0x = ax + dx * s0, p0y = ay + dy * s0;
+        const p1x = ax + dx * s1, p1y = ay + dy * s1;
+        if (riverDist(p0x, p0y) < RIVER_HALF + 0.25 || riverDist(p1x, p1y) < RIVER_HALF + 0.25) continue;
+        if (Math.hypot(p0x - PEARL.x, p0y - PEARL.y) < 0.95) continue;
+        pushQuad(
+          rdA, rdB, rdC,
+          p0x - nx * halfW, p0y - ny * halfW,
+          p0x + nx * halfW, p0y + ny * halfW,
+          p1x + nx * halfW, p1y + ny * halfW,
+          p1x - nx * halfW, p1y - ny * halfW,
+          zR,
+        );
+      }
+    }
+    if (rdA.length) {
+      ex(`G_{ava}=${list(rdA)}`, { hidden: true });
+      ex(`G_{avb}=${list(rdB)}`, { hidden: true });
+      ex(`G_{avc}=${list(rdC)}`, { hidden: true });
+      ex(`\\operatorname{triangle}\\left(G_{ava},G_{avb},G_{avc}\\right)`, { color: '#4f535a', fillOpacity: '1' });
+    }
+    // 外滩车行道 + 步道（两段完整矩形贴片）
+    const bunRoadA: string[] = [];
+    const bunRoadB: string[] = [];
+    const bunRoadC: string[] = [];
+    const bunWalkA: string[] = [];
+    const bunWalkB: string[] = [];
+    const bunWalkC: string[] = [];
+    pushQuad(bunRoadA, bunRoadB, bunRoadC, -4.92, -8.2, -4.35, -8.2, -4.35, 0.9, -4.92, 0.9, 0.01);
+    pushQuad(bunWalkA, bunWalkB, bunWalkC, -4.55, -7.6, -4.15, -7.6, -4.15, 0.55, -4.55, 0.55, 0.02);
+    ex(`G_{bra}=${list(bunRoadA)}`, { hidden: true });
+    ex(`G_{brb}=${list(bunRoadB)}`, { hidden: true });
+    ex(`G_{brc}=${list(bunRoadC)}`, { hidden: true });
+    ex(`\\operatorname{triangle}\\left(G_{bra},G_{brb},G_{brc}\\right)`, { color: '#b9ab94', fillOpacity: '1' });
+    ex(`G_{bwa}=${list(bunWalkA)}`, { hidden: true });
+    ex(`G_{bwb}=${list(bunWalkB)}`, { hidden: true });
+    ex(`G_{bwc}=${list(bunWalkC)}`, { hidden: true });
+    ex(`\\operatorname{triangle}\\left(G_{bwa},G_{bwb},G_{bwc}\\right)`, { color: '#d2c6b4', fillOpacity: '1' });
+  }
   // 外滩路灯：躲开南浦桥走廊
   {
     const bases: string[] = [];
