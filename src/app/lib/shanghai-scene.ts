@@ -596,7 +596,7 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   ex('\\operatorname{sphere}\\left(T_{r}+\\left(0,0,0.2\\right),0.1k_{leaf}\\right)', { colorLatex: 'C_{leaf}' });
 
   // ── 渡轮沿江航行（默认不自动播放，避免进场时每帧重算）──
-  text('⛴ 渡轮：b_t 默认自动播放，两艘船沿黄浦江心线南→北→东循环；可点滑块暂停。', '⛴ Ferries: b_t auto-plays along the Huangpu; pause on the slider if needed.');
+  text('⛴ 渡轮：b_t 默认自动播放；两艘白渡轮 + 一艘红色小船，沿黄浦江心线南→北→东循环。', '⛴ Ferries: two white boats + one small red boat auto-play along the Huangpu.');
   ex('b_{t}=0.2', { slider: { hardMin: true, hardMax: true, min: '0', max: '1', step: '0.002', animationPeriod: 28000, loopMode: 'LOOP_FORWARD', isPlaying: true } } as any);
   ex('s_{1}=0.387');
   ex('s_{2}=0.699');
@@ -604,22 +604,26 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   ex('R_{x}\\left(s\\right)=\\left\\{s<s_{1}:-2.6,s<s_{2}:2+4.6\\cos\\left(\\pi-\\frac{\\pi\\left(s-s_{1}\\right)}{2\\left(s_{2}-s_{1}\\right)}\\right),2+\\frac{7\\left(s-s_{2}\\right)}{1-s_{2}}\\right\\}', { hidden: true });
   ex('R_{y}\\left(s\\right)=\\left\\{s<s_{1}:-8+\\frac{9s}{s_{1}},s<s_{2}:1+4.6\\sin\\left(\\pi-\\frac{\\pi\\left(s-s_{1}\\right)}{2\\left(s_{2}-s_{1}\\right)}\\right),5.6\\right\\}', { hidden: true });
   ex('R_{a}\\left(s\\right)=\\left\\{s<s_{1}:0,s<s_{2}:-\\frac{\\pi\\left(s-s_{1}\\right)}{2\\left(s_{2}-s_{1}\\right)},-\\frac{\\pi}{2}\\right\\}', { hidden: true });
-  ex('\\Phi=\\left[0,0.5\\right]');
-  ex('S_{bo}=\\left[\\operatorname{mod}\\left(b_{t}+\\Phi\\left[i\\right],1\\right)\\operatorname{for}i=\\left[1...2\\right]\\right]');
-  ex('P_{bo}=\\left[\\left(R_{x}\\left(S_{bo}\\left[i\\right]\\right),R_{y}\\left(S_{bo}\\left[i\\right]\\right),-0.03\\right)\\operatorname{for}i=\\left[1...2\\right]\\right]', { hidden: true });
-  ex('A_{bo}=\\left[R_{a}\\left(S_{bo}\\left[i\\right]\\right)\\operatorname{for}i=\\left[1...2\\right]\\right]');
-  ex('W_{bo}=\\left[0.11,0.095\\right]');
-  ex('D_{bo}=\\left[0.34,0.28\\right]');
-  ex('H_{bo}=\\left[0.075,0.065\\right]');
-  ex('G_{bo}=\\operatorname{rgb}\\left(\\left[240,248\\right],\\left[240,248\\right],\\left[236,240\\right]\\right)');
+  // 第 3 艘：相位错开的红色小船（尺寸更小）
+  ex('\\Phi=\\left[0,0.5,0.28\\right]');
+  ex('S_{bo}=\\left[\\operatorname{mod}\\left(b_{t}+\\Phi\\left[i\\right],1\\right)\\operatorname{for}i=\\left[1...3\\right]\\right]');
+  ex('P_{bo}=\\left[\\left(R_{x}\\left(S_{bo}\\left[i\\right]\\right),R_{y}\\left(S_{bo}\\left[i\\right]\\right),-0.03\\right)\\operatorname{for}i=\\left[1...3\\right]\\right]', { hidden: true });
+  ex('A_{bo}=\\left[R_{a}\\left(S_{bo}\\left[i\\right]\\right)\\operatorname{for}i=\\left[1...3\\right]\\right]');
+  ex('W_{bo}=\\left[0.11,0.095,0.07\\right]');
+  ex('D_{bo}=\\left[0.34,0.28,0.2\\right]');
+  ex('H_{bo}=\\left[0.075,0.065,0.05\\right]');
+  ex('G_{bo}=\\operatorname{rgb}\\left(\\left[240,248,220\\right],\\left[240,248,56\\right],\\left[236,240,48\\right]\\right)');
   {
     const hull = (U: string) =>
       `B\\left(U_{${U}}\\left[j\\right],P_{bo}\\left[i\\right],W_{bo}\\left[i\\right],D_{bo}\\left[i\\right],H_{bo}\\left[i\\right],0.7,0.55,A_{bo}\\left[i\\right]\\right)`;
-    ex(`Q_{bo}=\\left[G_{bo}\\left[i\\right]\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...2\\right]\\right]`);
-    ex(`\\left[\\operatorname{triangle}\\left(${hull('a')},${hull('b')},${hull('c')}\\right)\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...2\\right]\\right]`, { colorLatex: 'Q_{bo}' });
+    ex(`Q_{bo}=\\left[G_{bo}\\left[i\\right]\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...3\\right]\\right]`);
+    ex(`\\left[\\operatorname{triangle}\\left(${hull('a')},${hull('b')},${hull('c')}\\right)\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...3\\right]\\right]`, { colorLatex: 'Q_{bo}' });
     const cabin = (U: string) =>
       `B\\left(U_{${U}}\\left[j\\right],P_{bo}\\left[i\\right]+\\left(0,0,H_{bo}\\left[i\\right]\\right),0.5\\cdot W_{bo}\\left[i\\right],0.32\\cdot D_{bo}\\left[i\\right],0.045,1,1,A_{bo}\\left[i\\right]\\right)`;
-    ex(`\\left[\\operatorname{triangle}\\left(${cabin('a')},${cabin('b')},${cabin('c')}\\right)\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...2\\right]\\right]`, { color: '#3d7ea6' });
+    // 白渡轮蓝舱、红船白舱
+    ex('G_{cab}=\\operatorname{rgb}\\left(\\left[61,61,250\\right],\\left[126,126,250\\right],\\left[166,166,250\\right]\\right)');
+    ex(`Q_{cab}=\\left[G_{cab}\\left[i\\right]\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...3\\right]\\right]`);
+    ex(`\\left[\\operatorname{triangle}\\left(${cabin('a')},${cabin('b')},${cabin('c')}\\right)\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...3\\right]\\right]`, { colorLatex: 'Q_{cab}' });
   }
 
   return out;
