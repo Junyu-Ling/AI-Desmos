@@ -187,50 +187,78 @@ function centuryAvenueDist(x: number, y: number) {
   return (x - ax) * -dy + (y - ay) * dx;
 }
 
-function buildTrees(buildings: Building[]) {
-  const rnd = mulberry32(42);
-  const pts: [number, number][] = [];
-  for (let y = -7.9; y <= 0.6; y += 0.55) pts.push([-4.62, y]);
-  for (let a = 1.75; a <= 3.05; a += 0.16) {
-    const r = 4.6 - RIVER_HALF - 0.35;
-    pts.push([2 + r * Math.cos(a), 1 + r * Math.sin(a)]);
+/** 南浦桥占位走廊：树与路灯避开，避免穿模 */
+const BRIDGE = { x0: -5.7, x1: 0.45, y0: -5.85, y1: -4.55, y: -5.2 };
+
+/**
+ * 行道树：参考 Ultra OBJ 的滨江布局，但强制最小间距、避开建筑/桥/江，
+ * 杜绝「扎堆球体」与穿楼。
+ */
+function buildTrees(obstacles: { x: number; y: number; r: number }[]) {
+  const raw: [number, number][] = [];
+  // 外滩：西岸陆地 x≈-4.6（江缘约 -4.3），与楼群/桥走廊留空
+  for (let y = -7.5; y <= 0.3; y += 0.78) raw.push([-4.62, y]);
+  // 陆家嘴滨江：弯道内侧偏南 + 南段东岸，躲开明珠与桥走廊
+  for (let a = 2.75; a <= 3.2; a += 0.22) {
+    const r = 4.6 - RIVER_HALF - 0.5;
+    raw.push([2 + r * Math.cos(a), 1 + r * Math.sin(a)]);
   }
-  for (let i = 0; i < 12; i++) {
-    const ang = rnd() * Math.PI * 2, rr = Math.sqrt(rnd()) * (GREEN.r - 0.12);
-    pts.push([GREEN.x + rr * Math.cos(ang), GREEN.y + rr * Math.sin(ang)]);
+  for (const p of [[0.9, -3.2], [1.5, -3.9], [2.1, -4.5], [3.0, 3.9], [4.0, 4.5]] as [number, number][]) {
+    raw.push(p);
   }
+  // 中心绿地：外圈 4 棵
+  for (let i = 0; i < 4; i++) {
+    const ang = -0.35 + i * (Math.PI / 2);
+    raw.push([GREEN.x + 0.55 * Math.cos(ang), GREEN.y + 0.55 * Math.sin(ang)]);
+  }
+  // 世纪大道两侧
   const ax = PEARL.x + 0.6, ay = PEARL.y - 0.5, dx = Math.cos(-0.72), dy = Math.sin(-0.72);
-  for (let s = 0.4; s < 9; s += 0.7) {
-    for (const side of [-0.3, 0.3]) pts.push([ax + dx * s - dy * side, ay + dy * s + dx * side]);
+  for (let s = 1.4; s < 7.4; s += 1.4) {
+    raw.push([ax + dx * s - dy * 0.45, ay + dy * s + dx * 0.45]);
+    raw.push([ax + dx * s + dy * 0.45, ay + dy * s - dx * 0.45]);
   }
-  const landmarks = [PEARL, JINMAO, SWFC, SHTOWER];
-  return pts.filter(([x, y]) => {
-    if (riverDist(x, y) <= RIVER_HALF + 0.22) return false;
-    if (x <= -7.4 || x >= 8.9 || Math.abs(y) >= 8.15) return false;
-    if (landmarks.some(p => Math.hypot(p.x - x, p.y - y) < 0.95)) return false;
-    // 与楼块保持间隙，避免树冠穿墙
-    if (buildings.some(b => Math.abs(b.x - x) < b.w + 0.14 && Math.abs(b.y - y) < b.d + 0.14)) return false;
-    return true;
-  });
+
+  const minGap = 0.65;
+  const out: [number, number][] = [];
+  for (const [x, y] of raw) {
+    // 只要离开水面即可；岸上外滩树距江心 ≈1.9–2.0
+    if (riverDist(x, y) <= RIVER_HALF + 0.12) continue;
+    if (x < -7.2 || x > 8.6 || y < -8 || y > 7.8) continue;
+    if (Math.hypot(x - PEARL.x, y - PEARL.y) < 1.1) continue;
+    if (x > BRIDGE.x0 && x < BRIDGE.x1 && y > BRIDGE.y0 && y < BRIDGE.y1) continue;
+    if (obstacles.some(o => Math.hypot(o.x - x, o.y - y) < o.r)) continue;
+    if (out.some(([ox, oy]) => Math.hypot(ox - x, oy - y) < minGap)) continue;
+    out.push([x, y]);
+  }
+  return out;
 }
 
 /** 生成场景的全部表达式（全部明文列出，不隐藏、不压缩） */
 export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpression[] {
   const zh = lang !== 'en';
   const city = buildCity();
-  const allBlocks = [...city.bund, ...city.bundTowers, ...city.puxi, ...city.north, ...city.lujiazui, ...city.ifc];
-  const trees = buildTrees(allBlocks);
+  const footprint = (b: Building, pad = 0.22) => ({
+    x: b.x, y: b.y, r: Math.max(b.w, b.d) * 0.75 + pad,
+  });
+  const treeObstacles = [
+    ...city.bund, ...city.bundTowers, ...city.puxi, ...city.north, ...city.lujiazui, ...city.ifc, city.swfc,
+  ].map(b => footprint(b));
+  treeObstacles.push(
+    { x: PEARL.x, y: PEARL.y, r: 1.05 },
+    { x: JINMAO.x, y: JINMAO.y, r: 0.7 },
+    { x: SWFC.x, y: SWFC.y, r: 0.65 },
+    { x: SHTOWER.x, y: SHTOWER.y, r: 0.85 },
+  );
+  const trees = buildTrees(treeObstacles);
   const out: Desmos3DExpression[] = [];
   let seq = 0;
   const id = (p: string) => `sh_${p}_${seq++}`;
   const text = (zhText: string, enText: string) => out.push({ id: id('t'), type: 'text', text: zh ? zhText : enText });
   const ex = (latex: string, extra: Partial<Desmos3DExpression> = {}) => out.push({ id: id('e'), latex, ...extra });
-  // 楼底略抬离地面，避免底面与地平面共面闪烁
-  const BASE_Z = 0.004;
 
   text(
-    '上海陆家嘴 · 四季｜1 单位 = 100 米。公式全部明文列出。层高错开、区域互斥，避免共面穿模。t₀=四季，b_t=渡轮（点播放）。',
-    'Shanghai Lujiazui · Four Seasons | 1 unit = 100 m. All formulas listed. Layer gaps + mutually exclusive regions avoid z-fighting. t₀=seasons, b_t=ferries.',
+    '上海陆家嘴 · 四季（完稿）｜1 单位 = 100 米。公式全部明文列出、不压缩。t₀=四季，b_t=渡轮。南浦桥为实体桥面；行道树已疏植并避开建筑/桥，减少穿模。',
+    'Shanghai Lujiazui · Four Seasons (final) | 1 unit = 100 m. All formulas listed. Solid Nanpu deck; trees spaced clear of buildings/bridge.',
   );
 
   // ── 四季 ──
@@ -278,71 +306,35 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   // d_r(x,y) 若绘图会铺成曲面，只关绘图、公式仍在列表
   ex('d_{r}\\left(x,y\\right)=\\left\\{y<1:\\left|x+2.6\\right|,x>2:\\left|y-5.6\\right|,\\left|\\sqrt{\\left(x-2\\right)^{2}+\\left(y-1\\right)^{2}}-4.6\\right|\\right\\}', { hidden: true });
 
-  // ── 地面与黄浦江（区域互斥 + 层高错开，消除共面穿模）──
-  text(
-    '🌊 地面分层：江面 / 驳岸 / 地面 / 道路 / 绿地互斥，Z 错开 ≥ 0.015，不叠共面片。',
-    '🌊 Layered ground: river / embankment / ground / roads / lawn are mutually exclusive with Z gaps ≥ 0.015.',
-  );
-  const embInner = RIVER_HALF;
-  const embMid = RIVER_HALF + 0.09;
-  const embOuter = RIVER_HALF + 0.2;
-  const grassR2 = GREEN.r ** 2;
-  const avenueLat =
-    `\\left|\\left(x-${f(PEARL.x + 0.6)}\\right)\\sin\\left(0.72\\right)+\\left(y-${f(PEARL.y - 0.5)}\\right)\\cos\\left(0.72\\right)\\right|`;
-  const avenueAlong =
-    `\\left(x-${f(PEARL.x + 0.6)}\\right)\\cos\\left(0.72\\right)-\\left(y-${f(PEARL.y - 0.5)}\\right)\\sin\\left(0.72\\right)`;
-  // 地面：让出护岸、绿地、世纪大道、外滩步道、明珠广场（互斥，不叠共面）
-  ex(
-    `z=0\\left\\{d_{r}\\left(x,y\\right)>${f(embOuter)}\\right\\}` +
-      `\\left\\{\\left(x-${f(GREEN.x)}\\right)^{2}+\\left(y-${f(GREEN.y)}\\right)^{2}>${f(grassR2)}\\right\\}` +
-      `\\left\\{${avenueLat}>0.16\\right\\}` +
-      `\\left\\{x\\le-4.95:1,x\\ge-4.12:1,y\\le-8.25:1,y\\ge0.95:1,0\\right\\}` +
-      `\\left\\{\\left(x-${f(PEARL.x)}\\right)^{2}+\\left(y-${f(PEARL.y)}\\right)^{2}>0.62\\right\\}` +
-      `\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`,
-    { colorLatex: 'C_{ground}' },
-  );
-  ex(
-    `z=-0.055+0.006\\sin\\left(2.8x+1.6y\\right)+0.004\\sin\\left(5.2x-3.1y\\right)` +
-      `\\left\\{d_{r}\\left(x,y\\right)<${f(embInner - 0.02)}\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`,
-    { colorLatex: 'C_{water}' },
-  );
-  ex(
-    `z=0.028\\left\\{${f(embInner)}<d_{r}\\left(x,y\\right)<${f(embMid)}\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`,
-    { color: '#6e6860' },
-  );
-  ex(
-    `z=0.048\\left\\{${f(embMid)}<d_{r}\\left(x,y\\right)<${f(embOuter)}\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`,
-    { color: '#9a9186' },
-  );
-  ex(
-    `z=0.018\\left\\{\\left(x-${f(GREEN.x)}\\right)^{2}+\\left(y-${f(GREEN.y)}\\right)^{2}<${f(grassR2)}\\right\\}` +
-      `\\left\\{d_{r}\\left(x,y\\right)>${f(embOuter)}\\right\\}`,
-    { colorLatex: 'C_{grass}' },
-  );
-  ex(
-    `z=0.02\\left\\{${avenueLat}<0.15\\right\\}\\left\\{${avenueAlong}>0\\right\\}` +
-      `\\left\\{d_{r}\\left(x,y\\right)>${f(embOuter)}\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`,
-    { color: '#55585e' },
-  );
-  ex('z=0.016\\left\\{-4.92<x<-4.35\\right\\}\\left\\{-8.2<y<0.9\\right\\}', { color: '#b9ab94' });
-  ex('z=0.034\\left\\{-4.55<x<-4.18\\right\\}\\left\\{-7.6<y<0.55\\right\\}', { color: '#d2c6b4' });
-  // 外滩路灯立在步道面上，不戳进地面
+  // ── 地面与黄浦江 ──
+  text('🌊 地面与黄浦江：d_r 到江心线距离，半宽 170 m；护岸、世纪大道、外滩步道分层。水面用轻微波纹。', '🌊 Ground & river with embankments, Century Avenue, Bund promenade, light ripples.');
+  // 地面 / 水面高度错开，减少与桥面、护岸的深度冲突
+  ex(`z=-0.02\\left\\{d_{r}\\left(x,y\\right)>${RIVER_HALF}\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { colorLatex: 'C_{ground}' });
+  ex(`z=-0.06+0.004\\sin\\left(2.6x+1.5y\\right)\\left\\{d_{r}\\left(x,y\\right)<${RIVER_HALF}\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { colorLatex: 'C_{water}' });
+  // 单层护岸（避免双层边界闪烁穿模）
+  ex(`z=0.035\\left\\{${RIVER_HALF}<d_{r}\\left(x,y\\right)<${f(RIVER_HALF + 0.15)}\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { color: '#8a8278' });
+  ex(`z=0.01\\left\\{\\left(x-${f(GREEN.x)}\\right)^{2}+\\left(y-${f(GREEN.y)}\\right)^{2}<${f(GREEN.r ** 2)}\\right\\}`, { colorLatex: 'C_{grass}' });
+  ex(`z=0.006\\left\\{\\left|\\left(x-${f(PEARL.x + 0.6)}\\right)\\sin\\left(0.72\\right)+\\left(y-${f(PEARL.y - 0.5)}\\right)\\cos\\left(0.72\\right)\\right|<0.14\\right\\}\\left\\{\\left(x-${f(PEARL.x + 0.6)}\\right)\\cos\\left(0.72\\right)-\\left(y-${f(PEARL.y - 0.5)}\\right)\\sin\\left(0.72\\right)>0\\right\\}\\left\\{-7.5<x<9\\right\\}\\left\\{-8.25<y<8.25\\right\\}`, { color: '#55585e' });
+  ex('z=0.008\\left\\{-4.92<x<-4.35\\right\\}\\left\\{-8.2<y<0.9\\right\\}', { color: '#b9ab94' });
+  ex('z=0.018\\left\\{-4.55<x<-4.15\\right\\}\\left\\{-7.6<y<0.55\\right\\}', { color: '#d2c6b4' });
+  // 外滩路灯：躲开南浦桥走廊
   {
     const bases: string[] = [];
     const tops: string[] = [];
-    for (let y = -7.4; y <= 0.4; y += 1.15) {
-      bases.push(pt(-4.28, y, 0.034));
-      tops.push(pt(-4.28, y, 0.3));
+    for (let y = -7.4; y <= 0.4; y += 1.2) {
+      if (y > BRIDGE.y0 - 0.15 && y < BRIDGE.y1 + 0.15) continue;
+      bases.push(pt(-4.28, y, 0));
+      tops.push(pt(-4.28, y, 0.28));
     }
     ex(`\\operatorname{segment}\\left(${list(bases)},${list(tops)}\\right)`, { color: '#5a564e' });
-    ex(`\\operatorname{sphere}\\left(${list(tops)},0.032\\right)`, { color: '#f2e6c4' });
+    ex(`\\operatorname{sphere}\\left(${list(tops)},0.03\\right)`, { color: '#f2e6c4' });
   }
 
   // ── 楼群 ──
-  // detail='full'：外滩只加一道外挑楼层线（不穿墙）；积雪改用屋顶色，不再叠共面雪片
+  // detail='full'：外滩加楼层线+冬雪；其余楼群只画主体，保证流畅
   const group = (tag: string, title: [string, string], bs: Building[], detail: 'full' | 'simple' = 'simple', zOf?: (b: Building) => number) => {
     text(title[0], title[1]);
-    const P = list(bs.map(b => pt(b.x, b.y, zOf ? zOf(b) : BASE_Z)));
+    const P = list(bs.map(b => pt(b.x, b.y, zOf ? zOf(b) : 0)));
     ex(`P_{${tag}}=${P}`);
     ex(`W_{${tag}}=${list(bs.map(b => f(b.w)))}`);
     ex(`D_{${tag}}=${list(bs.map(b => f(b.d)))}`);
@@ -357,14 +349,13 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
     ex(`Q_{${tag}}=\\left[G_{${tag}}\\left[i\\right]\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...${n}\\right]\\right]`);
     ex(`\\left[\\operatorname{triangle}\\left(${args('a')},${args('b')},${args('c')}\\right)\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...${n}\\right]\\right]`, { colorLatex: `Q_{${tag}}` });
     if (detail === 'full') {
-      // 外挑腰带：只画侧立面，水平外扩，避免切进楼体（Ultra 网格里大量共面 mullion 是穿模主因）
+      const snowArgs = (U: string) =>
+        `B\\left(U_{${U}}\\left[j\\right],P_{${tag}}\\left[i\\right]+\\left(0,0,H_{${tag}}\\left[i\\right]-0.03\\right),W_{${tag}}\\left[i\\right]K_{${tag}}\\left[i\\right]+0.004,D_{${tag}}\\left[i\\right]L_{${tag}}\\left[i\\right]+0.004,0.03+s_{now},1,1,A_{${tag}}\\left[i\\right]\\right)`;
+      ex(`\\left[\\operatorname{triangle}\\left(${snowArgs('a')},${snowArgs('b')},${snowArgs('c')}\\right)\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...${n}\\right]\\right]`, { colorLatex: 'C_{snow}' });
       const plate = (U: string) =>
-        `B\\left(U_{${U}}\\left[j\\right],P_{${tag}}\\left[i\\right]+\\left(0,0,H_{${tag}}\\left[i\\right]\\cdot\\frac{k}{4}\\right),1.08\\cdot W_{${tag}}\\left[i\\right],1.08\\cdot D_{${tag}}\\left[i\\right],0.012,1,1,A_{${tag}}\\left[i\\right]\\right)`;
+        `B\\left(U_{${U}}\\left[j\\right],P_{${tag}}\\left[i\\right]+\\left(0,0,H_{${tag}}\\left[i\\right]\\cdot\\frac{k}{4}\\right),1.035\\cdot W_{${tag}}\\left[i\\right],1.035\\cdot D_{${tag}}\\left[i\\right],0.01,1,1,A_{${tag}}\\left[i\\right]\\right)`;
+      // 只保留一道楼层线，避免三角面爆炸
       ex(`\\left[\\operatorname{triangle}\\left(${plate('a')},${plate('b')},${plate('c')}\\right)\\operatorname{for}j=\\left[3...10\\right],k=\\left[2\\right],i=\\left[1...${n}\\right]\\right]`, { colorLatex: 'C_{mullion}' });
-      // 冬季屋顶盖：完全落在屋顶之上，厚度随 s_w，非冬季缩成近零
-      const cap = (U: string) =>
-        `B\\left(U_{${U}}\\left[j\\right],P_{${tag}}\\left[i\\right]+\\left(0,0,H_{${tag}}\\left[i\\right]+0.006\\right),W_{${tag}}\\left[i\\right]K_{${tag}}\\left[i\\right]\\cdot 0.98,D_{${tag}}\\left[i\\right]L_{${tag}}\\left[i\\right]\\cdot 0.98,0.004+0.04s_{w},1,1,A_{${tag}}\\left[i\\right]\\right)`;
-      ex(`\\left[\\operatorname{triangle}\\left(${cap('a')},${cap('b')},${cap('c')}\\right)\\operatorname{for}j=\\left[1...10\\right],i=\\left[1...${n}\\right]\\right]`, { colorLatex: 'C_{snow}' });
     }
   };
 
@@ -392,10 +383,9 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   group('bund', ['🏛 外滩万国建筑群：石材楼身 + 楼层线，含海关大楼钟楼与和平饭店（绿色金字塔顶）。', '🏛 The Bund: stone blocks with floor plates, Customs House and Peace Hotel.'], city.bund, 'full');
   group('bt', ['海关大楼钟楼。', 'Customs House clock tower.'], city.bundTowers, 'full');
   const p = city.peace;
-  const top = BASE_Z + p.h, ph = 0.22;
-  // 金字塔落在屋顶之上（+0.008），不与屋顶共面
-  ex(`\\operatorname{triangle}\\left(${list([pt(p.x - 0.12, p.y - 0.12, top + 0.008), pt(p.x + 0.12, p.y - 0.12, top + 0.008), pt(p.x + 0.12, p.y + 0.12, top + 0.008), pt(p.x - 0.12, p.y + 0.12, top + 0.008)])},${list([pt(p.x + 0.12, p.y - 0.12, top + 0.008), pt(p.x + 0.12, p.y + 0.12, top + 0.008), pt(p.x - 0.12, p.y + 0.12, top + 0.008), pt(p.x - 0.12, p.y - 0.12, top + 0.008)])},${pt(p.x, p.y, top + ph)}\\right)`, { color: '#3f8f6b' });
-  ex(`\\operatorname{sphere}\\left(${pt(city.customs.x + 0.2, city.customs.y, BASE_Z + 0.74)},0.04\\right)`, { color: '#f2ead2' });
+  const top = p.h, ph = 0.22;
+  ex(`\\operatorname{triangle}\\left(${list([pt(p.x - 0.12, p.y - 0.12, top), pt(p.x + 0.12, p.y - 0.12, top), pt(p.x + 0.12, p.y + 0.12, top), pt(p.x - 0.12, p.y + 0.12, top)])},${list([pt(p.x + 0.12, p.y - 0.12, top), pt(p.x + 0.12, p.y + 0.12, top), pt(p.x - 0.12, p.y + 0.12, top), pt(p.x - 0.12, p.y - 0.12, top)])},${pt(p.x, p.y, top + ph)}\\right)`, { color: '#3f8f6b' });
+  ex(`\\operatorname{sphere}\\left(${pt(city.customs.x + 0.2, city.customs.y, 0.74)},0.04\\right)`, { color: '#f2ead2' });
 
   group('px', ['🏙 浦西纵深高楼。', '🏙 Puxi high-rises.'], city.puxi, 'simple');
   group('nb', ['🏙 北岸（北外滩、虹口）。', '🏙 North bank (North Bund, Hongkou).'], city.north, 'simple');
@@ -405,87 +395,128 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   group('ifc', ['🏙 国金中心风格双塔与裙楼。', '🏙 IFC-style twin towers and podium.'], city.ifc, 'simple');
   text('最高的 5 栋陆家嘴塔楼：方截面幕墙，竖梃/楼层线来自 f_ace，向上收分。', 'Top 5 Lujiazui towers: square curtain walls with f_ace mullions, tapering up.');
   putLists('hero', heroes);
-  // 幕墙停在屋顶略下，盖板浮在屋顶之上，避免顶面共面
-  ex(wall('hero', `${f(BASE_Z)}+\\left(H_{hero}-${f(BASE_Z)}\\right)v`, '1', '1', true), { colorLatex: 'C_{glass}' });
-  ex(lid('hero', `H_{hero}+0.01`, 'K_{hero}', 'L_{hero}'), { colorLatex: 'C_{roof}' });
+  ex(wall('hero', 'H_{hero}v', '1', '1', true), { colorLatex: 'C_{glass}' });
+  ex(lid('hero', 'H_{hero}', 'K_{hero}', 'L_{hero}'), { colorLatex: 'C_{roof}' });
 
   // ── 金茂：八边形截面，逐层出檐 ──
-  text('🗼 金茂大厦（421 m）：裙楼与塔身分段，塔身从裙楼顶之上升起，避免穿模。', '🗼 Jin Mao (421 m): podium and shaft stacked with a Z gap — no coplanar join.');
+  text('🗼 金茂大厦（421 m）：八边形截面，沿高度 13 次出檐收分，青铜色幕墙，顶部金色尖塔。', '🗼 Jin Mao Tower (421 m): octagonal section with 13 eaves, bronze curtain wall and a gold spire.');
   ex('r_{jm}\\left(v\\right)=0.30-0.15v+0.022\\max\\left(0,\\cos\\left(26\\pi v\\right)\\right)^{6}');
-  ex(`\\left(${f(JINMAO.x)}+0.40v\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)\\cos\\left(2\\pi u-0.42\\right),${f(JINMAO.y)}+0.40v\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)\\sin\\left(2\\pi u-0.42\\right),0.15\\right)`, { colorLatex: 'C_{podium}' });
-  ex(`\\left(${f(JINMAO.x)}+q_{x}\\cos\\left(-0.42\\right)-q_{y}\\sin\\left(-0.42\\right),${f(JINMAO.y)}+q_{x}\\sin\\left(-0.42\\right)+q_{y}\\cos\\left(-0.42\\right),0.17+3.85v\\right)\\operatorname{with}q_{x}=r_{jm}\\left(v\\right)\\sec\\left(\\operatorname{mod}\\left(2\\pi u,\\frac{\\pi}{4}\\right)-\\frac{\\pi}{8}\\right)\\cos\\left(2\\pi u\\right),q_{y}=r_{jm}\\left(v\\right)\\sec\\left(\\operatorname{mod}\\left(2\\pi u,\\frac{\\pi}{4}\\right)-\\frac{\\pi}{8}\\right)\\sin\\left(2\\pi u\\right)`, { colorLatex: 'C_{jinmao}' });
-  ex(`\\left(${f(JINMAO.x)}+0.05\\left(1-v\\right)\\cos\\left(2\\pi u\\right),${f(JINMAO.y)}+0.05\\left(1-v\\right)\\sin\\left(2\\pi u\\right),4.05+0.19v\\right)`, { color: '#e6d7a2' });
+  ex(`\\left(${f(JINMAO.x)}+q_{x}\\cos\\left(-0.42\\right)-q_{y}\\sin\\left(-0.42\\right),${f(JINMAO.y)}+q_{x}\\sin\\left(-0.42\\right)+q_{y}\\cos\\left(-0.42\\right),4.02v\\right)\\operatorname{with}q_{x}=r_{jm}\\left(v\\right)\\sec\\left(\\operatorname{mod}\\left(2\\pi u,\\frac{\\pi}{4}\\right)-\\frac{\\pi}{8}\\right)\\cos\\left(2\\pi u\\right),q_{y}=r_{jm}\\left(v\\right)\\sec\\left(\\operatorname{mod}\\left(2\\pi u,\\frac{\\pi}{4}\\right)-\\frac{\\pi}{8}\\right)\\sin\\left(2\\pi u\\right)`, { colorLatex: 'C_{jinmao}' });
+  ex(`\\left(${f(JINMAO.x)}+0.42v\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)\\cos\\left(2\\pi u-0.42\\right),${f(JINMAO.y)}+0.42v\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)\\sin\\left(2\\pi u-0.42\\right),0.16\\right)`, { colorLatex: 'C_{podium}' });
+  ex(`\\left(${f(JINMAO.x)}+0.05\\left(1-v\\right)\\cos\\left(2\\pi u\\right),${f(JINMAO.y)}+0.05\\left(1-v\\right)\\sin\\left(2\\pi u\\right),4.02+0.19v\\right)`, { color: '#e6d7a2' });
 
-  // ── 环球金融中心：幕墙在洞口下缘收住，框单独浮在洞口 ──
-  text('🗼 上海环球金融中心（492 m）：幕墙收到洞口下缘，开瓶器框单独架在空中，不与幕墙共体。', '🗼 SWFC (492 m): shaft stops below the aperture; the bottle-opener frame sits clear of the glass.');
-  ex(`\\left(${f(SWFC.x)}+q_{x}\\cos\\left(0.35\\right)-q_{y}\\sin\\left(0.35\\right),${f(SWFC.y)}+q_{x}\\sin\\left(0.35\\right)+q_{y}\\cos\\left(0.35\\right),${f(BASE_Z)}+4.38v\\right)\\operatorname{with}q_{x}=0.3\\left(1-0.11v\\right)${RHO}\\cos\\left(2\\pi u\\right),q_{y}=0.3\\left(1-0.78v\\right)${RHO}\\sin\\left(2\\pi u\\right)`, { colorLatex: 'C_{glass}' });
+  // ── 环球金融中心：一个方向收到刀锋，洞口用四根框而不是一块挡板 ──
+  text('🗼 上海环球金融中心（492 m）：梯形刀锋收分，幕墙有窗格，顶部「开瓶器」是透空的框。', '🗼 Shanghai World Financial Center (492 m): tapers to a blade, with a window grid and an open bottle-opener frame.');
+  ex(`\\left(${f(SWFC.x)}+q_{x}\\cos\\left(0.35\\right)-q_{y}\\sin\\left(0.35\\right),${f(SWFC.y)}+q_{x}\\sin\\left(0.35\\right)+q_{y}\\cos\\left(0.35\\right),4.92v\\right)\\operatorname{with}q_{x}=0.3\\left(1-0.12v\\right)${RHO}\\cos\\left(2\\pi u\\right),q_{y}=0.3\\left(1-0.82v\\right)${RHO}\\sin\\left(2\\pi u\\right)`, { colorLatex: 'C_{glass}' });
   {
     const a = 0.35, c = Math.cos(a), s = Math.sin(a);
     const at = (lx: number, ly: number, z: number): Building => ({
       x: SWFC.x + lx * c - ly * s, y: SWFC.y + lx * s + ly * c,
       w: 0.02, d: 0.018, h: 0.04, k: 1, l: 1, a, c: [232, 240, 246],
     });
-    // 框略外扩，离开刀锋实体
     const frame: Building[] = [
-      { ...at(-0.105, 0, 4.42), w: 0.014, d: 0.022, h: 0.34 },
-      { ...at(0.105, 0, 4.42), w: 0.014, d: 0.022, h: 0.34 },
-      { ...at(0, 0, 4.42), w: 0.112, d: 0.014, h: 0.024 },
-      { ...at(0, 0, 4.74), w: 0.1, d: 0.014, h: 0.024 },
+      { ...at(-0.1, 0, 4.42), w: 0.016, d: 0.02, h: 0.36 },
+      { ...at(0.1, 0, 4.42), w: 0.016, d: 0.02, h: 0.36 },
+      { ...at(0, 0, 4.42), w: 0.11, d: 0.016, h: 0.028 },
+      { ...at(0, 0, 4.75), w: 0.1, d: 0.014, h: 0.028 },
     ];
-    group('swh', ['开瓶器洞口：左右两根立柱加上下两根横梁，中间是空的。', 'Aperture: two posts and two beams, open in the middle.'], frame, 'simple', b => [4.42, 4.42, 4.42, 4.74][frame.indexOf(b)]);
+    group('swh', ['开瓶器洞口：左右两根立柱加上下两根横梁，中间是空的。', 'Aperture: two posts and two beams, open in the middle.'], frame, 'simple', b => [4.42, 4.42, 4.42, 4.75][frame.indexOf(b)]);
   }
 
   // ── 上海中心 ──
-  text('🗼 上海中心大厦（632 m）：裙楼顶盖与塔身错开 0.02，塔冠盖板浮在幕墙之上。', '🗼 Shanghai Tower (632 m): podium lid / shaft / crown stacked with clear Z gaps.');
+  text('🗼 上海中心大厦（632 m）：圆角三角形截面，自下而上收分并扭转 120°。设备层亮带与竖梃来自 C_st。', '🗼 Shanghai Tower (632 m): rounded-triangle taper + 120° twist; C_st for bands/mullions.');
   ex('C_{st}=\\operatorname{rgb}\\left(150+70\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-42\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8}-22\\max\\left(0,\\cos\\left(\\frac{2\\pi z}{0.08}\\right)\\right)^{8},178+55\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-30\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8}-16\\max\\left(0,\\cos\\left(\\frac{2\\pi z}{0.08}\\right)\\right)^{8},196+45\\max\\left(0,\\cos\\left(9z\\right)\\right)^{30}-18\\max\\left(0,\\cos\\left(16\\pi u\\right)\\right)^{8}\\right)', { hidden: true });
   ex(`r_{st}\\left(u,v\\right)=0.43\\left(1-0.55v\\right)\\left(1+0.11\\cos\\left(3\\left(2\\pi u-\\frac{2\\pi}{3}v\\right)\\right)\\right)`);
-  ex(`\\left(${f(SHTOWER.x)}+0.55v\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+0.55v\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)\\sin\\left(2\\pi u\\right),0.2\\right)`, { colorLatex: 'C_{podium}' });
-  ex(`\\left(${f(SHTOWER.x)}+r_{st}\\left(u,v\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+r_{st}\\left(u,v\\right)\\sin\\left(2\\pi u\\right),0.22+5.86v\\right)`, { colorLatex: 'C_{st}' });
+  // 裙楼底座
+  ex(`\\left(${f(SHTOWER.x)}+0.55v\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+0.55v\\sec\\left(\\operatorname{mod}\\left(2\\pi u-\\frac{\\pi}{4},\\frac{\\pi}{2}\\right)-\\frac{\\pi}{4}\\right)\\sin\\left(2\\pi u\\right),0.22\\right)`, { colorLatex: 'C_{podium}' });
+  ex(`\\left(${f(SHTOWER.x)}+r_{st}\\left(u,v\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+r_{st}\\left(u,v\\right)\\sin\\left(2\\pi u\\right),0.22+5.88v\\right)`, { colorLatex: 'C_{st}' });
   ex(`\\left(${f(SHTOWER.x)}+r_{st}\\left(u,1\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+r_{st}\\left(u,1\\right)\\sin\\left(2\\pi u\\right),6.1+0.22v\\left(1+\\cos\\left(2\\pi u-\\frac{2\\pi}{3}\\right)\\right)\\right)`, { color: '#a9c3d2' });
-  ex(`\\left(${f(SHTOWER.x)}+v\\cdot 0.98r_{st}\\left(u,1\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+v\\cdot 0.98r_{st}\\left(u,1\\right)\\sin\\left(2\\pi u\\right),6.12\\right)`, { color: '#8fa9b8' });
+  ex(`\\left(${f(SHTOWER.x)}+vr_{st}\\left(u,1\\right)\\cos\\left(2\\pi u\\right),${f(SHTOWER.y)}+vr_{st}\\left(u,1\\right)\\sin\\left(2\\pi u\\right),6.1\\right)`, { color: '#8fa9b8' });
 
   // ── 东方明珠 ──
   const P = PEARL;
-  text('🔴 东方明珠（468 m）：装饰环略大于球体半径，平台与地面错层，减少共面闪烁。', '🔴 Oriental Pearl (468 m): decorative rings sit outside the spheres; plaza lifted off the ground plane.');
+  text('🔴 东方明珠（468 m）：三根立柱 + 三根斜撑 + 下球（直径 50 m）+ 五颗小球 + 上球（直径 45 m）+ 太空舱 + 天线；底部有圆形观景平台。', '🔴 Oriental Pearl Tower (468 m): columns, slanted legs, spheres, space module, antenna and a circular podium.');
   ex('C_{pearl}=\\operatorname{rgb}\\left(196,46,104\\right)');
-  ex(`\\left(${f(P.x)}+0.72v\\cos\\left(2\\pi u\\right),${f(P.y)}+0.72v\\sin\\left(2\\pi u\\right),0.018\\right)`, { color: '#cfc6bb' });
-  ex(`\\left(${f(P.x)}+\\left(0.55+0.12v\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.55+0.12v\\right)\\sin\\left(2\\pi u\\right),0.03+0.05v\\right)`, { color: '#d8d0c6' });
-  ex(`\\left(${f(P.x)}+0.11\\cos\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]\\right)+0.045\\cos\\left(2\\pi u\\right),${f(P.y)}+0.11\\sin\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]\\right)+0.045\\sin\\left(2\\pi u\\right),0.08+2.67v\\right)`, { color: '#e3ddd6' });
-  ex(`\\left(${f(P.x)}+\\left(0.6-0.5v\\right)\\cos\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]+\\frac{\\pi}{3}\\right)+0.04\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.6-0.5v\\right)\\sin\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]+\\frac{\\pi}{3}\\right)+0.04\\sin\\left(2\\pi u\\right),0.08+0.88v\\right)`, { color: '#e3ddd6' });
+  // 底座圆环平台
+  ex(`\\left(${f(P.x)}+\\left(0.55+0.12v\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.55+0.12v\\right)\\sin\\left(2\\pi u\\right),0.02+0.06v\\right)`, { color: '#d8d0c6' });
+  ex(`\\left(${f(P.x)}+0.11\\cos\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]\\right)+0.045\\cos\\left(2\\pi u\\right),${f(P.y)}+0.11\\sin\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]\\right)+0.045\\sin\\left(2\\pi u\\right),2.75v\\right)`, { color: '#e3ddd6' });
+  ex(`\\left(${f(P.x)}+\\left(0.6-0.5v\\right)\\cos\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]+\\frac{\\pi}{3}\\right)+0.04\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.6-0.5v\\right)\\sin\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2\\right]+\\frac{\\pi}{3}\\right)+0.04\\sin\\left(2\\pi u\\right),0.95v\\right)`, { color: '#e3ddd6' });
   ex(`\\operatorname{sphere}\\left(${pt(P.x, P.y, 0.93)},0.25\\right)`, { colorLatex: 'C_{pearl}' });
-  // 装饰环半径略大于球，避免贴面闪烁
-  ex(`\\left(${f(P.x)}+\\left(0.262+0.01\\cos\\left(2\\pi v\\right)\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.262+0.01\\cos\\left(2\\pi v\\right)\\right)\\sin\\left(2\\pi u\\right),0.93+0.01\\sin\\left(2\\pi v\\right)\\right)`, { color: '#f7e7ee' });
+  ex(`\\left(${f(P.x)}+\\left(0.25+0.014\\cos\\left(2\\pi v\\right)\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.25+0.014\\cos\\left(2\\pi v\\right)\\right)\\sin\\left(2\\pi u\\right),0.93+0.014\\sin\\left(2\\pi v\\right)\\right)`, { color: '#f7e7ee' });
   ex(`\\operatorname{sphere}\\left(\\left(${f(P.x)}+0.11\\cos\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2,0,1\\right]\\right),${f(P.y)}+0.11\\sin\\left(\\frac{2\\pi}{3}\\cdot\\left[0,1,2,0,1\\right]\\right),\\left[1.45,1.62,1.79,1.96,2.13\\right]\\right),0.07\\right)`, { colorLatex: 'C_{pearl}' });
   ex(`\\operatorname{sphere}\\left(${pt(P.x, P.y, 2.63)},0.225\\right)`, { colorLatex: 'C_{pearl}' });
-  ex(`\\left(${f(P.x)}+\\left(0.236+0.01\\cos\\left(2\\pi v\\right)\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.236+0.01\\cos\\left(2\\pi v\\right)\\right)\\sin\\left(2\\pi u\\right),2.63+0.01\\sin\\left(2\\pi v\\right)\\right)`, { color: '#f7e7ee' });
-  ex(`\\left(${f(P.x)}+0.05\\cos\\left(2\\pi u\\right),${f(P.y)}+0.05\\sin\\left(2\\pi u\\right),2.86+0.62v\\right)`, { color: '#e3ddd6' });
+  ex(`\\left(${f(P.x)}+\\left(0.225+0.014\\cos\\left(2\\pi v\\right)\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+\\left(0.225+0.014\\cos\\left(2\\pi v\\right)\\right)\\sin\\left(2\\pi u\\right),2.63+0.014\\sin\\left(2\\pi v\\right)\\right)`, { color: '#f7e7ee' });
+  ex(`\\left(${f(P.x)}+0.05\\cos\\left(2\\pi u\\right),${f(P.y)}+0.05\\sin\\left(2\\pi u\\right),2.75+0.75v\\right)`, { color: '#e3ddd6' });
   ex(`\\operatorname{sphere}\\left(${pt(P.x, P.y, 3.5)},0.08\\right)`, { colorLatex: 'C_{pearl}' });
-  ex(`\\left(${f(P.x)}+0.03\\left(1-v\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+0.03\\left(1-v\\right)\\sin\\left(2\\pi u\\right),3.58+1.1v\\right)`, { color: '#d9d9d9' });
+  ex(`\\left(${f(P.x)}+0.03\\left(1-v\\right)\\cos\\left(2\\pi u\\right),${f(P.y)}+0.03\\left(1-v\\right)\\sin\\left(2\\pi u\\right),3.55+1.13v\\right)`, { color: '#d9d9d9' });
   ex(`\\operatorname{sphere}\\left(${pt(P.x, P.y, 4.68)},0.025\\right)`, { color: '#c8c8c8' });
+  ex(`\\left(${f(P.x)}+0.75v\\cos\\left(2\\pi u\\right),${f(P.y)}+0.75v\\sin\\left(2\\pi u\\right),0.014\\right)`, { color: '#cfc6bb' });
 
-  // ── 南浦大桥风格拱桥（黄浦江南段）──
-  text('🌉 南浦大桥风格：桥面抬离江面；拱脚落在桥面之上；斜拉索接到桥面两侧。', '🌉 Nanpu-style: deck clear of water; arches spring above the deck; stays meet the deck edges.');
+  // ── 南浦大桥（实体桥面 + 线段拱，参考 Ultra OBJ，去掉会穿模的参数曲面）──
+  text(
+    '🌉 南浦大桥：桥墩/桥面用三角体抬高离开江面与护岸；双拱与吊索只用线段，避免参数曲面穿进水面。',
+    '🌉 Nanpu Bridge: solid deck/piers clear of water; arches & hangers are segments only (no parametric z-fighting).',
+  );
   {
-    const by = -5.2;
-    const deckZ = 0.14;
-    ex(`\\left(-2.6+3.4\\left(2u-1\\right),${by}+0.16\\left(2v-1\\right),${deckZ}\\right)`, { color: '#6a727a' });
-    ex(`\\left(-2.6+3.1\\left(2u-1\\right),${by}+0.5,${deckZ + 0.02}+1.08\\left(1-\\left(2u-1\\right)^{2}\\right)\\right)`, { color: '#d4543a' });
-    ex(`\\left(-2.6+3.1\\left(2u-1\\right),${by}-0.5,${deckZ + 0.02}+1.08\\left(1-\\left(2u-1\\right)^{2}\\right)\\right)`, { color: '#d4543a' });
-    const cableXs = [-1.6, -0.8, 0, 0.8, 1.6].map(dx => -2.6 + dx);
-    const archZ = (dx: number) => deckZ + 0.02 + 1.08 * (1 - (dx / 3.1) ** 2);
-    const topsN = cableXs.map(x => pt(x, by + 0.5, archZ(x + 2.6)));
-    const topsS = cableXs.map(x => pt(x, by - 0.5, archZ(x + 2.6)));
-    const deckN = cableXs.map(x => pt(x, by + 0.15, deckZ + 0.005));
-    const deckS = cableXs.map(x => pt(x, by - 0.15, deckZ + 0.005));
-    ex(`\\operatorname{segment}\\left(${list(topsN)},${list(deckN)}\\right)`, { color: '#c9cdd2' });
-    ex(`\\operatorname{segment}\\left(${list(topsS)},${list(deckS)}\\right)`, { color: '#c9cdd2' });
+    const by = BRIDGE.y;
+    const zDeck = 0.22;
+    const deckH = 0.055;
+    const x0 = -5.2;
+    const x1 = 0.05;
+    const xMid = (x0 + x1) / 2;
+    const halfLen = (x1 - x0) / 2;
+    // 桥墩略低于桥面底，避免共面闪烁；桥面抬高离开水面/护岸
+    const brParts: Building[] = [
+      { x: xMid, y: by, w: halfLen, d: 0.18, h: deckH, k: 1, l: 1, a: 0, c: [108, 116, 124] },
+      { x: x0 + 0.16, y: by, w: 0.1, d: 0.14, h: zDeck - 0.01, k: 1, l: 1, a: 0, c: [82, 86, 92] },
+      { x: x1 - 0.16, y: by, w: 0.1, d: 0.14, h: zDeck - 0.01, k: 1, l: 1, a: 0, c: [82, 86, 92] },
+    ];
+    (brParts[0] as any).z0 = zDeck;
+    (brParts[1] as any).z0 = 0;
+    (brParts[2] as any).z0 = 0;
+    group(
+      'br',
+      ['桥面与桥墩（实体，z 与水面错开）。', 'Deck and piers (solid, z-clear of water).'],
+      brParts,
+      'simple',
+      b => (b as any).z0 ?? 0,
+    );
+
+    const peak = 0.95;
+    const N = 12;
+    const archY = [by - 0.14, by + 0.14];
+    for (const yArch of archY) {
+      const pts: string[] = [];
+      for (let i = 0; i <= N; i++) {
+        const t = i / N;
+        const x = x0 + (x1 - x0) * t;
+        const z = zDeck + deckH + peak * 4 * t * (1 - t);
+        pts.push(pt(x, yArch, z));
+      }
+      ex(`\\operatorname{segment}\\left(${list(pts.slice(0, -1))},${list(pts.slice(1))}\\right)`, { color: '#c84a34' });
+    }
+    const hangTop: string[] = [];
+    const hangBot: string[] = [];
+    for (let i = 2; i <= N - 2; i += 2) {
+      const t = i / N;
+      const x = x0 + (x1 - x0) * t;
+      const z = zDeck + deckH + peak * 4 * t * (1 - t);
+      for (const yArch of archY) {
+        hangTop.push(pt(x, yArch, z));
+        hangBot.push(pt(x, by + (yArch - by) * 0.25, zDeck + deckH));
+      }
+    }
+    ex(`\\operatorname{segment}\\left(${list(hangTop)},${list(hangBot)}\\right)`, { color: '#b7bdc4' });
   }
 
-  // ── 行道树 ──
-  text('🌳 行道树：与楼块/地标保间隙；树干从步道高度起，不插进地面。', '🌳 Trees keep clearance from buildings; trunks start above the ground plane.');
-  ex(`T_{r}=${list(trees.map(([x, y]) => pt(x, y, 0.02)))}`);
-  ex('\\operatorname{segment}\\left(T_{r},T_{r}+\\left(0,0,0.15\\right)\\right)', { colorLatex: 'C_{trunk}' });
-  ex('\\operatorname{sphere}\\left(T_{r}+\\left(0,0,0.19\\right),0.095k_{leaf}\\right)', { colorLatex: 'C_{leaf}' });
+  // ── 行道树（已去重、避开建筑与桥）──
+  text(
+    `🌳 行道树 ${trees.length} 棵：最小间距约 58 m，避开建筑轮廓与南浦桥走廊；树冠随季节变色。`,
+    `🌳 ${trees.length} street trees with min spacing; clear of buildings and the bridge corridor.`,
+  );
+  ex(`T_{r}=${list(trees.map(([x, y]) => pt(x, y, 0)))}`);
+  ex('\\operatorname{segment}\\left(T_{r},T_{r}+\\left(0,0,0.14\\right)\\right)', { colorLatex: 'C_{trunk}' });
+  ex('\\operatorname{sphere}\\left(T_{r}+\\left(0,0,0.18\\right),0.085k_{leaf}\\right)', { colorLatex: 'C_{leaf}' });
 
   // ── 渡轮沿江航行（默认不自动播放，避免进场时每帧重算）──
   text('⛴ 渡轮：点 b_t 播放，两艘船沿黄浦江心线南→北→东循环。航道函数 R_x/R_y/R_a 完整列出。', '⛴ Ferries: press play on b_t. Path helpers R_x/R_y/R_a are fully listed.');
