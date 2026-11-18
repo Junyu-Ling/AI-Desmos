@@ -316,9 +316,10 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
       B.push(pt(x1, y1, z), pt(x2, y2, z));
       C.push(pt(x2, y2, z), pt(x3, y3, z));
     };
-    const zG = -0.02;
-    const zW = -0.04;
-    const zE = 0.012;
+    // 整幅底板在下；江面/护岸必须更高，否则会被底板盖住
+    const zG = -0.025;
+    const zW = -0.002;
+    const zE = 0.014;
 
     // 1) 整幅地面底板：缩放/换角不会缺一块
     {
@@ -725,7 +726,7 @@ export function buildShanghaiSceneExpressions(lang: string = 'zh'): Desmos3DExpr
   // 第 3 艘：相位错开的红色小船（尺寸更小）
   ex('\\Phi=\\left[0,0.5,0.28\\right]');
   ex('S_{bo}=\\left[\\operatorname{mod}\\left(b_{t}+\\Phi\\left[i\\right],1\\right)\\operatorname{for}i=\\left[1...3\\right]\\right]');
-  ex('P_{bo}=\\left[\\left(R_{x}\\left(S_{bo}\\left[i\\right]\\right),R_{y}\\left(S_{bo}\\left[i\\right]\\right),-0.03\\right)\\operatorname{for}i=\\left[1...3\\right]\\right]', { hidden: true });
+  ex('P_{bo}=\\left[\\left(R_{x}\\left(S_{bo}\\left[i\\right]\\right),R_{y}\\left(S_{bo}\\left[i\\right]\\right),0.005\\right)\\operatorname{for}i=\\left[1...3\\right]\\right]', { hidden: true });
   ex('A_{bo}=\\left[R_{a}\\left(S_{bo}\\left[i\\right]\\right)\\operatorname{for}i=\\left[1...3\\right]\\right]');
   ex('W_{bo}=\\left[0.11,0.095,0.085\\right]');
   ex('D_{bo}=\\left[0.34,0.28,0.24\\right]');
